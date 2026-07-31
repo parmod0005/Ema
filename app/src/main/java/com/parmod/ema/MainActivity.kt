@@ -17,19 +17,19 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.parmod.ema.model.DashboardState
 import com.parmod.ema.model.ExecutionMode
 import com.parmod.ema.model.MarketIndex
@@ -42,9 +42,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    EmaApp()
-                }
+                Surface(modifier = Modifier.fillMaxSize()) { EmaApp() }
             }
         }
     }
@@ -52,16 +50,15 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun EmaApp() {
-    var state by remember { mutableStateOf(previewState()) }
-
+private fun EmaApp(vm: TradingViewModel = viewModel()) {
+    val state by vm.state.collectAsState()
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("EMA Options") },
                 actions = {
                     Text(
-                        text = if (state.isConnected) "LIVE" else "OFFLINE",
+                        if (state.isConnected) "CONNECTED" else "OFFLINE",
                         modifier = Modifier.padding(end = 16.dp),
                         fontWeight = FontWeight.Bold,
                     )
@@ -70,30 +67,17 @@ private fun EmaApp() {
         },
     ) { padding ->
         LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            item {
-                Spacer(Modifier.height(4.dp))
-                SelectorRow(
-                    state = state,
-                    onIndexChange = { state = state.copy(index = it) },
-                    onTradingModeChange = { state = state.copy(tradingMode = it) },
-                    onExecutionModeChange = { state = state.copy(executionMode = it) },
-                )
-            }
+            item { ConnectionRow(state, vm) }
+            item { SelectorRow(state, vm) }
             item { MarketSummary(state) }
             item { SignalCard(state) }
-            item {
-                Text(
-                    text = "Option chain",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
+            item { TradeControls(state, vm) }
+            state.position?.let { item { PositionCard(state, vm) } }
+            item { Text(state.message, style = MaterialTheme.typography.bodySmall) }
+            item { Text("Option chain · 5 ITM + ATM + 5 OTM", fontWeight = FontWeight.Bold) }
             items(state.optionChain) { quote -> OptionRow(quote) }
             item { Spacer(Modifier.height(20.dp)) }
         }
@@ -101,38 +85,44 @@ private fun EmaApp() {
 }
 
 @Composable
-private fun SelectorRow(
-    state: DashboardState,
-    onIndexChange: (MarketIndex) -> Unit,
-    onTradingModeChange: (TradingMode) -> Unit,
-    onExecutionModeChange: (ExecutionMode) -> Unit,
-) {
+private fun ConnectionRow(state: DashboardState, vm: TradingViewModel) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Button(onClick = vm::connectDemo, enabled = !state.isConnected) { Text("DEMO") }
+        OutlinedButton(onClick = vm::disconnect, enabled = state.isConnected) { Text("DISCONNECT") }
+        OutlinedButton(onClick = { vm.setExecutionMode(ExecutionMode.LIVE) }) { Text("UPSTOX LIVE") }
+    }
+}
+
+@Composable
+private fun SelectorRow(state: DashboardState, vm: TradingViewModel) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            ToggleButton("NIFTY", state.index == MarketIndex.NIFTY) { onIndexChange(MarketIndex.NIFTY) }
-            ToggleButton("SENSEX", state.index == MarketIndex.SENSEX) { onIndexChange(MarketIndex.SENSEX) }
+            ToggleButton("NIFTY", state.index == MarketIndex.NIFTY) { vm.selectIndex(MarketIndex.NIFTY) }
+            ToggleButton("SENSEX", state.index == MarketIndex.SENSEX) { vm.selectIndex(MarketIndex.SENSEX) }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            ToggleButton("MANUAL", state.tradingMode == TradingMode.MANUAL) { onTradingModeChange(TradingMode.MANUAL) }
-            ToggleButton("AUTO", state.tradingMode == TradingMode.AUTO) { onTradingModeChange(TradingMode.AUTO) }
-            ToggleButton("PAPER", state.executionMode == ExecutionMode.PAPER) { onExecutionModeChange(ExecutionMode.PAPER) }
-            ToggleButton("LIVE", state.executionMode == ExecutionMode.LIVE) { onExecutionModeChange(ExecutionMode.LIVE) }
+            ToggleButton("MANUAL", state.tradingMode == TradingMode.MANUAL) { vm.setTradingMode(TradingMode.MANUAL) }
+            ToggleButton("AUTO", state.tradingMode == TradingMode.AUTO) { vm.setTradingMode(TradingMode.AUTO) }
+            ToggleButton("PAPER", state.executionMode == ExecutionMode.PAPER) { vm.setExecutionMode(ExecutionMode.PAPER) }
+            ToggleButton("LIVE", state.executionMode == ExecutionMode.LIVE) { vm.setExecutionMode(ExecutionMode.LIVE) }
         }
     }
 }
 
 @Composable
 private fun ToggleButton(label: String, selected: Boolean, onClick: () -> Unit) {
-    Button(onClick = onClick, enabled = !selected) { Text(label) }
+    if (selected) Button(onClick = {}, enabled = false) { Text(label) }
+    else OutlinedButton(onClick = onClick) { Text(label) }
 }
 
 @Composable
 private fun MarketSummary(state: DashboardState) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -141,7 +131,7 @@ private fun MarketSummary(state: DashboardState) {
                 Text(formatPrice(state.spotPrice), style = MaterialTheme.typography.headlineMedium)
             }
             Column(horizontalAlignment = Alignment.End) {
-                Text("P&L", style = MaterialTheme.typography.labelLarge)
+                Text("PAPER P&L", style = MaterialTheme.typography.labelLarge)
                 Text(formatPrice(state.pnl), style = MaterialTheme.typography.titleLarge)
             }
         }
@@ -152,14 +142,46 @@ private fun MarketSummary(state: DashboardState) {
 private fun SignalCard(state: DashboardState) {
     val signal = state.signal
     Card(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
             Text(signal.action.name.replace('_', ' '), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Text("${signal.trend.name} · Confidence ${signal.confidence}/100")
-            Text("Entry ${formatOptional(signal.entry)}   SL ${formatOptional(signal.stopLoss)}   Target ${formatOptional(signal.target)}")
+            Text("Entry ${formatOptional(signal.entry)} · SL ${formatOptional(signal.stopLoss)} · Target ${formatOptional(signal.target)}")
             signal.reasons.take(3).forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
+        }
+    }
+}
+
+@Composable
+private fun TradeControls(state: DashboardState, vm: TradingViewModel) {
+    if (state.tradingMode == TradingMode.MANUAL) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = vm::buyCe, modifier = Modifier.weight(1f)) { Text("BUY ATM CE") }
+            Button(onClick = vm::buyPe, modifier = Modifier.weight(1f)) { Text("BUY ATM PE") }
+        }
+    } else {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Text("AUTO PAPER armed · trades only at confidence ≥80", modifier = Modifier.padding(12.dp))
+        }
+    }
+}
+
+@Composable
+private fun PositionCard(state: DashboardState, vm: TradingViewModel) {
+    val position = state.position ?: return
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column {
+                Text("${position.strike.toInt()} ${position.side} × ${position.quantity}", fontWeight = FontWeight.Bold)
+                Text("Entry ${formatPrice(position.entryPrice)} · LTP ${formatPrice(position.currentPrice)}")
+            }
+            Column(horizontalAlignment = Alignment.End) {
+                Text(formatPrice(position.pnl), fontWeight = FontWeight.Bold)
+                OutlinedButton(onClick = vm::exitPosition) { Text("EXIT") }
+            }
         }
     }
 }
@@ -168,22 +190,17 @@ private fun SignalCard(state: DashboardState) {
 private fun OptionRow(quote: OptionQuote) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column {
-                Text(
-                    text = "${quote.strike.toInt()} ${quote.type}${if (quote.isAtm) " · ATM" else ""}",
-                    fontWeight = FontWeight.Bold,
-                )
+                Text("${quote.strike.toInt()} ${quote.type}${if (quote.isAtm) " · ATM" else ""}", fontWeight = FontWeight.Bold)
                 Text("LTP ${formatPrice(quote.ltp)}")
             }
             Column(horizontalAlignment = Alignment.End) {
-                Text("OI ${quote.openInterest}  ΔOI ${quote.changeInOpenInterest}")
-                Text("Δ ${formatDecimal(quote.delta)}  Γ ${formatDecimal(quote.gamma)}")
+                Text("OI ${quote.openInterest} · ΔOI ${quote.changeInOpenInterest}")
+                Text("Δ ${formatDecimal(quote.delta)} · Γ ${formatDecimal(quote.gamma)}")
             }
         }
     }
@@ -192,16 +209,3 @@ private fun OptionRow(quote: OptionQuote) {
 private fun formatPrice(value: Double): String = String.format(Locale.US, "₹%,.2f", value)
 private fun formatDecimal(value: Double): String = String.format(Locale.US, "%.4f", value)
 private fun formatOptional(value: Double?): String = value?.let(::formatPrice) ?: "—"
-
-private fun previewState(): DashboardState {
-    val strikes = (24300..24800 step 50).flatMap { strike ->
-        listOf(
-            OptionQuote(strike.toDouble(), "CE", 120.0, 100_000L, 2_500L, 0.52, 0.0018, strike == 24550),
-            OptionQuote(strike.toDouble(), "PE", 115.0, 95_000L, -1_200L, -0.48, 0.0019, strike == 24550),
-        )
-    }
-    return DashboardState(
-        spotPrice = 24_552.35,
-        optionChain = strikes,
-    )
-}

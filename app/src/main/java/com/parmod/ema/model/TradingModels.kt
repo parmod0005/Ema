@@ -17,6 +17,8 @@ data class OptionQuote(
     val delta: Double,
     val gamma: Double,
     val isAtm: Boolean = false,
+    val instrumentKey: String = "",
+    val lastTickMillis: Long = 0L,
 )
 
 data class SignalSnapshot(
@@ -35,9 +37,7 @@ data class PaperPosition(
     val quantity: Int,
     val entryPrice: Double,
     val currentPrice: Double,
-) {
-    val pnl: Double get() = (currentPrice - entryPrice) * quantity
-}
+) { val pnl: Double get() = (currentPrice - entryPrice) * quantity }
 
 data class DashboardState(
     val index: MarketIndex = MarketIndex.NIFTY,
@@ -48,16 +48,10 @@ data class DashboardState(
     val liveExecutionUnlocked: Boolean = false,
     val spotPrice: Double = 0.0,
     val pnl: Double = 0.0,
-    val signal: SignalSnapshot = SignalSnapshot(
-        action = SignalAction.WAIT,
-        confidence = 0,
-        trend = TrendDirection.NEUTRAL,
-        entry = null,
-        stopLoss = null,
-        target = null,
-        reasons = listOf("Waiting for market data"),
-    ),
+    val signal: SignalSnapshot = SignalSnapshot(SignalAction.WAIT, 0, TrendDirection.NEUTRAL, null, null, null, listOf("Waiting for market data")),
     val optionChain: List<OptionQuote> = emptyList(),
     val position: PaperPosition? = null,
     val message: String = "Demo ready",
+    val lastTickMillis: Long = 0L,
+    val ticksReceived: Long = 0L,
 )

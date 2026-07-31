@@ -2,6 +2,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.protobuf")
 }
 
 android {
@@ -12,8 +13,8 @@ android {
         applicationId = "com.parmod.ema"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0-demo"
+        versionCode = 3
+        versionName = "0.3.0-tick"
     }
 
     buildFeatures {
@@ -26,8 +27,15 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+    kotlinOptions { jvmTarget = "17" }
+}
+
+protobuf {
+    protoc { artifact = "com.google.protobuf:protoc:4.28.3" }
+    generateProtoTasks {
+        all().configureEach {
+            builtins { create("java") { option("lite") } }
+        }
     }
 }
 
@@ -40,6 +48,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.protobuf:protobuf-javalite:4.28.3")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
 }

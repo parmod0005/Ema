@@ -7,9 +7,13 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
-/** Read-only Upstox market-data client. No order endpoint exists in this class. */
+/** Read-only Upstox bootstrap client. No order endpoint exists in this class. */
 class UpstoxLiveClient(private val accessToken: String) {
-    data class Snapshot(val spot: Double, val options: List<OptionQuote>)
+    data class Snapshot(
+        val spot: Double,
+        val options: List<OptionQuote>,
+        val underlyingKey: String,
+    )
 
     fun fetchSnapshot(index: MarketIndex, expiryDate: String): Snapshot {
         require(accessToken.isNotBlank()) { "Access token is required" }
@@ -20,36 +24,33 @@ class UpstoxLiveClient(private val accessToken: String) {
         }
         val spot = fetchLtp(underlying)
         val chain = fetchOptionChain(underlying, expiryDate, spot, index)
-        return Snapshot(spot, chain)
+        return Snapshot(spot, chain, underlying)
+    }
+
+    fun authorizedSocketUrl(): String {
+        val json = getJson("https://api.upstox.com/v3/feed/market-data-feed/authorize")
+        return json.getJSONObject("data").getString("authorized_redirect_uri")
     }
 
     private fun fetchLtp(instrumentKey: String): Double {
         val encoded = URLEncoder.encode(instrumentKey, Charsets.UTF_8.name())
         val json = getJson("https://api.upstox.com/v3/market-quote/ltp?instrument_key=$encoded")
         val data = json.getJSONObject("data")
-        val item = data.keys().asSequence().map { data.getJSONObject(it) }.firstOrNull()
-            ?: error("No LTP returned")
+        val item = data.keys().asSequence().map { data.getJSONObject(it) }.firstOrNull() ?: error("No LTP returned")
         return item.getDouble("last_price")
     }
 
-    private fun fetchOptionChain(
-        underlying: String,
-        expiryDate: String,
-        spot: Double,
-        index: MarketIndex,
-    ): List<OptionQuote> {
+    private fun fetchOptionChain(underlying: String, expiryDate: String, spot: Double, index: MarketIndex): List<OptionQuote> {
         val encoded = URLEncoder.encode(underlying, Charsets.UTF_8.name())
         val json = getJson("https://api.upstox.com/v2/option/chain?instrument_key=$encoded&expiry_date=$expiryDate")
         val rows = json.getJSONArray("data")
         val step = if (index == MarketIndex.NIFTY) 50 else 100
         val atm = kotlin.math.round(spot / step).toInt() * step
-        val minStrike = atm - 5 * step
-        val maxStrike = atm + 5 * step
         val result = mutableListOf<OptionQuote>()
         for (i in 0 until rows.length()) {
             val row = rows.getJSONObject(i)
             val strike = row.getDouble("strike_price")
-            if (strike < minStrike || strike > maxStrike) continue
+            if (strike < atm - 5 * step || strike > atm + 5 * step) continue
             parseOption(row.optJSONObject("call_options"), strike, "CE", strike.toInt() == atm)?.let(result::add)
             parseOption(row.optJSONObject("put_options"), strike, "PE", strike.toInt() == atm)?.let(result::add)
         }
@@ -72,6 +73,7 @@ class UpstoxLiveClient(private val accessToken: String) {
             delta = greeks.optDouble("delta", 0.0),
             gamma = greeks.optDouble("gamma", 0.0),
             isAtm = isAtm,
+            instrumentKey = node.optString("instrument_key"),
         )
     }
 
@@ -82,15 +84,12 @@ class UpstoxLiveClient(private val accessToken: String) {
             connection.connectTimeout = 10_000
             connection.readTimeout = 10_000
             connection.setRequestProperty("Accept", "application/json")
-            connection.setRequestProperty("Content-Type", "application/json")
             connection.setRequestProperty("Authorization", "Bearer $accessToken")
             val code = connection.responseCode
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
             val body = stream.bufferedReader().use { it.readText() }
             if (code !in 200..299) error("Upstox HTTP $code: $body")
             JSONObject(body)
-        } finally {
-            connection.disconnect()
-        }
+        } finally { connection.disconnect() }
     }
 }

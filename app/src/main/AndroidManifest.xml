@@ -8,10 +8,10 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.EMA">
         <activity
-            android:name=".MainActivity"
+            android:name=".OAuthLauncherActivity"
             android:exported="false" />
         <activity
-            android:name=".OAuthLauncherActivity"
+            android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

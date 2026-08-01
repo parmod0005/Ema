@@ -11,6 +11,7 @@ class ThreeMonthBacktestPipeline(
     data class Progress(val completed: Int, val total: Int, val message: String)
     data class Result(
         val index: MarketIndex,
+        val months: Long,
         val fromDate: LocalDate,
         val toDate: LocalDate,
         val expiries: Int,
@@ -30,11 +31,13 @@ class ThreeMonthBacktestPipeline(
     fun run(
         index: MarketIndex,
         today: LocalDate = LocalDate.now(),
+        months: Long = 6,
         interval: String = "1minute",
         strikesEachSide: Int = 5,
         onProgress: (Progress) -> Unit = {},
     ): Result {
-        val from = today.minusMonths(3)
+        require(months in setOf(1L, 3L, 6L, 12L)) { "Supported ranges are 1, 3, 6 or 12 months" }
+        val from = today.minusMonths(months)
         val expiries = client.getExpiries(index).filter { !it.isBefore(from) && !it.isAfter(today) }
         val work = expiries.flatMap { expiry ->
             val contracts = client.getExpiredOptionContracts(index, expiry)
@@ -70,6 +73,7 @@ class ThreeMonthBacktestPipeline(
         onProgress(Progress(work.size, work.size, "Backtest complete"))
         return Result(
             index = index,
+            months = months,
             fromDate = from,
             toDate = today,
             expiries = expiries.size,

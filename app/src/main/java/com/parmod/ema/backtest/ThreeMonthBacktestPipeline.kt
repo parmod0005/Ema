@@ -6,7 +6,7 @@ import kotlin.math.abs
 
 class ThreeMonthBacktestPipeline(
     private val client: UpstoxPlusHistoricalClient,
-    private val replayEngine: StrategyReplayEngine = StrategyReplayEngine(),
+    private val accountReplay: AccountChronologicalReplayEngine = AccountChronologicalReplayEngine(),
 ) {
     data class Progress(val completed: Int, val total: Int, val message: String)
     data class Result(
@@ -18,6 +18,12 @@ class ThreeMonthBacktestPipeline(
         val candlesProcessed: Int,
         val trades: List<BacktestEngine.Trade>,
         val report: BacktestEngine.Report,
+        val trainReport: BacktestEngine.Report,
+        val testReport: BacktestEngine.Report,
+        val endingCapital: Double,
+        val maxAccountDrawdown: Double,
+        val rejectedSignals: Int,
+        val capitalExhausted: Boolean,
         val errors: List<String>,
     )
 
@@ -34,7 +40,7 @@ class ThreeMonthBacktestPipeline(
             val contracts = client.getExpiredOptionContracts(index, expiry)
             selectResearchContracts(contracts, strikesEachSide)
         }
-        val trades = ArrayList<BacktestEngine.Trade>()
+        val series = ArrayList<AccountChronologicalReplayEngine.Series>()
         val errors = ArrayList<String>()
         var bars = 0
 
@@ -44,22 +50,24 @@ class ThreeMonthBacktestPipeline(
                 val start = contract.expiry.minusDays(7).coerceAtLeast(from)
                 val candles = client.getExpiredCandles(contract.instrumentKey, interval, start, contract.expiry)
                 bars += candles.size
-                val result = replayEngine.replay(
-                    StrategyReplayEngine.ContractSeries(
+                if (candles.isNotEmpty()) {
+                    series += AccountChronologicalReplayEngine.Series(
                         optionType = contract.optionType,
                         strike = contract.strike,
                         expiry = contract.expiry.toString(),
                         lotSize = contract.lotSize,
                         candles = candles,
-                    ),
-                )
-                trades += result.trades
+                    )
+                }
             }.onFailure { error ->
                 errors += "${contract.expiry} ${contract.strike.toInt()} ${contract.optionType}: ${error.message}"
             }
         }
+
+        onProgress(Progress(work.size, work.size, "Running chronological account replay…"))
+        val replay = accountReplay.replay(series)
+        val allReport = BacktestEngine().evaluate(replay.allTrades)
         onProgress(Progress(work.size, work.size, "Backtest complete"))
-        val sortedTrades = trades.sortedBy { it.exitEpochMs }
         return Result(
             index = index,
             fromDate = from,
@@ -67,8 +75,14 @@ class ThreeMonthBacktestPipeline(
             expiries = expiries.size,
             contractsTested = work.size,
             candlesProcessed = bars,
-            trades = sortedTrades,
-            report = BacktestEngine().evaluate(sortedTrades),
+            trades = replay.allTrades,
+            report = allReport,
+            trainReport = replay.trainReport,
+            testReport = replay.testReport,
+            endingCapital = replay.endingCapital,
+            maxAccountDrawdown = replay.maxAccountDrawdown,
+            rejectedSignals = replay.rejectedSignals,
+            capitalExhausted = replay.capitalExhausted,
             errors = errors,
         )
     }

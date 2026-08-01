@@ -30,6 +30,8 @@ class BacktestViewModel : ViewModel() {
     ) {
         val progress: Float
             get() = if (total <= 0) 0f else (completed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+        val selectedMonths: Int
+            get() = range.months.toInt()
     }
 
     private val _state = MutableStateFlow(UiState())
@@ -38,7 +40,15 @@ class BacktestViewModel : ViewModel() {
 
     fun selectRange(range: BacktestRange) {
         if (job?.isActive == true) return
-        _state.value = UiState(range = range, message = "Ready to fetch ${range.months} month${if (range.months == 1L) "" else "s"} of Upstox Plus data")
+        _state.value = UiState(
+            range = range,
+            message = "Ready to fetch ${range.months} month${if (range.months == 1L) "" else "s"} of Upstox Plus data",
+        )
+    }
+
+    fun selectMonths(months: Int) {
+        val range = BacktestRange.entries.firstOrNull { it.months.toInt() == months } ?: return
+        selectRange(range)
     }
 
     fun run(accessToken: String, index: MarketIndex) {

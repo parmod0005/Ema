@@ -2,6 +2,7 @@ package com.parmod.ema.model
 
 enum class TradingMode { MANUAL, AUTO }
 enum class ExecutionMode { PAPER, LIVE }
+enum class AppMode { LIVE_MARKET, BACKTEST }
 enum class ConnectionMode { DEMO, UPSTOX }
 enum class MarketIndex { NIFTY, SENSEX }
 enum class SignalAction { BUY_CE, BUY_PE, WAIT }
@@ -43,15 +44,21 @@ data class DashboardState(
     val index: MarketIndex = MarketIndex.NIFTY,
     val tradingMode: TradingMode = TradingMode.MANUAL,
     val executionMode: ExecutionMode = ExecutionMode.PAPER,
+    val appMode: AppMode = AppMode.LIVE_MARKET,
     val connectionMode: ConnectionMode = ConnectionMode.DEMO,
     val isConnected: Boolean = false,
     val liveExecutionUnlocked: Boolean = false,
+    val liveTradingEnabled: Boolean = false,
+    val startingCapital: Double = 100_000.0,
+    val realizedPnl: Double = 0.0,
     val spotPrice: Double = 0.0,
     val pnl: Double = 0.0,
     val signal: SignalSnapshot = SignalSnapshot(SignalAction.WAIT, 0, TrendDirection.NEUTRAL, null, null, null, listOf("Waiting for market data")),
     val optionChain: List<OptionQuote> = emptyList(),
     val position: PaperPosition? = null,
-    val message: String = "Demo ready",
+    val message: String = "Ready",
     val lastTickMillis: Long = 0L,
     val ticksReceived: Long = 0L,
-)
+) {
+    val equity: Double get() = startingCapital + realizedPnl + pnl
+}

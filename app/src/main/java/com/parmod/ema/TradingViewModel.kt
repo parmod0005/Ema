@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
+import com.parmod.ema.engine.ExecutionEngineV2
 import com.parmod.ema.engine.OptionSelector
 import com.parmod.ema.engine.SignalEngineV2
 import com.parmod.ema.model.*
@@ -29,6 +30,8 @@ class TradingViewModel : ViewModel() {
     private val livePrices = ArrayDeque<Double>()
     private val signalEngineV2 = SignalEngineV2()
     private val optionSelector = OptionSelector()
+    private val executionEngineV2 = ExecutionEngineV2()
+    private var executionState: ExecutionEngineV2.State? = null
     private var underlyingKey = ""
     private var savedAccessToken = ""
     private var savedExpiry = ""
@@ -147,6 +150,7 @@ class TradingViewModel : ViewModel() {
             ticksReceived = current.ticksReceived + 1,
             message = "${current.index.name} ticks ${current.ticksReceived + 1} · ${if (current.liveTradingEnabled) "LIVE ARMED" else "PAPER"}",
         )
+        manageOpenPosition()
         runAutoIfEligible()
     }
 
@@ -154,22 +158,14 @@ class TradingViewModel : ViewModel() {
         livePrices.addLast(snapshot.spot)
         val position = updatePosition(_state.value.position, snapshot.options)
         _state.value = _state.value.copy(spotPrice = snapshot.spot, optionChain = snapshot.options, position = position, pnl = position?.pnl ?: 0.0, signal = calculateLiveSignal(snapshot.spot, snapshot.options))
+        manageOpenPosition()
     }
 
     private fun calculateLiveSignal(spot: Double, chain: List<OptionQuote>): SignalSnapshot {
         val minimumTicks = 56
         if (spot <= 0 || livePrices.size < minimumTicks) return waitSignal("Collecting V2 ticks ${livePrices.size}/$minimumTicks")
-
         val prices = livePrices.toList()
-        val bars = prices.zipWithNext().map { (open, close) ->
-            SignalEngineV2.Bar(
-                open = open,
-                high = max(open, close),
-                low = minOf(open, close),
-                close = close,
-                volume = 0,
-            )
-        }
+        val bars = prices.zipWithNext().map { (open, close) -> SignalEngineV2.Bar(open, max(open, close), minOf(open, close), close, 0) }
         val evaluation = signalEngineV2.evaluate(bars)
         val calls = chain.filter { it.type == "CE" && abs(it.delta) in 0.35..0.70 }
         val puts = chain.filter { it.type == "PE" && abs(it.delta) in 0.35..0.70 }
@@ -183,35 +179,10 @@ class TradingViewModel : ViewModel() {
         val confidence = (evaluation.score + if (oiConfirmed) 5 else 0).coerceAtMost(100)
         val risk = (evaluation.atr * 0.8).coerceAtLeast(spot * 0.001)
         val reasons = (evaluation.reasons + "OI ${if (oiConfirmed) "confirmed" else "not confirmed"}").take(4)
-
         return when {
-            evaluation.direction == SignalEngineV2.Direction.BULLISH && confidence >= 80 -> SignalSnapshot(
-                SignalAction.BUY_CE,
-                confidence,
-                TrendDirection.BULLISH,
-                spot,
-                spot - risk,
-                spot + risk * 1.8,
-                listOf("BUY CALL · Signal Engine v2") + reasons,
-            )
-            evaluation.direction == SignalEngineV2.Direction.BEARISH && confidence >= 80 -> SignalSnapshot(
-                SignalAction.BUY_PE,
-                confidence,
-                TrendDirection.BEARISH,
-                spot,
-                spot + risk,
-                spot - risk * 1.8,
-                listOf("BUY PUT · Signal Engine v2") + reasons,
-            )
-            else -> SignalSnapshot(
-                SignalAction.WAIT,
-                confidence,
-                TrendDirection.NEUTRAL,
-                null,
-                null,
-                null,
-                listOf("WAIT · Signal Engine v2 filters") + reasons,
-            )
+            evaluation.direction == SignalEngineV2.Direction.BULLISH && confidence >= 80 -> SignalSnapshot(SignalAction.BUY_CE, confidence, TrendDirection.BULLISH, spot, spot - risk, spot + risk * 1.8, listOf("BUY CALL · Signal Engine v2") + reasons)
+            evaluation.direction == SignalEngineV2.Direction.BEARISH && confidence >= 80 -> SignalSnapshot(SignalAction.BUY_PE, confidence, TrendDirection.BEARISH, spot, spot + risk, spot - risk * 1.8, listOf("BUY PUT · Signal Engine v2") + reasons)
+            else -> SignalSnapshot(SignalAction.WAIT, confidence, TrendDirection.NEUTRAL, null, null, null, listOf("WAIT · Signal Engine v2 filters") + reasons)
         }
     }
 
@@ -228,7 +199,9 @@ class TradingViewModel : ViewModel() {
         livePrices.addLast(spot); while (livePrices.size > 600) livePrices.removeFirst()
         val position = updatePosition(current.position, chain)
         _state.value = current.copy(spotPrice = spot, optionChain = chain, signal = calculateLiveSignal(spot, chain), position = position, pnl = position?.pnl ?: 0.0, ticksReceived = current.ticksReceived + 1, lastTickMillis = System.currentTimeMillis())
-        runAutoIfEligible(); tick = (tick + 1) % 65
+        manageOpenPosition()
+        runAutoIfEligible()
+        tick = (tick + 1) % 65
     }
 
     private fun buildDemoChain(spot: Double, atm: Int, step: Int): List<OptionQuote> = (-5..5).flatMap { offset ->
@@ -240,26 +213,50 @@ class TradingViewModel : ViewModel() {
         val current = _state.value
         if (!current.isConnected) { _state.value = current.copy(message = "Connect live data first"); return }
         if (current.position != null) { _state.value = current.copy(message = "Exit current position first"); return }
-
         val selection = optionSelector.select(current.optionChain, side.name)
-        if (selection == null) {
-            _state.value = current.copy(message = "No liquid ${side.name} contract matches delta/OI filters")
-            return
-        }
+        if (selection == null) { _state.value = current.copy(message = "No liquid ${side.name} contract matches delta/OI filters"); return }
         val q = selection.quote
         val lot = if (current.index == MarketIndex.NIFTY) 65 else 20
         val mode = if (current.liveTradingEnabled) "LIVE" else "PAPER"
         val rationale = selection.reasons.take(2).joinToString(" · ")
+        val exec = executionEngineV2.open(q.ltp)
+        executionState = exec
         _state.value = current.copy(
-            position = PaperPosition(side, q.strike, lot, q.ltp, q.ltp),
+            position = PaperPosition(side, q.strike, lot, q.ltp, q.ltp, exec.highestPrice, exec.stopPrice, exec.targetPrice, exec.breakevenActive, exec.trailingActive),
             pnl = 0.0,
-            message = "$mode BUY ${q.strike.toInt()} ${side.name} × $lot · $rationale",
+            message = "$mode BUY ${q.strike.toInt()} ${side.name} × $lot · SL ${"%.2f".format(exec.stopPrice)} · TG ${"%.2f".format(exec.targetPrice)} · $rationale",
         )
+    }
+
+    private fun manageOpenPosition() {
+        val current = _state.value
+        val position = current.position ?: return
+        val state = executionState ?: executionEngineV2.open(position.entryPrice)
+        val opposite = (position.side == PositionSide.CE && current.signal.action == SignalAction.BUY_PE) || (position.side == PositionSide.PE && current.signal.action == SignalAction.BUY_CE)
+        val update = executionEngineV2.update(state, position.currentPrice, opposite)
+        executionState = update.state
+        val managed = position.copy(
+            highestPrice = update.state.highestPrice,
+            stopPrice = update.state.stopPrice,
+            targetPrice = update.state.targetPrice,
+            breakevenActive = update.state.breakevenActive,
+            trailingActive = update.state.trailingActive,
+        )
+        _state.value = current.copy(position = managed, pnl = managed.pnl)
+        update.exitReason?.let { reason ->
+            val label = when (reason) {
+                ExecutionEngineV2.ExitReason.STOP_LOSS -> if (update.state.trailingActive) "Trailing stop exit" else if (update.state.breakevenActive) "Breakeven stop exit" else "Stop-loss exit"
+                ExecutionEngineV2.ExitReason.TARGET -> "Target exit"
+                ExecutionEngineV2.ExitReason.OPPOSITE_SIGNAL -> "Opposite-signal exit"
+            }
+            closePosition(label)
+        }
     }
 
     private fun closePosition(reason: String) {
         val c = _state.value
         val realized = c.position?.pnl ?: 0.0
+        executionState = null
         _state.value = c.copy(position = null, pnl = 0.0, realizedPnl = c.realizedPnl + realized, message = "$reason · P&L ₹${"%.2f".format(realized)}")
         autoTradeTakenForSignal = false
     }
@@ -273,12 +270,8 @@ class TradingViewModel : ViewModel() {
                 SignalAction.BUY_PE -> openPaperPosition(PositionSide.PE)
                 SignalAction.WAIT -> Unit
             }
-            autoTradeTakenForSignal = true
+            autoTradeTakenForSignal = _state.value.position != null
         }
-        val p = _state.value.position ?: return
-        val pct = if (p.entryPrice == 0.0) 0.0 else (p.currentPrice - p.entryPrice) / p.entryPrice
-        val reversed = (p.side == PositionSide.CE && c.signal.action == SignalAction.BUY_PE) || (p.side == PositionSide.PE && c.signal.action == SignalAction.BUY_CE)
-        if (pct <= -0.15 || pct >= 0.30 || reversed) closePosition("Auto exit")
     }
 
     override fun onCleared() { disconnectInternal(); super.onCleared() }

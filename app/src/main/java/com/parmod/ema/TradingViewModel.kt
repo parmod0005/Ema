@@ -26,19 +26,36 @@ class TradingViewModel : ViewModel() {
     private var autoTradeTakenForSignal = false
     private val livePrices = ArrayDeque<Double>()
     private var underlyingKey = ""
+    private var savedAccessToken = ""
+    private var savedExpiry = ""
 
     fun connectLive(accessToken: String, expiryDate: String) {
         if (accessToken.isBlank() || expiryDate.isBlank()) {
-            _state.value = _state.value.copy(message = "Enter Upstox token and expiry date")
+            _state.value = _state.value.copy(message = "Paste a valid Upstox token and select expiry")
             return
         }
+        savedAccessToken = accessToken.trim()
+        savedExpiry = expiryDate.trim()
+        connectSelectedIndex()
+    }
+
+    private fun connectSelectedIndex() {
+        if (savedAccessToken.isBlank() || savedExpiry.isBlank()) return
         disconnectInternal()
         livePrices.clear()
-        _state.value = _state.value.copy(connectionMode = ConnectionMode.UPSTOX, isConnected = false, executionMode = ExecutionMode.PAPER, message = "Bootstrapping Upstox option instruments…")
+        val selectedIndex = _state.value.index
+        _state.value = _state.value.copy(
+            connectionMode = ConnectionMode.UPSTOX,
+            isConnected = false,
+            executionMode = ExecutionMode.PAPER,
+            optionChain = emptyList(),
+            spotPrice = 0.0,
+            message = "Loading ${selectedIndex.name} contracts and live feed…",
+        )
         feedJob = viewModelScope.launch {
             try {
-                val client = UpstoxLiveClient(accessToken.trim())
-                val snapshot = withContext(Dispatchers.IO) { client.fetchSnapshot(_state.value.index, expiryDate.trim()) }
+                val client = UpstoxLiveClient(savedAccessToken)
+                val snapshot = withContext(Dispatchers.IO) { client.fetchSnapshot(selectedIndex, savedExpiry) }
                 underlyingKey = snapshot.underlyingKey
                 publishLiveSnapshot(snapshot)
                 val keys = listOf(snapshot.underlyingKey) + snapshot.options.mapNotNull { it.instrumentKey.takeIf(String::isNotBlank) }
@@ -47,7 +64,7 @@ class TradingViewModel : ViewModel() {
                     instrumentKeys = keys.distinct(),
                     listener = object : UpstoxTickStream.Listener {
                         override fun onOpen() {
-                            _state.value = _state.value.copy(isConnected = true, message = "UPSTOX V3 TICK STREAM · ${keys.size} instruments · paper only")
+                            _state.value = _state.value.copy(isConnected = true, message = "${selectedIndex.name} live ticks connected · ${keys.size} instruments")
                         }
                         override fun onTick(tick: UpstoxTickStream.Tick) { applyTick(tick) }
                         override fun onError(message: String) { _state.value = _state.value.copy(message = message) }
@@ -69,9 +86,28 @@ class TradingViewModel : ViewModel() {
 
     fun disconnect() { disconnectInternal(); _state.value = _state.value.copy(isConnected = false, message = "Disconnected") }
     private fun disconnectInternal() { feedJob?.cancel(); feedJob = null; tickStream?.disconnect(); tickStream = null }
-    fun selectIndex(index: MarketIndex) { closePosition("Index changed"); disconnectInternal(); livePrices.clear(); tick = 0; _state.value = _state.value.copy(index = index, isConnected = false, message = "Reconnect for ${index.name}") }
+
+    fun selectIndex(index: MarketIndex) {
+        if (_state.value.index == index) return
+        closePosition("Market changed")
+        livePrices.clear()
+        tick = 0
+        _state.value = _state.value.copy(index = index, isConnected = false, optionChain = emptyList(), spotPrice = 0.0, message = "Switching automatically to ${index.name}…")
+        if (_state.value.connectionMode == ConnectionMode.UPSTOX && savedAccessToken.isNotBlank() && savedExpiry.isNotBlank()) connectSelectedIndex()
+        else if (_state.value.connectionMode == ConnectionMode.DEMO) connectDemo()
+    }
+
     fun setTradingMode(mode: TradingMode) { autoTradeTakenForSignal = false; _state.value = _state.value.copy(tradingMode = mode, message = "$mode mode selected") }
-    fun setExecutionMode(mode: ExecutionMode) { _state.value = if (mode == ExecutionMode.LIVE) _state.value.copy(executionMode = ExecutionMode.PAPER, message = "Live orders disabled; tick data and paper trading remain live") else _state.value.copy(executionMode = mode) }
+    fun setAppMode(mode: AppMode) { _state.value = _state.value.copy(appMode = mode, message = if (mode == AppMode.BACKTEST) "Historical backtest mode" else "Live market mode") }
+    fun setStartingCapital(value: Double) { if (value > 0) _state.value = _state.value.copy(startingCapital = value) }
+    fun setLiveTradingEnabled(enabled: Boolean) {
+        _state.value = _state.value.copy(
+            liveTradingEnabled = enabled,
+            executionMode = if (enabled) ExecutionMode.LIVE else ExecutionMode.PAPER,
+            message = if (enabled) "LIVE TRADING ARMED · broker order validation required" else "Live trading OFF · paper mode active",
+        )
+    }
+    fun setExecutionMode(mode: ExecutionMode) = setLiveTradingEnabled(mode == ExecutionMode.LIVE)
     fun buyCe() = openPaperPosition(PositionSide.CE)
     fun buyPe() = openPaperPosition(PositionSide.PE)
     fun exitPosition() = closePosition("Position exited")
@@ -105,9 +141,9 @@ class TradingViewModel : ViewModel() {
             pnl = position?.pnl ?: 0.0,
             lastTickMillis = tick.feedTimestamp,
             ticksReceived = current.ticksReceived + 1,
-            message = "UPSTOX V3 TICKS ${current.ticksReceived + 1} · paper orders only",
+            message = "${current.index.name} ticks ${current.ticksReceived + 1} · ${if (current.liveTradingEnabled) "LIVE ARMED" else "PAPER"}",
         )
-        runAutoPaperIfEligible()
+        runAutoIfEligible()
     }
 
     private fun publishLiveSnapshot(snapshot: UpstoxLiveClient.Snapshot) {
@@ -133,9 +169,9 @@ class TradingViewModel : ViewModel() {
         val oiConfirm = (bullish && putOi >= callOi) || (bearish && callOi >= putOi)
         val confidence = (65 + minOf(17, (abs(slope) / spot * 120_000).toInt()) + if (oiConfirm) 10 else 0).coerceAtMost(92)
         return when {
-            bullish && confidence >= 75 -> SignalSnapshot(SignalAction.BUY_CE, confidence, TrendDirection.BULLISH, spot, spot * 0.9985, spot * 1.003, listOf("Tick EMA fast above slow", "Positive tick momentum", "Live option OI ${if (oiConfirm) "confirms" else "is weak"}"))
-            bearish && confidence >= 75 -> SignalSnapshot(SignalAction.BUY_PE, confidence, TrendDirection.BEARISH, spot, spot * 1.0015, spot * 0.997, listOf("Tick EMA fast below slow", "Negative tick momentum", "Live option OI ${if (oiConfirm) "confirms" else "is weak"}"))
-            else -> waitSignal("Tick anti-chop filter active")
+            bullish && confidence >= 75 -> SignalSnapshot(SignalAction.BUY_CE, confidence, TrendDirection.BULLISH, spot, spot * 0.9985, spot * 1.003, listOf("BUY CALL", "EMA and momentum bullish", "OI ${if (oiConfirm) "confirmed" else "weak"}"))
+            bearish && confidence >= 75 -> SignalSnapshot(SignalAction.BUY_PE, confidence, TrendDirection.BEARISH, spot, spot * 1.0015, spot * 0.997, listOf("BUY PUT", "EMA and momentum bearish", "OI ${if (oiConfirm) "confirmed" else "weak"}"))
+            else -> waitSignal("WAIT · anti-chop filter active")
         }
     }
 
@@ -153,7 +189,7 @@ class TradingViewModel : ViewModel() {
         livePrices.addLast(spot); while (livePrices.size > 600) livePrices.removeFirst()
         val position = updatePosition(current.position, chain)
         _state.value = current.copy(spotPrice = spot, optionChain = chain, signal = calculateLiveSignal(spot, chain), position = position, pnl = position?.pnl ?: 0.0, ticksReceived = current.ticksReceived + 1, lastTickMillis = System.currentTimeMillis())
-        runAutoPaperIfEligible(); tick = (tick + 1) % 65
+        runAutoIfEligible(); tick = (tick + 1) % 65
     }
 
     private fun buildDemoChain(spot: Double, atm: Int, step: Int): List<OptionQuote> = (-5..5).flatMap { offset ->
@@ -163,18 +199,31 @@ class TradingViewModel : ViewModel() {
 
     private fun openPaperPosition(side: PositionSide) {
         val current = _state.value
-        if (!current.isConnected) { _state.value = current.copy(message = "Connect Upstox tick data first"); return }
+        if (!current.isConnected) { _state.value = current.copy(message = "Connect live data first"); return }
         if (current.position != null) { _state.value = current.copy(message = "Exit current position first"); return }
         val q = current.optionChain.firstOrNull { it.isAtm && it.type == side.name } ?: return
         val lot = if (current.index == MarketIndex.NIFTY) 65 else 20
-        _state.value = current.copy(position = PaperPosition(side, q.strike, lot, q.ltp, q.ltp), pnl = 0.0, message = "TICK-DATA PAPER BUY ${q.strike.toInt()} ${side.name} × $lot")
+        _state.value = current.copy(position = PaperPosition(side, q.strike, lot, q.ltp, q.ltp), pnl = 0.0, message = "${if (current.liveTradingEnabled) "LIVE" else "PAPER"} BUY ${q.strike.toInt()} ${side.name} × $lot")
     }
 
-    private fun closePosition(reason: String) { val c = _state.value; val realized = c.position?.pnl ?: 0.0; _state.value = c.copy(position = null, pnl = 0.0, message = "$reason · P&L ₹${"%.2f".format(realized)}"); autoTradeTakenForSignal = false }
-    private fun runAutoPaperIfEligible() {
+    private fun closePosition(reason: String) {
         val c = _state.value
-        if (c.tradingMode != TradingMode.AUTO || c.executionMode != ExecutionMode.PAPER) return
-        if (c.position == null && !autoTradeTakenForSignal && c.signal.confidence >= 80) { when (c.signal.action) { SignalAction.BUY_CE -> openPaperPosition(PositionSide.CE); SignalAction.BUY_PE -> openPaperPosition(PositionSide.PE); SignalAction.WAIT -> Unit }; autoTradeTakenForSignal = true }
+        val realized = c.position?.pnl ?: 0.0
+        _state.value = c.copy(position = null, pnl = 0.0, realizedPnl = c.realizedPnl + realized, message = "$reason · P&L ₹${"%.2f".format(realized)}")
+        autoTradeTakenForSignal = false
+    }
+
+    private fun runAutoIfEligible() {
+        val c = _state.value
+        if (c.tradingMode != TradingMode.AUTO || c.appMode != AppMode.LIVE_MARKET) return
+        if (c.position == null && !autoTradeTakenForSignal && c.signal.confidence >= 80) {
+            when (c.signal.action) {
+                SignalAction.BUY_CE -> openPaperPosition(PositionSide.CE)
+                SignalAction.BUY_PE -> openPaperPosition(PositionSide.PE)
+                SignalAction.WAIT -> Unit
+            }
+            autoTradeTakenForSignal = true
+        }
         val p = _state.value.position ?: return
         val pct = if (p.entryPrice == 0.0) 0.0 else (p.currentPrice - p.entryPrice) / p.entryPrice
         val reversed = (p.side == PositionSide.CE && c.signal.action == SignalAction.BUY_PE) || (p.side == PositionSide.PE && c.signal.action == SignalAction.BUY_CE)

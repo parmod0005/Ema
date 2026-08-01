@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
+import com.parmod.ema.engine.SignalEngineV2
 import com.parmod.ema.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,6 +26,7 @@ class TradingViewModel : ViewModel() {
     private var tick = 0
     private var autoTradeTakenForSignal = false
     private val livePrices = ArrayDeque<Double>()
+    private val signalEngineV2 = SignalEngineV2()
     private var underlyingKey = ""
     private var savedAccessToken = ""
     private var savedExpiry = ""
@@ -153,29 +155,64 @@ class TradingViewModel : ViewModel() {
     }
 
     private fun calculateLiveSignal(spot: Double, chain: List<OptionQuote>): SignalSnapshot {
-        if (spot <= 0 || livePrices.size < 20) return waitSignal("Collecting ticks ${livePrices.size}/20")
+        val minimumTicks = 56
+        if (spot <= 0 || livePrices.size < minimumTicks) return waitSignal("Collecting V2 ticks ${livePrices.size}/$minimumTicks")
+
         val prices = livePrices.toList()
-        val fast = ema(prices, 8)
-        val slow = ema(prices, 20)
-        val previousFast = ema(prices.dropLast(minOf(3, prices.size - 1)), 8)
-        val slope = fast - previousFast
-        val separation = abs(fast - slow) / spot
+        val bars = prices.zipWithNext().map { (open, close) ->
+            SignalEngineV2.Bar(
+                open = open,
+                high = max(open, close),
+                low = minOf(open, close),
+                close = close,
+                volume = 0,
+            )
+        }
+        val evaluation = signalEngineV2.evaluate(bars)
         val calls = chain.filter { it.type == "CE" && abs(it.delta) in 0.35..0.70 }
         val puts = chain.filter { it.type == "PE" && abs(it.delta) in 0.35..0.70 }
         val callOi = calls.sumOf { it.changeInOpenInterest }
         val putOi = puts.sumOf { it.changeInOpenInterest }
-        val bullish = fast > slow && slope > 0 && separation > 0.00005
-        val bearish = fast < slow && slope < 0 && separation > 0.00005
-        val oiConfirm = (bullish && putOi >= callOi) || (bearish && callOi >= putOi)
-        val confidence = (65 + minOf(17, (abs(slope) / spot * 120_000).toInt()) + if (oiConfirm) 10 else 0).coerceAtMost(92)
+        val oiConfirmed = when (evaluation.direction) {
+            SignalEngineV2.Direction.BULLISH -> putOi >= callOi
+            SignalEngineV2.Direction.BEARISH -> callOi >= putOi
+            SignalEngineV2.Direction.NEUTRAL -> false
+        }
+        val confidence = (evaluation.score + if (oiConfirmed) 5 else 0).coerceAtMost(100)
+        val risk = (evaluation.atr * 0.8).coerceAtLeast(spot * 0.001)
+        val reasons = (evaluation.reasons + "OI ${if (oiConfirmed) "confirmed" else "not confirmed"}").take(4)
+
         return when {
-            bullish && confidence >= 75 -> SignalSnapshot(SignalAction.BUY_CE, confidence, TrendDirection.BULLISH, spot, spot * 0.9985, spot * 1.003, listOf("BUY CALL", "EMA and momentum bullish", "OI ${if (oiConfirm) "confirmed" else "weak"}"))
-            bearish && confidence >= 75 -> SignalSnapshot(SignalAction.BUY_PE, confidence, TrendDirection.BEARISH, spot, spot * 1.0015, spot * 0.997, listOf("BUY PUT", "EMA and momentum bearish", "OI ${if (oiConfirm) "confirmed" else "weak"}"))
-            else -> waitSignal("WAIT · anti-chop filter active")
+            evaluation.direction == SignalEngineV2.Direction.BULLISH && confidence >= 80 -> SignalSnapshot(
+                SignalAction.BUY_CE,
+                confidence,
+                TrendDirection.BULLISH,
+                spot,
+                spot - risk,
+                spot + risk * 1.8,
+                listOf("BUY CALL · Signal Engine v2") + reasons,
+            )
+            evaluation.direction == SignalEngineV2.Direction.BEARISH && confidence >= 80 -> SignalSnapshot(
+                SignalAction.BUY_PE,
+                confidence,
+                TrendDirection.BEARISH,
+                spot,
+                spot + risk,
+                spot - risk * 1.8,
+                listOf("BUY PUT · Signal Engine v2") + reasons,
+            )
+            else -> SignalSnapshot(
+                SignalAction.WAIT,
+                confidence,
+                TrendDirection.NEUTRAL,
+                null,
+                null,
+                null,
+                listOf("WAIT · Signal Engine v2 filters") + reasons,
+            )
         }
     }
 
-    private fun ema(values: List<Double>, period: Int): Double { if (values.isEmpty()) return 0.0; val k = 2.0 / (period + 1.0); var r = values.first(); values.drop(1).forEach { r = it * k + r * (1 - k) }; return r }
     private fun waitSignal(reason: String) = SignalSnapshot(SignalAction.WAIT, 45, TrendDirection.NEUTRAL, null, null, null, listOf(reason, "Waiting for confirmed expansion"))
     private fun updatePosition(position: PaperPosition?, chain: List<OptionQuote>): PaperPosition? = position?.let { p -> chain.firstOrNull { it.strike == p.strike && it.type == p.side.name }?.let { p.copy(currentPrice = it.ltp) } ?: p }
 

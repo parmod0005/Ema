@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
+import com.parmod.ema.engine.OptionSelector
 import com.parmod.ema.engine.SignalEngineV2
 import com.parmod.ema.model.*
 import kotlinx.coroutines.Dispatchers
@@ -27,6 +28,7 @@ class TradingViewModel : ViewModel() {
     private var autoTradeTakenForSignal = false
     private val livePrices = ArrayDeque<Double>()
     private val signalEngineV2 = SignalEngineV2()
+    private val optionSelector = OptionSelector()
     private var underlyingKey = ""
     private var savedAccessToken = ""
     private var savedExpiry = ""
@@ -238,9 +240,21 @@ class TradingViewModel : ViewModel() {
         val current = _state.value
         if (!current.isConnected) { _state.value = current.copy(message = "Connect live data first"); return }
         if (current.position != null) { _state.value = current.copy(message = "Exit current position first"); return }
-        val q = current.optionChain.firstOrNull { it.isAtm && it.type == side.name } ?: return
+
+        val selection = optionSelector.select(current.optionChain, side.name)
+        if (selection == null) {
+            _state.value = current.copy(message = "No liquid ${side.name} contract matches delta/OI filters")
+            return
+        }
+        val q = selection.quote
         val lot = if (current.index == MarketIndex.NIFTY) 65 else 20
-        _state.value = current.copy(position = PaperPosition(side, q.strike, lot, q.ltp, q.ltp), pnl = 0.0, message = "${if (current.liveTradingEnabled) "LIVE" else "PAPER"} BUY ${q.strike.toInt()} ${side.name} × $lot")
+        val mode = if (current.liveTradingEnabled) "LIVE" else "PAPER"
+        val rationale = selection.reasons.take(2).joinToString(" · ")
+        _state.value = current.copy(
+            position = PaperPosition(side, q.strike, lot, q.ltp, q.ltp),
+            pnl = 0.0,
+            message = "$mode BUY ${q.strike.toInt()} ${side.name} × $lot · $rationale",
+        )
     }
 
     private fun closePosition(reason: String) {

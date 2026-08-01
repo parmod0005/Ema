@@ -1,51 +1,61 @@
 package com.parmod.ema.ai
 
 import com.parmod.ema.model.SignalAction
-import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
+/**
+ * Host-side tests cover the pure AI decision contract. The org.json parser is
+ * exercised by Android/integration tests because Android's org.json classes are
+ * stubs in local JVM unit tests.
+ */
 class AiBridgeClientTest {
-    private val client = AiBridgeClient("https://bridge.example", "device-token")
+    private fun decision(
+        action: SignalAction = SignalAction.BUY_CE,
+        confidence: Int = 87,
+        validForMillis: Long = 30_000L,
+    ) = AiTradeDecision(
+        decisionId = "d-1",
+        snapshotId = "s-1",
+        decidedAtMillis = 1_000L,
+        validForMillis = validForMillis,
+        action = action,
+        confidence = confidence,
+        regime = MarketRegime.TRENDING_BULLISH,
+        maximumSpotMovePct = 0.15,
+        modelVersion = "gpt-test",
+        promptVersion = "p1",
+    )
 
-    private fun decision(action: String = "BUY_CALL") = JSONObject().apply {
-        put("schemaVersion", 1)
-        put("decisionId", "d-1")
-        put("snapshotId", "s-1")
-        put("decidedAtMillis", 1_000L)
-        put("validForMillis", 30_000L)
-        put("action", action)
-        put("confidence", 87)
-        put("regime", "TRENDING_BULLISH")
-        put("maximumSpotMovePct", 0.15)
-        put("modelVersion", "gpt-test")
-        put("promptVersion", "p1")
-    }
-
-    @Test fun parsesCallAliasAndOptionalFields() {
-        val parsed = client.parseDecision(decision())
+    @Test fun acceptsCallDecisionContract() {
+        val parsed = decision()
         assertEquals(SignalAction.BUY_CE, parsed.action)
         assertEquals(87, parsed.confidence)
-        assertNull(parsed.instrumentKey)
+        assertFalse(parsed.isExpired(20_000L))
     }
 
-    @Test fun parsesPutAlias() {
-        val parsed = client.parseDecision(decision("BUY_PUT"))
-        assertEquals(SignalAction.BUY_PE, parsed.action)
+    @Test fun acceptsPutDecisionContract() {
+        assertEquals(SignalAction.BUY_PE, decision(SignalAction.BUY_PE).action)
     }
 
-    @Test fun unknownActionFailsClosed() {
-        assertThrows(IllegalStateException::class.java) {
-            client.parseDecision(decision("BUY_FUTURE"))
-        }
-    }
-
-    @Test fun invalidConfidenceFailsModelValidation() {
-        val json = decision().put("confidence", 140)
+    @Test fun rejectsInvalidConfidence() {
         assertThrows(IllegalArgumentException::class.java) {
-            client.parseDecision(json)
+            decision(confidence = 140)
         }
+    }
+
+    @Test fun rejectsInvalidValidityWindow() {
+        assertThrows(IllegalArgumentException::class.java) {
+            decision(validForMillis = 500L)
+        }
+    }
+
+    @Test fun expiryIsDeterministic() {
+        val value = decision(validForMillis = 5_000L)
+        assertFalse(value.isExpired(6_000L))
+        assertTrue(value.isExpired(6_001L))
     }
 }

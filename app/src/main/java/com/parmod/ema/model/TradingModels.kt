@@ -1,5 +1,10 @@
 package com.parmod.ema.model
 
+import com.parmod.ema.ai.AiBridgeHealth
+import com.parmod.ema.ai.AiRunMode
+import com.parmod.ema.ai.AiTradeDecision
+import com.parmod.ema.ai.SignalEngineMode
+
 enum class TradingMode { MANUAL, AUTO }
 enum class ExecutionMode { PAPER, LIVE }
 enum class AppMode { LIVE_MARKET, BACKTEST }
@@ -53,6 +58,11 @@ data class DashboardState(
     val executionMode: ExecutionMode = ExecutionMode.PAPER,
     val appMode: AppMode = AppMode.LIVE_MARKET,
     val connectionMode: ConnectionMode = ConnectionMode.DEMO,
+    val signalEngineMode: SignalEngineMode = SignalEngineMode.NATIVE,
+    val aiRunMode: AiRunMode = AiRunMode.SHADOW,
+    val aiBridgeHealth: AiBridgeHealth = AiBridgeHealth(),
+    val aiDecision: AiTradeDecision? = null,
+    val aiFinalReason: String = "AI bridge not configured",
     val isConnected: Boolean = false,
     val liveExecutionUnlocked: Boolean = false,
     val liveTradingEnabled: Boolean = false,

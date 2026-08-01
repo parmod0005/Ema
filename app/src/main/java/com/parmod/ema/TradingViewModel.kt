@@ -2,6 +2,8 @@ package com.parmod.ema
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.parmod.ema.ai.AiRunMode
+import com.parmod.ema.ai.SignalEngineMode
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
 import com.parmod.ema.engine.ExecutionEngineV2
@@ -106,6 +108,22 @@ class TradingViewModel : ViewModel() {
 
     fun setTradingMode(mode: TradingMode) { autoTradeTakenForSignal = false; _state.value = _state.value.copy(tradingMode = mode, message = "$mode mode selected") }
     fun setAppMode(mode: AppMode) { _state.value = _state.value.copy(appMode = mode, message = if (mode == AppMode.BACKTEST) "Historical backtest mode" else "Live market mode") }
+    fun setSignalEngineMode(mode: SignalEngineMode) {
+        autoTradeTakenForSignal = false
+        val reason = when (mode) {
+            SignalEngineMode.NATIVE -> "Native Signal Engine V2 selected"
+            SignalEngineMode.AI_BRAIN -> "AI Brain selected · bridge decisions required"
+            SignalEngineMode.HYBRID -> "Hybrid selected · AI/native safety routing"
+        }
+        _state.value = _state.value.copy(signalEngineMode = mode, aiFinalReason = reason, message = reason)
+    }
+    fun setAiRunMode(mode: AiRunMode) {
+        val safeMode = if (mode == AiRunMode.LIVE_CANDIDATE) AiRunMode.SHADOW else mode
+        _state.value = _state.value.copy(
+            aiRunMode = safeMode,
+            message = if (safeMode == AiRunMode.SHADOW) "AI shadow mode · analysis only" else "AI paper mode · local risk gates active",
+        )
+    }
     fun setStartingCapital(value: Double) { if (value > 0) _state.value = _state.value.copy(startingCapital = value) }
     fun setLiveTradingEnabled(enabled: Boolean) {
         _state.value = _state.value.copy(
@@ -264,6 +282,7 @@ class TradingViewModel : ViewModel() {
     private fun runAutoIfEligible() {
         val c = _state.value
         if (c.tradingMode != TradingMode.AUTO || c.appMode != AppMode.LIVE_MARKET) return
+        if (c.signalEngineMode != SignalEngineMode.NATIVE && c.aiRunMode == AiRunMode.SHADOW) return
         if (c.position == null && !autoTradeTakenForSignal && c.signal.confidence >= 80) {
             when (c.signal.action) {
                 SignalAction.BUY_CE -> openPaperPosition(PositionSide.CE)

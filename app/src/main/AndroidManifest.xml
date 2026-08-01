@@ -4,7 +4,9 @@
 
     <application
         android:allowBackup="true"
-        android:label="EMA"
+        android:icon="@drawable/vardhani_logo"
+        android:roundIcon="@drawable/vardhani_logo"
+        android:label="VARDHANI"
         android:supportsRtl="true"
         android:theme="@style/Theme.EMA">
         <activity

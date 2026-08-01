@@ -19,7 +19,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.parmod.ema.backtest.BacktestRangeSelector
 import com.parmod.ema.backtest.BacktestViewModel
+import com.parmod.ema.backtest.backtestRangeTitle
 import com.parmod.ema.data.UpstoxOptionDiscoveryClient
 import com.parmod.ema.model.*
 import kotlinx.coroutines.Dispatchers
@@ -137,6 +139,7 @@ private fun VardhaniApp(
                         index = state.index,
                         state = backtest,
                         onRun = { backtestVm.run(token, state.index) },
+                        onRangeSelected = backtestVm::selectMonths,
                         onCancel = backtestVm::cancel,
                         onClear = backtestVm::clearResult,
                     )
@@ -307,15 +310,21 @@ private fun BacktestPanel(
     index: MarketIndex,
     state: BacktestViewModel.UiState,
     onRun: () -> Unit,
+    onRangeSelected: (Int) -> Unit,
     onCancel: () -> Unit,
     onClear: () -> Unit,
 ) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-            Text("3-MONTH ${index.name} BACKTEST", fontWeight = FontWeight.Bold)
+            Text("${backtestRangeTitle(state.selectedMonths)} ${index.name} BACKTEST", fontWeight = FontWeight.Bold)
             Text(
-                "Fetches Upstox Plus expired option contracts and one-minute historical candles, then replays the production entry, stop, target, reversal and cooldown rules.",
+                "Fetches Upstox Plus expired option contracts and one-minute historical candles, then replays account-level entry, stop, target, reversal, cooldown, costs and risk rules.",
                 style = MaterialTheme.typography.bodySmall,
+            )
+            BacktestRangeSelector(
+                selectedMonths = state.selectedMonths,
+                enabled = !state.isRunning,
+                onSelected = onRangeSelected,
             )
 
             if (state.isRunning) {
@@ -324,7 +333,7 @@ private fun BacktestPanel(
                 OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) { Text("CANCEL BACKTEST") }
             } else {
                 Button(onClick = onRun, enabled = token.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
-                    Text("FETCH 3 MONTHS & RUN")
+                    Text("FETCH ${if (state.selectedMonths == 12) "1 YEAR" else "${state.selectedMonths} MONTHS"} & RUN")
                 }
             }
 
@@ -342,13 +351,21 @@ private fun BacktestPanel(
                 }
                 Row(Modifier.fillMaxWidth()) {
                     BacktestMetric("PROFIT FACTOR", decimal(result.report.profitFactor), Modifier.weight(1f))
-                    BacktestMetric("DRAWDOWN", price(result.report.maxDrawdown), Modifier.weight(1f))
-                    BacktestMetric("PRECISION", percent(result.report.signalPrecision), Modifier.weight(1f))
+                    BacktestMetric("DRAWDOWN", price(result.maxAccountDrawdown), Modifier.weight(1f))
+                    BacktestMetric("ENDING CAPITAL", price(result.endingCapital), Modifier.weight(1f))
+                }
+                Row(Modifier.fillMaxWidth()) {
+                    BacktestMetric("TRAIN PF", decimal(result.trainReport.profitFactor), Modifier.weight(1f))
+                    BacktestMetric("TEST PF", decimal(result.testReport.profitFactor), Modifier.weight(1f))
+                    BacktestMetric("TEST WIN", percent(result.testReport.winRate), Modifier.weight(1f))
                 }
                 Text(
-                    "${result.expiries} expiries · ${result.contractsTested} contracts · ${result.candlesProcessed} candles · ${result.errors.size} errors",
+                    "${result.expiries} expiries · ${result.contractsTested} contracts · ${result.candlesProcessed} candles · ${result.rejectedSignals} rejected · ${result.errors.size} errors",
                     style = MaterialTheme.typography.labelSmall,
                 )
+                if (result.capitalExhausted) {
+                    Text("CAPITAL EXHAUSTED — strategy rejected", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                }
                 if (result.errors.isNotEmpty()) {
                     Text("First error: ${result.errors.first()}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, maxLines = 3)
                 }

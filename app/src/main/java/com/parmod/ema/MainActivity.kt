@@ -19,6 +19,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.parmod.ema.backtest.BacktestViewModel
 import com.parmod.ema.data.UpstoxOptionDiscoveryClient
 import com.parmod.ema.model.*
 import kotlinx.coroutines.Dispatchers
@@ -35,8 +36,12 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun VardhaniApp(vm: TradingViewModel = viewModel()) {
+private fun VardhaniApp(
+    vm: TradingViewModel = viewModel(),
+    backtestVm: BacktestViewModel = viewModel(),
+) {
     val state by vm.state.collectAsState()
+    val backtest by backtestVm.state.collectAsState()
     val scope = rememberCoroutineScope()
     var token by remember { mutableStateOf("") }
     var isConnecting by remember { mutableStateOf(false) }
@@ -55,7 +60,7 @@ private fun VardhaniApp(vm: TradingViewModel = viewModel()) {
                 availableExpiries = discovery.expiries
                 selectedExpiry = discovery.nearestExpiry
                 vm.connectLive(token.trim(), discovery.nearestExpiry)
-            } catch (error: Exception) {
+            } catch (_: Exception) {
                 vm.disconnect()
             } finally {
                 isConnecting = false
@@ -72,7 +77,12 @@ private fun VardhaniApp(vm: TradingViewModel = viewModel()) {
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(painterResource(R.drawable.vardhani_logo), contentDescription = "VARDHANI", modifier = Modifier.size(36.dp), tint = Color.Unspecified)
+                        Icon(
+                            painterResource(R.drawable.vardhani_logo),
+                            contentDescription = "VARDHANI",
+                            modifier = Modifier.size(36.dp),
+                            tint = Color.Unspecified,
+                        )
                         Spacer(Modifier.width(8.dp))
                         Column {
                             Text("VARDHANI", fontWeight = FontWeight.Bold)
@@ -120,7 +130,18 @@ private fun VardhaniApp(vm: TradingViewModel = viewModel()) {
             item { AccountAndSignal(state) }
             item { TradeControls(state, vm) }
             state.position?.let { item { PositionStrip(state, vm) } }
-            if (state.appMode == AppMode.BACKTEST) item { BacktestPanel() }
+            if (state.appMode == AppMode.BACKTEST) {
+                item {
+                    BacktestPanel(
+                        token = token,
+                        index = state.index,
+                        state = backtest,
+                        onRun = { backtestVm.run(token, state.index) },
+                        onCancel = backtestVm::cancel,
+                        onClear = backtestVm::clearResult,
+                    )
+                }
+            }
             item { Text(state.message, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 4.dp)) }
             if (state.appMode == AppMode.LIVE_MARKET) item { OptionChainTable(state.optionChain) }
             item { Spacer(Modifier.height(16.dp)) }
@@ -153,10 +174,12 @@ private fun ConnectionCard(
                     singleLine = true,
                     label = { Text("Paste Upstox access token") },
                     visualTransformation = PasswordVisualTransformation(),
-                    supportingText = { Text("Token is used for market data and historical research") },
+                    supportingText = { Text("Used for live data and Upstox Plus historical research") },
                 )
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Button(onClick = onConnect, modifier = Modifier.weight(1f), enabled = token.isNotBlank() && !isConnecting) { Text(if (isConnecting) "CONNECTING…" else "CONNECT LIVE") }
+                    Button(onClick = onConnect, modifier = Modifier.weight(1f), enabled = token.isNotBlank() && !isConnecting) {
+                        Text(if (isConnecting) "CONNECTING…" else "CONNECT LIVE")
+                    }
                     OutlinedButton(onClick = onDemo, modifier = Modifier.weight(1f)) { Text("DEMO") }
                 }
             } else {
@@ -171,7 +194,9 @@ private fun ConnectionCard(
                     Box {
                         OutlinedButton(onClick = { onExpiryExpanded(true) }, modifier = Modifier.fillMaxWidth()) { Text("Expiry: $selectedExpiry") }
                         DropdownMenu(expanded = expiryExpanded, onDismissRequest = { onExpiryExpanded(false) }) {
-                            availableExpiries.forEach { expiry -> DropdownMenuItem(text = { Text(expiry) }, onClick = { onExpirySelected(expiry) }) }
+                            availableExpiries.forEach { expiry ->
+                                DropdownMenuItem(text = { Text(expiry) }, onClick = { onExpirySelected(expiry) })
+                            }
                         }
                     }
                 }
@@ -195,7 +220,9 @@ private fun ModePanel(state: DashboardState, vm: TradingViewModel) {
             Button(
                 onClick = { vm.setLiveTradingEnabled(!state.liveTradingEnabled) },
                 modifier = Modifier.weight(1.2f),
-                colors = ButtonDefaults.buttonColors(containerColor = if (state.liveTradingEnabled) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.secondary),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (state.liveTradingEnabled) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.secondary,
+                ),
             ) { Text(if (state.liveTradingEnabled) "LIVE ORDERS ON" else "LIVE ORDERS OFF", fontSize = 10.sp) }
         }
     }
@@ -203,8 +230,11 @@ private fun ModePanel(state: DashboardState, vm: TradingViewModel) {
 
 @Composable
 private fun Choice(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
-    if (selected) Button(onClick = {}, enabled = false, modifier = modifier, contentPadding = PaddingValues(horizontal = 3.dp)) { Text(label, fontSize = 10.sp) }
-    else OutlinedButton(onClick = onClick, modifier = modifier, contentPadding = PaddingValues(horizontal = 3.dp)) { Text(label, fontSize = 10.sp) }
+    if (selected) Button(onClick = {}, enabled = false, modifier = modifier, contentPadding = PaddingValues(horizontal = 3.dp)) {
+        Text(label, fontSize = 10.sp)
+    } else OutlinedButton(onClick = onClick, modifier = modifier, contentPadding = PaddingValues(horizontal = 3.dp)) {
+        Text(label, fontSize = 10.sp)
+    }
 }
 
 @Composable
@@ -237,7 +267,11 @@ private fun AccountAndSignal(state: DashboardState) {
     }
 }
 
-@Composable private fun Metric(label: String, value: String, modifier: Modifier) = Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) { Text(label, fontSize = 9.sp); Text(value, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+@Composable
+private fun Metric(label: String, value: String, modifier: Modifier) = Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+    Text(label, fontSize = 9.sp)
+    Text(value, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+}
 
 @Composable
 private fun TradeControls(state: DashboardState, vm: TradingViewModel) {
@@ -268,13 +302,67 @@ private fun PositionStrip(state: DashboardState, vm: TradingViewModel) {
 }
 
 @Composable
-private fun BacktestPanel() {
+private fun BacktestPanel(
+    token: String,
+    index: MarketIndex,
+    state: BacktestViewModel.UiState,
+    onRun: () -> Unit,
+    onCancel: () -> Unit,
+    onClear: () -> Unit,
+) {
     Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("3-MONTH HISTORICAL BACKTEST", fontWeight = FontWeight.Bold)
-            Text("Upstox Plus expired contracts and historical candles will be fetched for the selected market. Results will include trades, win rate, net P&L, profit factor, expectancy and drawdown.", style = MaterialTheme.typography.bodySmall)
-            Button(onClick = {}, enabled = false, modifier = Modifier.fillMaxWidth()) { Text("FETCH 3 MONTHS & RUN · PIPELINE BUILDING") }
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            Text("3-MONTH ${index.name} BACKTEST", fontWeight = FontWeight.Bold)
+            Text(
+                "Fetches Upstox Plus expired option contracts and one-minute historical candles, then replays the production entry, stop, target, reversal and cooldown rules.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            if (state.isRunning) {
+                LinearProgressIndicator(progress = { state.progress }, modifier = Modifier.fillMaxWidth())
+                Text("${state.completed}/${state.total.coerceAtLeast(1)} · ${state.message}", style = MaterialTheme.typography.labelSmall)
+                OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) { Text("CANCEL BACKTEST") }
+            } else {
+                Button(onClick = onRun, enabled = token.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
+                    Text("FETCH 3 MONTHS & RUN")
+                }
+            }
+
+            state.error?.let {
+                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            }
+
+            state.result?.let { result ->
+                HorizontalDivider()
+                Text("${result.fromDate} to ${result.toDate}", style = MaterialTheme.typography.labelMedium)
+                Row(Modifier.fillMaxWidth()) {
+                    BacktestMetric("TRADES", result.report.trades.toString(), Modifier.weight(1f))
+                    BacktestMetric("WIN RATE", percent(result.report.winRate), Modifier.weight(1f))
+                    BacktestMetric("NET P&L", price(result.report.netPnl), Modifier.weight(1f))
+                }
+                Row(Modifier.fillMaxWidth()) {
+                    BacktestMetric("PROFIT FACTOR", decimal(result.report.profitFactor), Modifier.weight(1f))
+                    BacktestMetric("DRAWDOWN", price(result.report.maxDrawdown), Modifier.weight(1f))
+                    BacktestMetric("PRECISION", percent(result.report.signalPrecision), Modifier.weight(1f))
+                }
+                Text(
+                    "${result.expiries} expiries · ${result.contractsTested} contracts · ${result.candlesProcessed} candles · ${result.errors.size} errors",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+                if (result.errors.isNotEmpty()) {
+                    Text("First error: ${result.errors.first()}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, maxLines = 3)
+                }
+                OutlinedButton(onClick = onClear, modifier = Modifier.fillMaxWidth()) { Text("CLEAR RESULTS") }
+            }
         }
+    }
+}
+
+@Composable
+private fun BacktestMetric(label: String, value: String, modifier: Modifier) {
+    Column(modifier.padding(3.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, fontSize = 9.sp)
+        Text(value, fontWeight = FontWeight.Bold, fontSize = 12.sp, textAlign = TextAlign.Center)
     }
 }
 
@@ -282,16 +370,30 @@ private data class ChainRow(val strike: Double, val ce: OptionQuote?, val pe: Op
 
 @Composable
 private fun OptionChainTable(options: List<OptionQuote>) {
-    val rows = remember(options) { options.groupBy { it.strike }.toSortedMap().map { (strike, quotes) -> ChainRow(strike, quotes.firstOrNull { it.type == "CE" }, quotes.firstOrNull { it.type == "PE" }, quotes.any { it.isAtm }) } }
+    val rows = remember(options) {
+        options.groupBy { it.strike }.toSortedMap().map { (strike, quotes) ->
+            ChainRow(strike, quotes.firstOrNull { it.type == "CE" }, quotes.firstOrNull { it.type == "PE" }, quotes.any { it.isAtm })
+        }
+    }
     Card(Modifier.fillMaxWidth()) {
         Column {
             Text("OPTION CHAIN · LIVE TICKS", Modifier.padding(10.dp), fontWeight = FontWeight.Bold)
             Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant).padding(vertical = 6.dp)) {
-                Header("CE LTP", 1f); Header("CE OI/ΔOI", 1.2f); Header("STRIKE", .9f); Header("PE LTP", 1f); Header("PE OI/ΔOI", 1.2f)
+                Header("CE LTP", 1f)
+                Header("CE OI/ΔOI", 1.2f)
+                Header("STRIKE", .9f)
+                Header("PE LTP", 1f)
+                Header("PE OI/ΔOI", 1.2f)
             }
             if (rows.isEmpty()) Text("Connect live data to load the option chain", Modifier.fillMaxWidth().padding(18.dp), textAlign = TextAlign.Center)
             rows.forEach { row ->
-                Row(Modifier.fillMaxWidth().background(if (row.atm) MaterialTheme.colorScheme.primaryContainer else Color.Transparent).border(.25.dp, MaterialTheme.colorScheme.outlineVariant).padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    Modifier.fillMaxWidth()
+                        .background(if (row.atm) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+                        .border(.25.dp, MaterialTheme.colorScheme.outlineVariant)
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Cell(row.ce?.ltp?.let { "%.2f".format(Locale.US, it) } ?: "—", 1f)
                     Cell(row.ce?.let { "${compact(it.openInterest)}/${signed(it.changeInOpenInterest)}" } ?: "—", 1.2f)
                     Cell(row.strike.toInt().toString() + if (row.atm) "\nATM" else "", .9f, true)
@@ -303,8 +405,24 @@ private fun OptionChainTable(options: List<OptionQuote>) {
     }
 }
 
-@Composable private fun RowScope.Header(text: String, weight: Float) = Text(text, Modifier.weight(weight), textAlign = TextAlign.Center, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-@Composable private fun RowScope.Cell(text: String, weight: Float, bold: Boolean = false) = Text(text, Modifier.weight(weight), textAlign = TextAlign.Center, fontSize = 10.sp, fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal)
-private fun compact(v: Long) = when { kotlin.math.abs(v) >= 100_000 -> "%.1fL".format(Locale.US, v / 100_000.0); kotlin.math.abs(v) >= 1_000 -> "%.1fK".format(Locale.US, v / 1_000.0); else -> v.toString() }
+@Composable
+private fun RowScope.Header(text: String, weight: Float) = Text(text, Modifier.weight(weight), textAlign = TextAlign.Center, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+
+@Composable
+private fun RowScope.Cell(text: String, weight: Float, bold: Boolean = false) = Text(
+    text,
+    Modifier.weight(weight),
+    textAlign = TextAlign.Center,
+    fontSize = 10.sp,
+    fontWeight = if (bold) FontWeight.Bold else FontWeight.Normal,
+)
+
+private fun compact(v: Long) = when {
+    kotlin.math.abs(v) >= 100_000 -> "%.1fL".format(Locale.US, v / 100_000.0)
+    kotlin.math.abs(v) >= 1_000 -> "%.1fK".format(Locale.US, v / 1_000.0)
+    else -> v.toString()
+}
 private fun signed(v: Long) = (if (v > 0) "+" else "") + compact(v)
 private fun price(v: Double) = "₹%,.2f".format(Locale.US, v)
+private fun percent(v: Double) = "%.1f%%".format(Locale.US, v * 100.0)
+private fun decimal(v: Double) = if (v.isInfinite()) "∞" else "%.2f".format(Locale.US, v)

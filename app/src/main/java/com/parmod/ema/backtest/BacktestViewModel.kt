@@ -11,12 +11,20 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+enum class BacktestRange(val months: Long, val label: String) {
+    ONE_MONTH(1, "1M"),
+    THREE_MONTHS(3, "3M"),
+    SIX_MONTHS(6, "6M"),
+    ONE_YEAR(12, "1Y"),
+}
+
 class BacktestViewModel : ViewModel() {
     data class UiState(
+        val range: BacktestRange = BacktestRange.SIX_MONTHS,
         val isRunning: Boolean = false,
         val completed: Int = 0,
         val total: Int = 0,
-        val message: String = "Ready to fetch three months of Upstox Plus data",
+        val message: String = "Ready to fetch six months of Upstox Plus data",
         val result: ThreeMonthBacktestPipeline.Result? = null,
         val error: String? = null,
     ) {
@@ -28,6 +36,11 @@ class BacktestViewModel : ViewModel() {
     val state: StateFlow<UiState> = _state.asStateFlow()
     private var job: Job? = null
 
+    fun selectRange(range: BacktestRange) {
+        if (job?.isActive == true) return
+        _state.value = UiState(range = range, message = "Ready to fetch ${range.months} month${if (range.months == 1L) "" else "s"} of Upstox Plus data")
+    }
+
     fun run(accessToken: String, index: MarketIndex) {
         if (accessToken.isBlank()) {
             _state.value = _state.value.copy(error = "Paste and verify a valid Upstox token first")
@@ -35,12 +48,14 @@ class BacktestViewModel : ViewModel() {
         }
         if (job?.isActive == true) return
 
-        _state.value = UiState(isRunning = true, message = "Discovering expired expiries…")
+        val selectedRange = _state.value.range
+        _state.value = UiState(range = selectedRange, isRunning = true, message = "Discovering expired expiries…")
         job = viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
                     ThreeMonthBacktestPipeline(UpstoxPlusHistoricalClient(accessToken.trim())).run(
                         index = index,
+                        months = selectedRange.months,
                         onProgress = { progress ->
                             _state.value = _state.value.copy(
                                 isRunning = true,
@@ -54,6 +69,7 @@ class BacktestViewModel : ViewModel() {
                 }
             }.onSuccess { result ->
                 _state.value = UiState(
+                    range = selectedRange,
                     isRunning = false,
                     completed = result.contractsTested,
                     total = result.contractsTested,
@@ -78,7 +94,8 @@ class BacktestViewModel : ViewModel() {
 
     fun clearResult() {
         if (job?.isActive == true) return
-        _state.value = UiState()
+        val range = _state.value.range
+        _state.value = UiState(range = range)
     }
 
     override fun onCleared() {

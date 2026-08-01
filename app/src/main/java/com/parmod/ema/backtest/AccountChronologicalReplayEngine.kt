@@ -1,18 +1,20 @@
 package com.parmod.ema.backtest
 
+import com.parmod.ema.engine.SignalEngineV2
 import java.time.LocalDate
 import kotlin.math.abs
 
 /**
  * Replays all candidate option contracts on one account timeline.
  * Enforces one open position, daily limits, capital exhaustion, slippage and costs.
+ * Candidate generation uses the same Signal Engine v2 quality core intended for live signals.
  */
-class AccountChronologicalReplayEngine {
+class AccountChronologicalReplayEngine(
+    private val signalEngine: SignalEngineV2 = SignalEngineV2(),
+) {
     data class Config(
         val startingCapital: Double = 100_000.0,
-        val fastPeriod: Int = 8,
-        val slowPeriod: Int = 20,
-        val minimumConfidence: Int = 85,
+        val minimumConfidence: Int = 80,
         val stopLossPct: Double = 0.15,
         val targetPct: Double = 0.30,
         val cooldownMinutes: Long = 5,
@@ -50,27 +52,34 @@ class AccountChronologicalReplayEngine {
     fun replay(series: List<Series>, config: Config = Config()): Result {
         if (series.isEmpty()) return emptyResult(config.startingCapital)
         val byTime = sortedMapOf<Long, MutableList<Candidate>>()
+        val engineConfig = SignalEngineV2.Config(minimumScore = config.minimumConfidence)
+
         series.forEach { s ->
-            val closes = ArrayList<Double>()
-            s.candles.forEachIndexed { i, c ->
-                closes += c.close
-                if (closes.size < config.slowPeriod || c.close <= 0.0) return@forEachIndexed
-                val fast = ema(closes, config.fastPeriod)
-                val slow = ema(closes, config.slowPeriod)
-                val previousFast = ema(closes.dropLast(1), config.fastPeriod)
-                val slope = fast - previousFast
-                val separation = abs(fast - slow) / c.close
-                val match = if (s.optionType == "CE") fast > slow && slope > 0 else fast < slow && slope < 0
-                if (!match) return@forEachIndexed
-                val score = (65 + minOf(20, (abs(slope) / c.close * 120_000).toInt()) + if (separation > 0.00005) 10 else 0).coerceAtMost(95)
-                if (score >= config.minimumConfidence) {
-                    byTime.getOrPut(c.time.toInstant().toEpochMilli()) { mutableListOf() } += Candidate(s, i, score)
+            val bars = ArrayList<SignalEngineV2.Bar>()
+            s.candles.forEachIndexed { i, candle ->
+                if (candle.close <= 0.0) return@forEachIndexed
+                bars += SignalEngineV2.Bar(
+                    open = candle.open,
+                    high = candle.high,
+                    low = candle.low,
+                    close = candle.close,
+                    volume = candle.volume,
+                )
+                val evaluation = signalEngine.evaluate(bars, engineConfig)
+                // We buy options only when that option premium itself has a confirmed bullish expansion.
+                if (evaluation.direction == SignalEngineV2.Direction.BULLISH &&
+                    evaluation.score >= config.minimumConfidence
+                ) {
+                    byTime.getOrPut(candle.time.toInstant().toEpochMilli()) { mutableListOf() } +=
+                        Candidate(s, i, evaluation.score)
                 }
             }
         }
 
         val allTimes = byTime.keys.toList()
-        val splitTime = allTimes.getOrNull((allTimes.size * config.trainFraction).toInt().coerceIn(0, (allTimes.size - 1).coerceAtLeast(0))) ?: Long.MAX_VALUE
+        val splitIndex = (allTimes.size * config.trainFraction).toInt()
+            .coerceIn(0, (allTimes.size - 1).coerceAtLeast(0))
+        val splitTime = allTimes.getOrNull(splitIndex) ?: Long.MAX_VALUE
         val trades = ArrayList<BacktestEngine.Trade>()
         var capital = config.startingCapital
         var peak = capital
@@ -98,14 +107,25 @@ class AccountChronologicalReplayEngine {
                 val candle = active.series.candles.firstOrNull { it.time.toInstant().toEpochMilli() == time }
                 if (candle != null) {
                     val pct = (candle.close - entryPrice) / entryPrice
-                    val reverse = candidates.any { it.series.optionType != active.series.optionType }
+                    val reverse = candidates.any {
+                        it.series.optionType != active.series.optionType && it.score >= active.score
+                    }
                     if (pct <= -config.stopLossPct || pct >= config.targetPct || reverse) {
                         val exit = candle.close * (1.0 - config.slippagePctEachSide)
                         val entry = entryPrice * (1.0 + config.slippagePctEachSide)
                         val gross = (exit - entry) * active.series.lotSize
                         val net = gross - config.flatChargesPerRoundTrip
                         val adjustedExit = entry + net / active.series.lotSize
-                        val trade = BacktestEngine.Trade(entryTime, time, active.series.optionType, entry, adjustedExit, active.series.lotSize, active.score, active.series.expiry)
+                        val trade = BacktestEngine.Trade(
+                            entryTime,
+                            time,
+                            active.series.optionType,
+                            entry,
+                            adjustedExit,
+                            active.series.lotSize,
+                            active.score,
+                            active.series.expiry,
+                        )
                         trades += trade
                         capital += trade.pnl
                         dailyPnl += trade.pnl
@@ -113,20 +133,33 @@ class AccountChronologicalReplayEngine {
                         maxDrawdown = maxOf(maxDrawdown, peak - capital)
                         open = null
                         cooldownUntil = time + config.cooldownMinutes * 60_000L
-                        if (capital <= 0.0) { exhausted = true; break }
+                        if (capital <= 0.0) {
+                            exhausted = true
+                            break
+                        }
                     }
                 }
             }
 
             if (open == null) {
-                if (time < cooldownUntil || tradesToday >= config.maximumTradesPerDay || dailyPnl <= -config.maximumDailyLoss || capital <= 0.0) {
+                if (time < cooldownUntil ||
+                    tradesToday >= config.maximumTradesPerDay ||
+                    dailyPnl <= -config.maximumDailyLoss ||
+                    capital <= 0.0
+                ) {
                     rejected += candidates.size
                     continue
                 }
-                val best = candidates.maxWithOrNull(compareBy<Candidate> { it.score }.thenBy { -abs(it.series.strike) }) ?: continue
+                val best = candidates.maxWithOrNull(
+                    compareBy<Candidate> { it.score }
+                        .thenBy { -abs(it.series.strike) },
+                ) ?: continue
                 val candle = best.series.candles[best.index]
                 val required = candle.close * best.series.lotSize
-                if (required > capital) { rejected++; continue }
+                if (required > capital) {
+                    rejected++
+                    continue
+                }
                 open = best
                 entryPrice = candle.close
                 entryTime = time
@@ -149,14 +182,13 @@ class AccountChronologicalReplayEngine {
         )
     }
 
-    private fun emptyResult(capital: Double) = Result(emptyList(), BacktestEngine().evaluate(emptyList()), BacktestEngine().evaluate(emptyList()), capital, 0.0, 0, false)
-
-    private fun ema(values: List<Double>, period: Int): Double {
-        val subset = values.takeLast(period)
-        if (subset.isEmpty()) return 0.0
-        val k = 2.0 / (period + 1.0)
-        var result = subset.first()
-        subset.drop(1).forEach { result = it * k + result * (1.0 - k) }
-        return result
-    }
+    private fun emptyResult(capital: Double) = Result(
+        emptyList(),
+        BacktestEngine().evaluate(emptyList()),
+        BacktestEngine().evaluate(emptyList()),
+        capital,
+        0.0,
+        0,
+        false,
+    )
 }

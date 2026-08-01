@@ -2,6 +2,7 @@ package com.parmod.ema.data
 
 import com.upstox.marketdatafeederv3udapi.rpc.proto.Feed
 import com.upstox.marketdatafeederv3udapi.rpc.proto.FeedResponse
+import com.upstox.marketdatafeederv3udapi.rpc.proto.FullFeed
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -93,11 +94,11 @@ class UpstoxTickStream(
             Feed.FeedUnionCase.FULLFEED -> {
                 val full = feed.fullFeed
                 when (full.fullFeedUnionCase) {
-                    com.upstox.marketdatafeederv3udapi.rpc.proto.FullFeed.FullFeedUnionCase.MARKETFF -> {
+                    FullFeed.FullFeedUnionCase.MARKETFF -> {
                         val item = full.marketFF
                         Tick(key, item.ltpc.ltp, item.ltpc.ltt, item.oi.toLong(), item.optionGreeks.delta, item.optionGreeks.gamma, timestamp)
                     }
-                    com.upstox.marketdatafeederv3udapi.rpc.proto.FullFeed.FullFeedUnionCase.INDEXFF -> {
+                    FullFeed.FullFeedUnionCase.INDEXFF -> {
                         val item = full.indexFF
                         Tick(key, item.ltpc.ltp, item.ltpc.ltt, null, null, null, timestamp)
                     }

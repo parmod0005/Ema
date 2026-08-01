@@ -1,9 +1,9 @@
 package com.parmod.ema.backtest
 
 import java.time.OffsetDateTime
-import kotlin.test.Test
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
 
 class AccountChronologicalReplayEngineTest {
     @Test

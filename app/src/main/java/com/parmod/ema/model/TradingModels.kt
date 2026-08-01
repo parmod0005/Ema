@@ -38,7 +38,14 @@ data class PaperPosition(
     val quantity: Int,
     val entryPrice: Double,
     val currentPrice: Double,
-) { val pnl: Double get() = (currentPrice - entryPrice) * quantity }
+    val highestPrice: Double = entryPrice,
+    val stopPrice: Double = entryPrice * 0.85,
+    val targetPrice: Double = entryPrice * 1.30,
+    val breakevenActive: Boolean = false,
+    val trailingActive: Boolean = false,
+) {
+    val pnl: Double get() = (currentPrice - entryPrice) * quantity
+}
 
 data class DashboardState(
     val index: MarketIndex = MarketIndex.NIFTY,

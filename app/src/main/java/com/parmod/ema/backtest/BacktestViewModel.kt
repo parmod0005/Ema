@@ -1,6 +1,7 @@
 package com.parmod.ema.backtest
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.parmod.ema.model.MarketIndex
 import kotlinx.coroutines.Dispatchers
@@ -10,6 +11,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 enum class BacktestRange(val months: Long, val label: String) {
     ONE_MONTH(1, "1M"),
@@ -18,7 +20,7 @@ enum class BacktestRange(val months: Long, val label: String) {
     ONE_YEAR(12, "1Y"),
 }
 
-class BacktestViewModel : ViewModel() {
+class BacktestViewModel(application: Application) : AndroidViewModel(application) {
     data class UiState(
         val range: BacktestRange = BacktestRange.SIX_MONTHS,
         val isRunning: Boolean = false,
@@ -27,6 +29,8 @@ class BacktestViewModel : ViewModel() {
         val message: String = "Ready to fetch six months of Upstox Plus data",
         val result: ThreeMonthBacktestPipeline.Result? = null,
         val error: String? = null,
+        val cacheHits: Long = 0,
+        val networkRequests: Long = 0,
     ) {
         val progress: Float
             get() = if (total <= 0) 0f else (completed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
@@ -37,12 +41,13 @@ class BacktestViewModel : ViewModel() {
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
     private var job: Job? = null
+    private val candleCache = File(application.filesDir, "upstox_backtest_cache/v1")
 
     fun selectRange(range: BacktestRange) {
         if (job?.isActive == true) return
         _state.value = UiState(
             range = range,
-            message = "Ready to fetch ${range.months} month${if (range.months == 1L) "" else "s"} of Upstox Plus data",
+            message = "Ready to fetch or resume ${range.months} month${if (range.months == 1L) "" else "s"} of Upstox Plus data",
         )
     }
 
@@ -59,38 +64,56 @@ class BacktestViewModel : ViewModel() {
         if (job?.isActive == true) return
 
         val selectedRange = _state.value.range
-        _state.value = UiState(range = selectedRange, isRunning = true, message = "Discovering expired expiries…")
+        _state.value = UiState(
+            range = selectedRange,
+            isRunning = true,
+            message = "Discovering expiries · completed candle files will be reused…",
+        )
         job = viewModelScope.launch {
+            var client: UpstoxPlusHistoricalClient? = null
             runCatching {
                 withContext(Dispatchers.IO) {
-                    ThreeMonthBacktestPipeline(UpstoxPlusHistoricalClient(accessToken.trim())).run(
+                    client = UpstoxPlusHistoricalClient(
+                        accessToken = accessToken.trim(),
+                        cacheDirectory = candleCache,
+                    )
+                    ThreeMonthBacktestPipeline(client!!).run(
                         index = index,
                         months = selectedRange.months,
                         onProgress = { progress ->
+                            val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
                             _state.value = _state.value.copy(
                                 isRunning = true,
                                 completed = progress.completed,
                                 total = progress.total,
-                                message = progress.message,
+                                message = "${progress.message} · cache ${stats.cacheHits} · network ${stats.requests}",
                                 error = null,
+                                cacheHits = stats.cacheHits,
+                                networkRequests = stats.requests,
                             )
                         },
                     )
                 }
             }.onSuccess { result ->
+                val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
                 _state.value = UiState(
                     range = selectedRange,
                     isRunning = false,
                     completed = result.contractsTested,
                     total = result.contractsTested,
-                    message = "Backtest complete: ${result.report.trades} trades across ${result.expiries} expiries",
+                    message = "Backtest complete · ${stats.cacheHits} cached datasets · ${stats.requests} network requests",
                     result = result,
+                    cacheHits = stats.cacheHits,
+                    networkRequests = stats.requests,
                 )
             }.onFailure { error ->
+                val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
                 _state.value = _state.value.copy(
                     isRunning = false,
-                    message = "Backtest failed",
+                    message = "Backtest stopped · cached contracts remain available for resume",
                     error = error.message ?: error::class.java.simpleName,
+                    cacheHits = stats.cacheHits,
+                    networkRequests = stats.requests,
                 )
             }
         }
@@ -99,13 +122,27 @@ class BacktestViewModel : ViewModel() {
     fun cancel() {
         job?.cancel()
         job = null
-        _state.value = _state.value.copy(isRunning = false, message = "Backtest cancelled")
+        _state.value = _state.value.copy(
+            isRunning = false,
+            message = "Backtest cancelled · completed candle downloads were retained",
+        )
     }
 
     fun clearResult() {
         if (job?.isActive == true) return
         val range = _state.value.range
         _state.value = UiState(range = range)
+    }
+
+    fun clearCache() {
+        if (job?.isActive == true) return
+        candleCache.deleteRecursively()
+        candleCache.mkdirs()
+        _state.value = _state.value.copy(
+            cacheHits = 0,
+            networkRequests = 0,
+            message = "Historical candle cache cleared",
+        )
     }
 
     override fun onCleared() {

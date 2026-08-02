@@ -41,14 +41,40 @@ class TradingViewModel : ViewModel() {
     private var savedAccessToken = ""
     private var savedExpiry = ""
     private var aiClient: AiBridgeClient? = null
+    private var directOpenAiClient: DirectOpenAiClient? = null
     private var lastAiRequestMillis = 0L
     private var lastAiSnapshotSpot = 0.0
+
+    fun setAiConnectionMode(mode: AiConnectionMode) {
+        aiJob?.cancel()
+        val configured = when (mode) {
+            AiConnectionMode.BRIDGE_SERVER -> aiClient != null
+            AiConnectionMode.DIRECT_OPENAI -> directOpenAiClient != null
+        }
+        val provider = if (mode == AiConnectionMode.BRIDGE_SERVER) "Bridge Server" else "Direct OpenAI"
+        _state.value = _state.value.copy(
+            aiConnectionMode = mode,
+            aiDecision = null,
+            aiBridgeHealth = AiBridgeHealth(
+                configured = configured,
+                reachable = false,
+                message = if (configured) "$provider configured · waiting for market snapshot" else "$provider not configured",
+            ),
+            aiFinalReason = "$provider selected",
+            message = "$provider selected · Shadow/Paper only",
+        )
+        applyAiRouting()
+    }
 
     fun configureAiBridge(baseUrl: String, deviceToken: String) {
         aiJob?.cancel()
         aiClient = if (baseUrl.isBlank() || deviceToken.isBlank()) null else AiBridgeClient(baseUrl.trim(), deviceToken.trim())
+        _state.value = _state.value.copy(aiConnectionMode = AiConnectionMode.BRIDGE_SERVER, aiDecision = null)
         if (aiClient == null) {
-            _state.value = _state.value.copy(aiBridgeHealth = AiBridgeHealth(), aiDecision = null, aiFinalReason = "AI bridge not configured")
+            _state.value = _state.value.copy(
+                aiBridgeHealth = AiBridgeHealth(message = "AI bridge not configured"),
+                aiFinalReason = "AI bridge not configured",
+            )
             return
         }
         _state.value = _state.value.copy(aiBridgeHealth = AiBridgeHealth(configured = true, message = "Checking AI bridge…"))
@@ -56,6 +82,25 @@ class TradingViewModel : ViewModel() {
             val health = withContext(Dispatchers.IO) { aiClient?.health() ?: AiBridgeHealth() }
             _state.value = _state.value.copy(aiBridgeHealth = health, message = health.message)
         }
+    }
+
+    fun configureDirectOpenAi(apiKey: String, model: String) {
+        aiJob?.cancel()
+        val cleanModel = model.trim().ifBlank { "gpt-5" }
+        directOpenAiClient = if (apiKey.isBlank()) null else DirectOpenAiClient(apiKey.trim(), cleanModel)
+        _state.value = _state.value.copy(
+            aiConnectionMode = AiConnectionMode.DIRECT_OPENAI,
+            directOpenAiModel = cleanModel,
+            aiDecision = null,
+            aiBridgeHealth = if (directOpenAiClient == null) {
+                AiBridgeHealth(message = "Direct OpenAI not configured")
+            } else {
+                AiBridgeHealth(configured = true, message = "Direct OpenAI configured · waiting for snapshot")
+            },
+            aiFinalReason = if (directOpenAiClient == null) "Direct OpenAI not configured" else "Direct OpenAI selected · local safety routing active",
+            message = if (directOpenAiClient == null) "OpenAI key removed" else "Direct OpenAI configured · Shadow/Paper only",
+        )
+        applyAiRouting()
     }
 
     fun connectLive(accessToken: String, expiryDate: String) {
@@ -118,9 +163,10 @@ class TradingViewModel : ViewModel() {
     fun setAppMode(mode: AppMode) { _state.value = _state.value.copy(appMode = mode, message = if (mode == AppMode.BACKTEST) "Historical backtest mode" else "Live market mode") }
     fun setSignalEngineMode(mode: SignalEngineMode) {
         autoTradeTakenForSignal = false
+        val provider = if (_state.value.aiConnectionMode == AiConnectionMode.DIRECT_OPENAI) "Direct OpenAI" else "AI bridge"
         val reason = when (mode) {
             SignalEngineMode.NATIVE -> "Native Signal Engine V2 selected"
-            SignalEngineMode.AI_BRAIN -> "AI Brain selected · bridge decisions required"
+            SignalEngineMode.AI_BRAIN -> "AI Brain selected · $provider decisions required"
             SignalEngineMode.HYBRID -> "Hybrid selected · AI/native safety routing"
         }
         _state.value = _state.value.copy(signalEngineMode = mode, aiFinalReason = reason, message = reason)
@@ -168,22 +214,34 @@ class TradingViewModel : ViewModel() {
 
     private fun maybeRequestAi() {
         val c = _state.value
-        val client = aiClient ?: return
-        if (c.signalEngineMode == SignalEngineMode.NATIVE || !c.isConnected || !aiBuffer.isReady() || savedExpiry.isBlank()) return
+        val providerConfigured = when (c.aiConnectionMode) {
+            AiConnectionMode.BRIDGE_SERVER -> aiClient != null
+            AiConnectionMode.DIRECT_OPENAI -> directOpenAiClient != null
+        }
+        if (!providerConfigured || c.signalEngineMode == SignalEngineMode.NATIVE || !c.isConnected || !aiBuffer.isReady() || savedExpiry.isBlank()) return
         val now = System.currentTimeMillis()
         if (aiJob?.isActive == true || now - lastAiRequestMillis < 15_000L) return
         val snapshot = aiBuffer.build(c, savedExpiry, now)
         lastAiRequestMillis = now; lastAiSnapshotSpot = snapshot.spot
         aiJob = viewModelScope.launch {
             try {
-                val response = withContext(Dispatchers.IO) { client.analyze(snapshot) }
-                val health = AiBridgeHealth(configured = true, reachable = true, lastLatencyMillis = response.latencyMillis, lastSuccessMillis = System.currentTimeMillis(), message = "AI bridge online")
-                _state.value = _state.value.copy(aiBridgeHealth = health, aiDecision = response.decision)
+                val response = withContext(Dispatchers.IO) {
+                    when (c.aiConnectionMode) {
+                        AiConnectionMode.BRIDGE_SERVER -> aiClient?.analyze(snapshot)?.let { it.decision to it.latencyMillis }
+                            ?: error("AI bridge not configured")
+                        AiConnectionMode.DIRECT_OPENAI -> directOpenAiClient?.analyze(snapshot)?.let { it.decision to it.latencyMillis }
+                            ?: error("Direct OpenAI not configured")
+                    }
+                }
+                val providerName = if (c.aiConnectionMode == AiConnectionMode.BRIDGE_SERVER) "AI bridge" else "Direct OpenAI"
+                val health = AiBridgeHealth(configured = true, reachable = true, lastLatencyMillis = response.second, lastSuccessMillis = System.currentTimeMillis(), message = "$providerName online")
+                _state.value = _state.value.copy(aiBridgeHealth = health, aiDecision = response.first)
                 applyAiRouting(snapshotSpot = snapshot.spot)
                 runAutoIfEligible()
             } catch (error: Exception) {
                 val old = _state.value.aiBridgeHealth
-                _state.value = _state.value.copy(aiBridgeHealth = old.copy(configured = true, reachable = false, consecutiveFailures = old.consecutiveFailures + 1, message = error.message?.take(160) ?: "AI bridge error"))
+                val providerName = if (c.aiConnectionMode == AiConnectionMode.BRIDGE_SERVER) "AI bridge" else "Direct OpenAI"
+                _state.value = _state.value.copy(aiBridgeHealth = old.copy(configured = true, reachable = false, consecutiveFailures = old.consecutiveFailures + 1, message = error.message?.take(160) ?: "$providerName error"))
                 applyAiRouting(snapshotSpot = snapshot.spot)
             }
         }

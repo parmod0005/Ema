@@ -1,10 +1,13 @@
 package com.parmod.ema.backtest
 
 import com.parmod.ema.model.MarketIndex
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.time.LocalDate
 import java.time.OffsetDateTime
 import kotlin.math.min
@@ -14,6 +17,7 @@ class UpstoxPlusHistoricalClient(
     private val accessToken: String,
     private val minimumRequestSpacingMillis: Long = 350L,
     private val maximumAttempts: Int = 6,
+    private val cacheDirectory: File? = null,
 ) {
     data class ExpiredContract(
         val instrumentKey: String,
@@ -38,12 +42,18 @@ class UpstoxPlusHistoricalClient(
         val requests: Long = 0,
         val retries: Long = 0,
         val rateLimits: Long = 0,
+        val cacheHits: Long = 0,
+        val cacheWrites: Long = 0,
     )
 
     @Volatile
     private var stats = RequestStats()
     private val throttleLock = Any()
     private var lastRequestStartedMillis = 0L
+
+    init {
+        cacheDirectory?.mkdirs()
+    }
 
     fun requestStats(): RequestStats = stats
 
@@ -94,28 +104,87 @@ class UpstoxPlusHistoricalClient(
             "Unsupported expired-candle interval: $interval"
         }
         require(!fromDate.isAfter(toDate)) { "fromDate must not be after toDate" }
+
+        val cacheFile = candleCacheFile(expiredInstrumentKey, interval, fromDate, toDate)
+        readCachedCandles(cacheFile)?.let {
+            stats = stats.copy(cacheHits = stats.cacheHits + 1)
+            return it
+        }
+
         val key = URLEncoder.encode(expiredInstrumentKey, Charsets.UTF_8.name())
         val json = get(
             "https://api.upstox.com/v2/expired-instruments/historical-candle/" +
                 "$key/$interval/$toDate/$fromDate",
         )
-        val candles = json.getJSONObject("data").getJSONArray("candles")
-        return buildList {
-            for (i in 0 until candles.length()) {
-                val row = candles.getJSONArray(i)
-                add(
-                    Candle(
-                        time = OffsetDateTime.parse(row.getString(0)),
-                        open = row.getDouble(1),
-                        high = row.getDouble(2),
-                        low = row.getDouble(3),
-                        close = row.getDouble(4),
-                        volume = row.optLong(5, 0L),
-                        openInterest = row.optLong(6, 0L),
-                    ),
+        val candles = parseCandles(json.getJSONObject("data").getJSONArray("candles"))
+        writeCachedCandles(cacheFile, candles)
+        return candles
+    }
+
+    private fun parseCandles(rows: JSONArray): List<Candle> = buildList {
+        for (i in 0 until rows.length()) {
+            val row = rows.getJSONArray(i)
+            add(
+                Candle(
+                    time = OffsetDateTime.parse(row.getString(0)),
+                    open = row.getDouble(1),
+                    high = row.getDouble(2),
+                    low = row.getDouble(3),
+                    close = row.getDouble(4),
+                    volume = row.optLong(5, 0L),
+                    openInterest = row.optLong(6, 0L),
+                ),
+            )
+        }
+    }.sortedBy { it.time }
+
+    private fun candleCacheFile(key: String, interval: String, from: LocalDate, to: LocalDate): File? {
+        val root = cacheDirectory ?: return null
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest("$key|$interval|$from|$to".toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return File(root, "$digest.json")
+    }
+
+    private fun readCachedCandles(file: File?): List<Candle>? {
+        if (file == null || !file.isFile || file.length() == 0L) return null
+        return runCatching {
+            val root = JSONObject(file.readText())
+            if (root.optInt("version") != CACHE_VERSION || !root.optBoolean("complete", false)) return null
+            parseCandles(root.getJSONArray("candles"))
+        }.getOrNull()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun writeCachedCandles(file: File?, candles: List<Candle>) {
+        if (file == null || candles.isEmpty()) return
+        runCatching {
+            file.parentFile?.mkdirs()
+            val temp = File(file.parentFile, "${file.name}.tmp")
+            val rows = JSONArray()
+            candles.forEach { candle ->
+                rows.put(
+                    JSONArray().apply {
+                        put(candle.time.toString())
+                        put(candle.open)
+                        put(candle.high)
+                        put(candle.low)
+                        put(candle.close)
+                        put(candle.volume)
+                        put(candle.openInterest)
+                    },
                 )
             }
-        }.sortedBy { it.time }
+            temp.writeText(
+                JSONObject()
+                    .put("version", CACHE_VERSION)
+                    .put("complete", true)
+                    .put("candles", rows)
+                    .toString(),
+            )
+            if (file.exists()) file.delete()
+            check(temp.renameTo(file)) { "Unable to finalize candle cache" }
+            stats = stats.copy(cacheWrites = stats.cacheWrites + 1)
+        }
     }
 
     private fun encodedUnderlying(index: MarketIndex): String {
@@ -180,5 +249,9 @@ class UpstoxPlusHistoricalClient(
         val exponential = 1_000L shl (attempt - 1).coerceAtMost(5)
         val jitter = (System.nanoTime() and 511L)
         return min(exponential + jitter, 30_000L)
+    }
+
+    private companion object {
+        const val CACHE_VERSION = 1
     }
 }

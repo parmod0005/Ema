@@ -1,5 +1,7 @@
 package com.parmod.ema
 
+import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -18,12 +20,14 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.parmod.ema.ai.LocalCredentialVault
 import com.parmod.ema.backtest.BacktestRangeSelector
 import com.parmod.ema.backtest.BacktestViewModel
 import com.parmod.ema.data.UpstoxOptionDiscoveryClient
 import com.parmod.ema.model.*
+import com.parmod.ema.service.VardhaniMarketService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -54,6 +58,23 @@ private fun VardhaniApp(
     var expiries by remember { mutableStateOf(emptyList<String>()) }
     var expiryMenu by remember { mutableStateOf(false) }
 
+    fun startBackgroundMarket(index: MarketIndex, selectedExpiry: String) {
+        if (token.isBlank() || selectedExpiry.isBlank()) return
+        val intent = Intent(context, VardhaniMarketService::class.java).apply {
+            action = VardhaniMarketService.ACTION_START
+            putExtra(VardhaniMarketService.EXTRA_TOKEN, token.trim())
+            putExtra(VardhaniMarketService.EXTRA_EXPIRY, selectedExpiry)
+            putExtra(VardhaniMarketService.EXTRA_INDEX, index.name)
+        }
+        ContextCompat.startForegroundService(context, intent)
+    }
+
+    fun stopBackgroundMarket() {
+        context.startService(
+            Intent(context, VardhaniMarketService::class.java).setAction(VardhaniMarketService.ACTION_STOP),
+        )
+    }
+
     fun connect(index: MarketIndex = state.index) {
         if (token.isBlank() || connecting) return
         connecting = true
@@ -63,8 +84,12 @@ private fun VardhaniApp(
                     expiries = it.expiries
                     expiry = it.nearestExpiry
                     vm.connectLive(token.trim(), it.nearestExpiry)
+                    startBackgroundMarket(index, it.nearestExpiry)
                 }
-                .onFailure { vm.disconnect() }
+                .onFailure {
+                    stopBackgroundMarket()
+                    vm.disconnect()
+                }
             connecting = false
         }
     }
@@ -110,8 +135,17 @@ private fun VardhaniApp(
                         expiry = it
                         expiryMenu = false
                         vm.connectLive(token, it)
+                        startBackgroundMarket(state.index, it)
                     },
-                    { connect() }, vm::connectDemo, vm::disconnect,
+                    { connect() },
+                    {
+                        stopBackgroundMarket()
+                        vm.connectDemo()
+                    },
+                    {
+                        stopBackgroundMarket()
+                        vm.disconnect()
+                    },
                 )
             }
             item { MarketModePanel(state, vm) }
@@ -160,7 +194,7 @@ private fun ConnectionPanel(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("${state.index.name} connected", fontWeight = FontWeight.Bold)
-                        Text("Expiry ${expiry.ifBlank { "automatic" }}", style = MaterialTheme.typography.labelSmall)
+                        Text("Expiry ${expiry.ifBlank { "automatic" }} · background service active", style = MaterialTheme.typography.labelSmall)
                     }
                     OutlinedButton(onDisconnect) { Text("DISCONNECT") }
                 }
@@ -266,11 +300,12 @@ private fun BacktestCard(token: String, index: MarketIndex, state: BacktestViewM
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("UPSTOX PLUS BACKTEST · ${index.name}", fontWeight = FontWeight.Bold)
             BacktestRangeSelector(state.selectedMonths, !state.isRunning, vm::selectMonths)
+            Text("Downloaded candles are cached locally and reused on the next run.", style = MaterialTheme.typography.labelSmall)
             if (state.isRunning) {
                 LinearProgressIndicator({ state.progress }, Modifier.fillMaxWidth())
                 Text("${state.completed}/${state.total.coerceAtLeast(1)} · ${state.message}", style = MaterialTheme.typography.labelSmall)
                 OutlinedButton(vm::cancel, Modifier.fillMaxWidth()) { Text("CANCEL") }
-            } else Button({ vm.run(token, index) }, Modifier.fillMaxWidth(), enabled = token.isNotBlank()) { Text("FETCH DATA & RUN") }
+            } else Button({ vm.run(token, index) }, Modifier.fillMaxWidth(), enabled = token.isNotBlank()) { Text("FETCH / RESUME & RUN") }
             state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
             state.result?.let { result ->
                 HorizontalDivider()

@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.parmod.ema.MainActivity
 import com.parmod.ema.R
@@ -30,6 +31,7 @@ class VardhaniMarketService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var connectionJob: Job? = null
     private var stream: UpstoxTickStream? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     private var shouldRun = false
     private var token = ""
     private var expiry = ""
@@ -39,6 +41,10 @@ class VardhaniMarketService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VARDHANI:MarketFeed").apply {
+            setReferenceCounted(false)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -51,11 +57,10 @@ class VardhaniMarketService : Service() {
             ACTION_START, null -> {
                 token = intent?.getStringExtra(EXTRA_TOKEN).orEmpty().ifBlank { token }
                 expiry = intent?.getStringExtra(EXTRA_EXPIRY).orEmpty().ifBlank { expiry }
-                index = runCatching {
-                    MarketIndex.valueOf(intent?.getStringExtra(EXTRA_INDEX).orEmpty())
-                }.getOrDefault(index)
+                index = runCatching { MarketIndex.valueOf(intent?.getStringExtra(EXTRA_INDEX).orEmpty()) }.getOrDefault(index)
                 if (token.isNotBlank() && expiry.isNotBlank()) {
                     shouldRun = true
+                    if (wakeLock?.isHeld != true) wakeLock?.acquire(12 * 60 * 60 * 1000L)
                     startForeground(NOTIFICATION_ID, notification("Connecting ${index.name}…"))
                     connectWithRetry()
                 }
@@ -87,9 +92,7 @@ class VardhaniMarketService : Service() {
 
                             override fun onTick(tick: UpstoxTickStream.Tick) {
                                 receivedTicks += 1
-                                if (receivedTicks % 100L == 0L) {
-                                    updateNotification("${index.name} live · $receivedTicks ticks")
-                                }
+                                if (receivedTicks % 100L == 0L) updateNotification("${index.name} live · $receivedTicks ticks")
                             }
 
                             override fun onError(message: String) {
@@ -98,7 +101,10 @@ class VardhaniMarketService : Service() {
                             }
 
                             override fun onClosed() {
-                                if (shouldRun) connectWithRetry()
+                                if (shouldRun) scope.launch {
+                                    delay(1_000L)
+                                    connectWithRetry()
+                                }
                             }
                         },
                     ).also { it.connect() }
@@ -119,6 +125,7 @@ class VardhaniMarketService : Service() {
         connectionJob = null
         stream?.disconnect()
         stream = null
+        if (wakeLock?.isHeld == true) wakeLock?.release()
     }
 
     private fun createChannel() {
@@ -137,15 +144,11 @@ class VardhaniMarketService : Service() {
 
     private fun notification(text: String): Notification {
         val openIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val stopIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, VardhaniMarketService::class.java).setAction(ACTION_STOP),
+            this, 1, Intent(this, VardhaniMarketService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -155,17 +158,21 @@ class VardhaniMarketService : Service() {
             .setContentIntent(openIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .addAction(0, "STOP", stopIntent)
             .build()
     }
 
     private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, notification(text))
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        if (shouldRun) connectWithRetry()
+        if (shouldRun) {
+            updateNotification("App minimized · background feed active")
+            connectWithRetry()
+        }
         super.onTaskRemoved(rootIntent)
     }
 

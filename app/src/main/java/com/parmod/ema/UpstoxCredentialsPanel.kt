@@ -25,9 +25,10 @@ import androidx.compose.ui.unit.dp
 import com.parmod.ema.ai.LocalCredentialVault
 
 /**
- * Always-visible Upstox credential editor for the personal-device build.
- * Values are entered after installation and persisted only through the
- * Android Keystore-backed LocalCredentialVault.
+ * Compact editor for the long-lived Upstox application credentials.
+ *
+ * The short-lived access token is intentionally entered only in the main
+ * connection card, avoiding two token fields on the same screen.
  */
 @Composable
 fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
@@ -37,52 +38,66 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
 
     var apiKey by remember { mutableStateOf(initial.upstoxApiKey) }
     var apiSecret by remember { mutableStateOf(initial.upstoxApiSecret) }
-    var accessToken by remember { mutableStateOf(initial.upstoxAccessToken) }
     var redirectUri by remember { mutableStateOf(initial.upstoxRedirectUri) }
+    var expanded by remember { mutableStateOf(false) }
     var reveal by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-            Text("UPSTOX CREDENTIALS", fontWeight = FontWeight.Bold)
-            Text(
-                "Required for live data. API key and secret are stored encrypted on this phone and are not compiled into the APK.",
-                style = MaterialTheme.typography.labelSmall,
-            )
-            CredentialField("Upstox API key", apiKey, reveal) { apiKey = it.trim() }
-            CredentialField("Upstox API secret", apiSecret, reveal) { apiSecret = it.trim() }
-            CredentialField("Upstox access token", accessToken, reveal) { accessToken = it.trim() }
-            OutlinedTextField(
-                value = redirectUri,
-                onValueChange = { redirectUri = it.trim() },
-                label = { Text("Upstox redirect URI") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                OutlinedButton(
-                    onClick = { reveal = !reveal },
-                    modifier = Modifier.weight(1f),
-                ) { Text(if (reveal) "HIDE" else "REVEAL") }
-                Button(
-                    onClick = {
-                        val old = vault.read()
-                        vault.save(
-                            old.copy(
-                                upstoxApiKey = apiKey,
-                                upstoxApiSecret = apiSecret,
-                                upstoxAccessToken = accessToken,
-                                upstoxRedirectUri = redirectUri,
-                            ),
-                        )
-                        onAccessTokenSaved(accessToken)
-                        reveal = false
-                        message = "Upstox credentials encrypted and saved"
-                    },
-                    enabled = accessToken.isNotBlank(),
-                    modifier = Modifier.weight(1f),
-                ) { Text("SAVE") }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Column(Modifier.weight(1f)) {
+                    Text("UPSTOX APP CREDENTIALS", fontWeight = FontWeight.Bold)
+                    Text(
+                        if (apiKey.isNotBlank() && apiSecret.isNotBlank()) "API key and secret saved securely" else "Optional API key, secret and redirect URI",
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                OutlinedButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "CLOSE" else "EDIT")
+                }
             }
+
+            if (expanded) {
+                Text(
+                    "The access token is entered only in the connection card above. These longer-lived values are encrypted with Android Keystore.",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+                CredentialField("Upstox API key", apiKey, reveal) { apiKey = it.trim() }
+                CredentialField("Upstox API secret", apiSecret, reveal) { apiSecret = it.trim() }
+                OutlinedTextField(
+                    value = redirectUri,
+                    onValueChange = { redirectUri = it.trim() },
+                    label = { Text("Upstox redirect URI") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = { reveal = !reveal },
+                        modifier = Modifier.weight(1f),
+                    ) { Text(if (reveal) "HIDE" else "REVEAL") }
+                    Button(
+                        onClick = {
+                            val old = vault.read()
+                            vault.save(
+                                old.copy(
+                                    upstoxApiKey = apiKey,
+                                    upstoxApiSecret = apiSecret,
+                                    upstoxRedirectUri = redirectUri,
+                                ),
+                            )
+                            onAccessTokenSaved(old.upstoxAccessToken)
+                            reveal = false
+                            expanded = false
+                            message = "Upstox app credentials encrypted and saved"
+                        },
+                        enabled = apiKey.isNotBlank() || apiSecret.isNotBlank() || redirectUri.isNotBlank(),
+                        modifier = Modifier.weight(1f),
+                    ) { Text("SAVE") }
+                }
+            }
+
             if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.labelSmall)
         }
     }

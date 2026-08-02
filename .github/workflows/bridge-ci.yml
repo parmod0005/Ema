@@ -1,0 +1,27 @@
+name: Bridge CI
+
+on:
+  pull_request:
+    paths:
+      - 'bridge/**'
+      - '.github/workflows/bridge-ci.yml'
+  push:
+    branches: ['develop/ema-android-foundation']
+    paths:
+      - 'bridge/**'
+      - '.github/workflows/bridge-ci.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: bridge/requirements.txt
+      - run: pip install -r bridge/requirements.txt
+      - run: pytest -q
+        working-directory: bridge
+      - run: docker build -f bridge/Dockerfile -t vardhani-bridge:test .

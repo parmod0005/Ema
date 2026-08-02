@@ -53,6 +53,20 @@ data class PaperPosition(
     val pnl: Double get() = (currentPrice - entryPrice) * quantity
 }
 
+data class LearningDashboardState(
+    val completedTrades: Int = 0,
+    val wins: Int = 0,
+    val losses: Int = 0,
+    val winRate: Double = 0.0,
+    val profitFactor: Double = 0.0,
+    val expectancy: Double = 0.0,
+    val maximumDrawdownPct: Double = 0.0,
+    val promotionEligible: Boolean = false,
+    val policyVersion: Int = 1,
+    val minimumAiConfidence: Int = 80,
+    val message: String = "No completed paper trades yet",
+)
+
 data class DashboardState(
     val index: MarketIndex = MarketIndex.NIFTY,
     val tradingMode: TradingMode = TradingMode.MANUAL,
@@ -76,6 +90,12 @@ data class DashboardState(
     val signal: SignalSnapshot = SignalSnapshot(SignalAction.WAIT, 0, TrendDirection.NEUTRAL, null, null, null, listOf("Waiting for market data")),
     val optionChain: List<OptionQuote> = emptyList(),
     val position: PaperPosition? = null,
+    val learning: LearningDashboardState = LearningDashboardState(),
+    val paperRiskLocked: Boolean = false,
+    val paperRiskReason: String = "Paper risk gates clear",
+    val todayPaperPnl: Double = 0.0,
+    val todayPaperTrades: Int = 0,
+    val consecutivePaperLosses: Int = 0,
     val message: String = "Ready",
     val lastTickMillis: Long = 0L,
     val ticksReceived: Long = 0L,

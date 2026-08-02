@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: vardhani-ai-bridge
+    runtime: docker
+    dockerfilePath: ./bridge/Dockerfile
+    dockerContext: .
+    healthCheckPath: /v1/health
+    autoDeploy: false
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: VARDHANI_DEVICE_TOKEN
+        generateValue: true
+      - key: OPENAI_MODEL
+        value: gpt-5
+      - key: OPENAI_TIMEOUT_SECONDS
+        value: "12"
+      - key: MAX_SNAPSHOT_AGE_MS
+        value: "10000"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "12"
+      - key: AUDIT_PATH
+        value: /var/data/audit.jsonl
+    disk:
+      name: vardhani-audit
+      mountPath: /var/data
+      sizeGB: 1

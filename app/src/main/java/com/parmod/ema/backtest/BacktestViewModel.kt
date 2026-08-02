@@ -22,11 +22,11 @@ enum class BacktestRange(val months: Long, val label: String) {
 
 class BacktestViewModel(application: Application) : AndroidViewModel(application) {
     data class UiState(
-        val range: BacktestRange = BacktestRange.SIX_MONTHS,
+        val range: BacktestRange = BacktestRange.ONE_MONTH,
         val isRunning: Boolean = false,
         val completed: Int = 0,
         val total: Int = 0,
-        val message: String = "Ready to fetch six months of Upstox Plus data",
+        val message: String = "Safe mobile mode: start with one month",
         val result: ThreeMonthBacktestPipeline.Result? = null,
         val error: String? = null,
         val cacheHits: Long = 0,
@@ -47,7 +47,11 @@ class BacktestViewModel(application: Application) : AndroidViewModel(application
         if (job?.isActive == true) return
         _state.value = UiState(
             range = range,
-            message = "Ready to fetch or resume ${range.months} month${if (range.months == 1L) "" else "s"} of Upstox Plus data",
+            message = if (range.months <= 3) {
+                "Ready to fetch or resume ${range.months} month${if (range.months == 1L) "" else "s"}"
+            } else {
+                "Large mobile run selected · complete 1M/3M first so cached data can be reused"
+            },
         )
     }
 
@@ -71,8 +75,8 @@ class BacktestViewModel(application: Application) : AndroidViewModel(application
         )
         job = viewModelScope.launch {
             var client: UpstoxPlusHistoricalClient? = null
-            runCatching {
-                withContext(Dispatchers.IO) {
+            try {
+                val result = withContext(Dispatchers.IO) {
                     client = UpstoxPlusHistoricalClient(
                         accessToken = accessToken.trim(),
                         cacheDirectory = candleCache,
@@ -94,7 +98,6 @@ class BacktestViewModel(application: Application) : AndroidViewModel(application
                         },
                     )
                 }
-            }.onSuccess { result ->
                 val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
                 _state.value = UiState(
                     range = selectedRange,
@@ -106,12 +109,21 @@ class BacktestViewModel(application: Application) : AndroidViewModel(application
                     cacheHits = stats.cacheHits,
                     networkRequests = stats.requests,
                 )
-            }.onFailure { error ->
+            } catch (memory: OutOfMemoryError) {
                 val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
                 _state.value = _state.value.copy(
                     isRunning = false,
-                    message = "Backtest stopped · cached contracts remain available for resume",
-                    error = error.message ?: error::class.java.simpleName,
+                    message = "Backtest stopped safely · cached downloads retained",
+                    error = "Phone memory limit reached. Restart with 1M; cached data will be reused.",
+                    cacheHits = stats.cacheHits,
+                    networkRequests = stats.requests,
+                )
+            } catch (error: Throwable) {
+                val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
+                _state.value = _state.value.copy(
+                    isRunning = false,
+                    message = "Backtest stopped safely · cached contracts remain available for resume",
+                    error = (error.message ?: error::class.java.simpleName).take(300),
                     cacheHits = stats.cacheHits,
                     networkRequests = stats.requests,
                 )
@@ -136,13 +148,18 @@ class BacktestViewModel(application: Application) : AndroidViewModel(application
 
     fun clearCache() {
         if (job?.isActive == true) return
-        candleCache.deleteRecursively()
-        candleCache.mkdirs()
-        _state.value = _state.value.copy(
-            cacheHits = 0,
-            networkRequests = 0,
-            message = "Historical candle cache cleared",
-        )
+        runCatching { candleCache.deleteRecursively(); candleCache.mkdirs() }
+            .onSuccess {
+                _state.value = _state.value.copy(
+                    cacheHits = 0,
+                    networkRequests = 0,
+                    message = "Historical candle cache cleared",
+                    error = null,
+                )
+            }
+            .onFailure {
+                _state.value = _state.value.copy(error = "Could not clear cache: ${it.message}")
+            }
     }
 
     override fun onCleared() {

@@ -11,6 +11,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -18,6 +19,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.parmod.ema.ai.LocalCredentialVault
 import com.parmod.ema.backtest.BacktestRangeSelector
 import com.parmod.ema.backtest.BacktestViewModel
 import com.parmod.ema.data.UpstoxOptionDiscoveryClient
@@ -43,7 +45,10 @@ private fun VardhaniApp(
     val state by vm.state.collectAsState()
     val backtest by backtestVm.state.collectAsState()
     val scope = rememberCoroutineScope()
-    var token by remember { mutableStateOf("") }
+    val context = LocalContext.current
+    val credentialVault = remember(context) { LocalCredentialVault(context) }
+    val restoredToken = remember(credentialVault) { credentialVault.read().upstoxAccessToken }
+    var token by remember { mutableStateOf(restoredToken) }
     var connecting by remember { mutableStateOf(false) }
     var expiry by remember { mutableStateOf("") }
     var expiries by remember { mutableStateOf(emptyList<String>()) }
@@ -144,9 +149,9 @@ private fun ConnectionPanel(
             if (!state.isConnected) {
                 OutlinedTextField(
                     token, onToken, Modifier.fillMaxWidth(), singleLine = true,
-                    label = { Text("Paste Upstox access token") },
+                    label = { Text("Upstox access token") },
                     visualTransformation = PasswordVisualTransformation(),
-                    supportingText = { Text("Used only for Upstox live and historical data") },
+                    supportingText = { Text(if (token.isNotBlank()) "Encrypted token available · tap Connect Live" else "Paste a token or save one in the private credentials vault") },
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Button(onConnect, Modifier.weight(1f), enabled = token.isNotBlank() && !connecting) {

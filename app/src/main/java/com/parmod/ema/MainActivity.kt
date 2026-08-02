@@ -58,13 +58,13 @@ private fun VardhaniApp(
         if (token.isBlank() || connecting) return
         connecting = true
         scope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) { UpstoxOptionDiscoveryClient(token.trim()).discover(index) }
-            }.onSuccess {
-                expiries = it.expiries
-                expiry = it.nearestExpiry
-                vm.connectLive(token.trim(), it.nearestExpiry)
-            }.onFailure { vm.disconnect() }
+            runCatching { withContext(Dispatchers.IO) { UpstoxOptionDiscoveryClient(token.trim()).discover(index) } }
+                .onSuccess {
+                    expiries = it.expiries
+                    expiry = it.nearestExpiry
+                    vm.connectLive(token.trim(), it.nearestExpiry)
+                }
+                .onFailure { vm.disconnect() }
             connecting = false
         }
     }
@@ -117,11 +117,10 @@ private fun VardhaniApp(
             item { MarketModePanel(state, vm) }
             item { AiControlPanel(state, vm) }
             item { SignalCard(state) }
+            item { LearningDashboardPanel(state, vm) }
             item { TradingControls(state, vm) }
             state.position?.let { item { PositionCard(state, vm) } }
-            if (state.appMode == AppMode.BACKTEST) {
-                item { BacktestCard(token, state.index, backtest, backtestVm) }
-            }
+            if (state.appMode == AppMode.BACKTEST) item { BacktestCard(token, state.index, backtest, backtestVm) }
             item { Text(state.message, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(4.dp)) }
             if (state.appMode == AppMode.LIVE_MARKET) item { OptionChain(state.optionChain) }
             item { Spacer(Modifier.height(16.dp)) }
@@ -154,9 +153,7 @@ private fun ConnectionPanel(
                     supportingText = { Text(if (token.isNotBlank()) "Encrypted token available · tap Connect Live" else "Paste a token or save one in the private credentials vault") },
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Button(onConnect, Modifier.weight(1f), enabled = token.isNotBlank() && !connecting) {
-                        Text(if (connecting) "CONNECTING…" else "CONNECT LIVE")
-                    }
+                    Button(onConnect, Modifier.weight(1f), enabled = token.isNotBlank() && !connecting) { Text(if (connecting) "CONNECTING…" else "CONNECT LIVE") }
                     OutlinedButton(onDemo, Modifier.weight(1f)) { Text("DEMO") }
                 }
             } else {
@@ -206,11 +203,7 @@ private fun Choice(label: String, selected: Boolean, modifier: Modifier, onClick
 
 @Composable
 private fun SignalCard(state: DashboardState) {
-    val signal = when (state.signal.action) {
-        SignalAction.BUY_CE -> "BUY CALL"
-        SignalAction.BUY_PE -> "BUY PUT"
-        SignalAction.WAIT -> "WAIT"
-    }
+    val signal = when (state.signal.action) { SignalAction.BUY_CE -> "BUY CALL"; SignalAction.BUY_PE -> "BUY PUT"; SignalAction.WAIT -> "WAIT" }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row {
@@ -244,10 +237,10 @@ private fun Metric(label: String, value: String, modifier: Modifier) = Column(mo
 private fun TradingControls(state: DashboardState, vm: TradingViewModel) {
     if (state.appMode != AppMode.LIVE_MARKET) return
     if (state.tradingMode == TradingMode.MANUAL) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Button(vm::buyCe, Modifier.weight(1f), enabled = state.isConnected) { Text("BUY CALL") }
-        Button(vm::buyPe, Modifier.weight(1f), enabled = state.isConnected) { Text("BUY PUT") }
+        Button(vm::buyCe, Modifier.weight(1f), enabled = state.isConnected && !state.paperRiskLocked) { Text("BUY CALL") }
+        Button(vm::buyPe, Modifier.weight(1f), enabled = state.isConnected && !state.paperRiskLocked) { Text("BUY PUT") }
     } else Surface(Modifier.fillMaxWidth(), tonalElevation = 2.dp) {
-        Text("AUTO MODE · AI Shadow cannot execute · Paper requires approved routing", Modifier.padding(9.dp), textAlign = TextAlign.Center, fontSize = 10.sp)
+        Text(if (state.paperRiskLocked) "AUTO PAPER LOCKED · ${state.paperRiskReason}" else "AUTO MODE · AI Shadow cannot execute · Paper requires approved routing", Modifier.padding(9.dp), textAlign = TextAlign.Center, fontSize = 10.sp)
     }
 }
 

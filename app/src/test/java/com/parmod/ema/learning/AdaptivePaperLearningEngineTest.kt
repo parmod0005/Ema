@@ -13,7 +13,7 @@ class AdaptivePaperLearningEngineTest {
 
     @Test
     fun smallSampleCannotPromote() {
-        val outcomes = List(10) { trade(index = it, pnl = 100.0, confidence = 85) }
+        val outcomes = List(10) { trade(index = it, pnl = 1.0, confidence = 85) }
         val result = engine.evaluate(outcomes, current)
 
         assertFalse(result.eligibleForPromotion)
@@ -24,7 +24,7 @@ class AdaptivePaperLearningEngineTest {
     @Test
     fun losingPolicyCannotPromote() {
         val outcomes = List(60) { index ->
-            trade(index, pnl = if (index % 3 == 0) 120.0 else -100.0, confidence = 82)
+            trade(index, pnl = if (index % 3 == 0) 1.2 else -1.0, confidence = 82)
         }
         val result = engine.evaluate(outcomes, current)
 
@@ -34,12 +34,15 @@ class AdaptivePaperLearningEngineTest {
 
     @Test
     fun strongPaperEvidenceProducesOnlyBoundedChange() {
+        // P&L values are realistic percentages of the ₹100 test premium so the
+        // drawdown gate is exercised rather than accidentally tripped by a
+        // synthetic +120% / -70% sequence.
         val outcomes = List(80) { index ->
             trade(
                 index = index,
-                pnl = if (index % 10 < 7) 120.0 else -70.0,
+                pnl = if (index % 10 < 7) 1.2 else -0.7,
                 confidence = 84,
-                adverse = if (index % 10 < 7) 4.0 else 9.0,
+                adverse = if (index % 10 < 7) 0.4 else 0.9,
             )
         }
         val result = engine.evaluate(outcomes, current)
@@ -54,7 +57,7 @@ class AdaptivePaperLearningEngineTest {
         index: Int,
         pnl: Double,
         confidence: Int,
-        adverse: Double = if (pnl < 0) 10.0 else 3.0,
+        adverse: Double = if (pnl < 0) 1.0 else 0.3,
     ) = AdaptivePaperLearningEngine.PaperTradeOutcome(
         openedAtMillis = index * 60_000L,
         closedAtMillis = index * 60_000L + 30_000L,
@@ -69,7 +72,7 @@ class AdaptivePaperLearningEngineTest {
         quantity = 1,
         pnl = pnl,
         maximumAdverseExcursionPct = adverse,
-        maximumFavourableExcursionPct = if (pnl > 0) 14.0 else 2.0,
+        maximumFavourableExcursionPct = if (pnl > 0) 1.4 else 0.2,
         exitReason = "TEST",
     )
 }

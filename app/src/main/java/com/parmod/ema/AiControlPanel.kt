@@ -18,6 +18,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -29,13 +30,21 @@ import androidx.compose.ui.unit.sp
 import com.parmod.ema.ai.AiConnectionMode
 import com.parmod.ema.ai.AiRunMode
 import com.parmod.ema.ai.LocalCredentialVault
+import com.parmod.ema.ai.OpenAiConnectionTester
 import com.parmod.ema.ai.SignalEngineMode
 import com.parmod.ema.model.DashboardState
 import com.parmod.ema.model.SignalAction
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val vault = remember(context) { LocalCredentialVault(context) }
     val initialCredentials = remember(vault) { vault.read() }
     val health = state.aiBridgeHealth
@@ -45,12 +54,16 @@ fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
     var bridgeUrl by remember { mutableStateOf("") }
     var deviceToken by remember { mutableStateOf("") }
     var openAiKey by remember { mutableStateOf(initialCredentials.openAiApiKey) }
-    var openAiModel by remember { mutableStateOf(initialCredentials.openAiModel) }
+    var openAiModel by remember { mutableStateOf(initialCredentials.openAiModel.ifBlank { "gpt-5" }) }
     var upstoxApiKey by remember { mutableStateOf(initialCredentials.upstoxApiKey) }
     var upstoxApiSecret by remember { mutableStateOf(initialCredentials.upstoxApiSecret) }
     var upstoxAccessToken by remember { mutableStateOf(initialCredentials.upstoxAccessToken) }
     var upstoxRedirectUri by remember { mutableStateOf(initialCredentials.upstoxRedirectUri) }
     var vaultMessage by remember { mutableStateOf("") }
+    var testingOpenAi by remember { mutableStateOf(false) }
+    var testMessage by remember { mutableStateOf("Not tested") }
+    var testLatency by remember { mutableStateOf<Long?>(null) }
+    var lastTestMillis by remember { mutableStateOf<Long?>(null) }
 
     SecureWindowEffect(enabled = state.aiConnectionMode == AiConnectionMode.DIRECT_OPENAI)
 
@@ -65,7 +78,11 @@ fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("SIGNAL BRAIN", fontWeight = FontWeight.Bold)
                 Text(
-                    if (health.reachable) "● AI ONLINE" else if (health.configured) "● AI READY" else "● NOT CONFIGURED",
+                    when {
+                        health.reachable -> "● AI ONLINE"
+                        health.configured -> "● AI CONFIGURED"
+                        else -> "● NOT CONFIGURED"
+                    },
                     color = if (health.reachable || health.configured) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
@@ -74,20 +91,16 @@ fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
 
             Text("AI CONNECTION", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                AiChoice(
-                    "DIRECT OPENAI",
-                    state.aiConnectionMode == AiConnectionMode.DIRECT_OPENAI,
-                    Modifier.weight(1f),
-                ) { vm.setAiConnectionMode(AiConnectionMode.DIRECT_OPENAI) }
-                AiChoice(
-                    "BRIDGE SERVER",
-                    state.aiConnectionMode == AiConnectionMode.BRIDGE_SERVER,
-                    Modifier.weight(1f),
-                ) { vm.setAiConnectionMode(AiConnectionMode.BRIDGE_SERVER) }
+                AiChoice("DIRECT OPENAI", state.aiConnectionMode == AiConnectionMode.DIRECT_OPENAI, Modifier.weight(1f)) {
+                    vm.setAiConnectionMode(AiConnectionMode.DIRECT_OPENAI)
+                }
+                AiChoice("BRIDGE SERVER", state.aiConnectionMode == AiConnectionMode.BRIDGE_SERVER, Modifier.weight(1f)) {
+                    vm.setAiConnectionMode(AiConnectionMode.BRIDGE_SERVER)
+                }
             }
 
             if (state.aiConnectionMode == AiConnectionMode.DIRECT_OPENAI) {
-                Text("PRIVATE DEVICE CREDENTIALS VAULT", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                Text("DIRECT OPENAI · PERSONAL DEVICE", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
                 SecretField("OpenAI API key", openAiKey, revealSecrets) { openAiKey = it.trim() }
                 OutlinedTextField(
                     value = openAiModel,
@@ -97,65 +110,81 @@ fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                SecretField("Upstox API key", upstoxApiKey, revealSecrets) { upstoxApiKey = it.trim() }
-                SecretField("Upstox API secret", upstoxApiSecret, revealSecrets) { upstoxApiSecret = it.trim() }
-                SecretField("Upstox access token", upstoxAccessToken, revealSecrets) { upstoxAccessToken = it.trim() }
-                OutlinedTextField(
-                    value = upstoxRedirectUri,
-                    onValueChange = { upstoxRedirectUri = it.trim() },
-                    label = { Text("Upstox redirect URI") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
 
-                OutlinedButton(
-                    onClick = { revealSecrets = !revealSecrets },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text(if (revealSecrets) "HIDE CREDENTIALS" else "REVEAL CREDENTIALS") }
-
-                Button(
-                    onClick = {
-                        val credentials = LocalCredentialVault.Credentials(
-                            openAiApiKey = openAiKey,
-                            openAiModel = openAiModel,
-                            upstoxApiKey = upstoxApiKey,
-                            upstoxApiSecret = upstoxApiSecret,
-                            upstoxAccessToken = upstoxAccessToken,
-                            upstoxRedirectUri = upstoxRedirectUri,
-                        )
-                        vault.save(credentials)
-                        vm.configureDirectOpenAi(credentials.openAiApiKey, credentials.openAiModel)
-                        revealSecrets = false
-                        vaultMessage = "Credentials encrypted with Android Keystore"
-                    },
-                    enabled = openAiKey.isNotBlank(),
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("SAVE ENCRYPTED CREDENTIALS") }
-
-                OutlinedButton(
-                    onClick = {
-                        vault.clearAll()
-                        openAiKey = ""
-                        openAiModel = "gpt-5"
-                        upstoxApiKey = ""
-                        upstoxApiSecret = ""
-                        upstoxAccessToken = ""
-                        upstoxRedirectUri = ""
-                        vm.configureDirectOpenAi("", "gpt-5")
-                        revealSecrets = false
-                        vaultMessage = "All locally stored credentials deleted"
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("DELETE ALL CREDENTIALS") }
-
-                if (vaultMessage.isNotBlank()) {
-                    Text(vaultMessage, style = MaterialTheme.typography.labelSmall)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(
+                        onClick = {
+                            val credentials = LocalCredentialVault.Credentials(
+                                openAiApiKey = openAiKey,
+                                openAiModel = openAiModel,
+                                upstoxApiKey = upstoxApiKey,
+                                upstoxApiSecret = upstoxApiSecret,
+                                upstoxAccessToken = upstoxAccessToken,
+                                upstoxRedirectUri = upstoxRedirectUri,
+                            )
+                            vault.save(credentials)
+                            vm.configureDirectOpenAi(credentials.openAiApiKey, credentials.openAiModel)
+                            revealSecrets = false
+                            vaultMessage = "Saved and configured with Android Keystore"
+                        },
+                        enabled = openAiKey.isNotBlank(),
+                        modifier = Modifier.weight(1f),
+                    ) { Text("SAVE & CONFIGURE", fontSize = 10.sp) }
+                    OutlinedButton(
+                        onClick = {
+                            if (testingOpenAi || openAiKey.isBlank()) return@OutlinedButton
+                            testingOpenAi = true
+                            testMessage = "Testing authentication…"
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) { OpenAiConnectionTester(openAiKey).test() }
+                                testingOpenAi = false
+                                testMessage = result.message
+                                testLatency = result.latencyMillis
+                                lastTestMillis = System.currentTimeMillis()
+                                if (result.success) vm.configureDirectOpenAi(openAiKey, openAiModel)
+                            }
+                        },
+                        enabled = openAiKey.isNotBlank() && !testingOpenAi,
+                        modifier = Modifier.weight(1f),
+                    ) { Text(if (testingOpenAi) "TESTING…" else "TEST OPENAI API", fontSize = 10.sp) }
                 }
+
+                OutlinedButton(onClick = { revealSecrets = !revealSecrets }, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (revealSecrets) "HIDE CREDENTIALS" else "SHOW ADVANCED CREDENTIALS")
+                }
+                if (revealSecrets) {
+                    SecretField("Upstox API key", upstoxApiKey, true) { upstoxApiKey = it.trim() }
+                    SecretField("Upstox API secret", upstoxApiSecret, true) { upstoxApiSecret = it.trim() }
+                    SecretField("Upstox access token", upstoxAccessToken, true) { upstoxAccessToken = it.trim() }
+                    OutlinedTextField(
+                        value = upstoxRedirectUri,
+                        onValueChange = { upstoxRedirectUri = it.trim() },
+                        label = { Text("Upstox redirect URI") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedButton(
+                        onClick = {
+                            vault.clearAll()
+                            openAiKey = ""; openAiModel = "gpt-5"
+                            upstoxApiKey = ""; upstoxApiSecret = ""; upstoxAccessToken = ""; upstoxRedirectUri = ""
+                            vm.configureDirectOpenAi("", "gpt-5")
+                            revealSecrets = false
+                            vaultMessage = "All locally stored credentials deleted"
+                            testMessage = "Not tested"
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("DELETE ALL CREDENTIALS") }
+                }
+
+                if (vaultMessage.isNotBlank()) Text(vaultMessage, style = MaterialTheme.typography.labelSmall)
+                Text("API authentication: $testMessage", style = MaterialTheme.typography.labelSmall)
                 Text(
-                    "Personal-device mode: secrets are encrypted at rest but may still be exposed on a rooted or compromised phone.",
+                    "Last test: ${lastTestMillis?.let(::formatTime) ?: "—"} · latency ${testLatency?.let { "$it ms" } ?: "—"}",
                     style = MaterialTheme.typography.labelSmall,
                 )
             } else {
+                Text("BRIDGE SERVER", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
                 if (!health.configured) {
                     OutlinedTextField(
                         value = bridgeUrl,
@@ -173,11 +202,7 @@ fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
                     ) { Text("CONNECT AI BRIDGE") }
                 } else {
                     OutlinedButton(
-                        onClick = {
-                            vm.configureAiBridge("", "")
-                            bridgeUrl = ""
-                            deviceToken = ""
-                        },
+                        onClick = { vm.configureAiBridge("", ""); bridgeUrl = ""; deviceToken = "" },
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text("DISCONNECT AI BRIDGE") }
                 }
@@ -189,20 +214,27 @@ fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
                 AiChoice("AI BRAIN", state.signalEngineMode == SignalEngineMode.AI_BRAIN, Modifier.weight(1f)) { vm.setSignalEngineMode(SignalEngineMode.AI_BRAIN) }
                 AiChoice("HYBRID", state.signalEngineMode == SignalEngineMode.HYBRID, Modifier.weight(1f)) { vm.setSignalEngineMode(SignalEngineMode.HYBRID) }
             }
-
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 AiChoice("SHADOW", state.aiRunMode == AiRunMode.SHADOW, Modifier.weight(1f)) { vm.setAiRunMode(AiRunMode.SHADOW) }
                 AiChoice("PAPER", state.aiRunMode == AiRunMode.PAPER, Modifier.weight(1f)) { vm.setAiRunMode(AiRunMode.PAPER) }
             }
 
             HorizontalDivider()
-            val latency = health.lastLatencyMillis?.let { "${it} ms" } ?: "—"
             val provider = if (state.aiConnectionMode == AiConnectionMode.DIRECT_OPENAI) "Direct OpenAI (${state.directOpenAiModel})" else "Bridge Server"
             Text("Provider: $provider", style = MaterialTheme.typography.labelSmall)
-            Text("Status: ${health.message} · latency $latency", style = MaterialTheme.typography.labelSmall)
+            Text("Runtime: ${health.message} · latency ${health.lastLatencyMillis?.let { "$it ms" } ?: "—"}", style = MaterialTheme.typography.labelSmall)
+            Text(
+                when {
+                    !health.configured -> "Market snapshot: NOT SENT · configure and test the provider"
+                    decision == null -> "Market snapshot: waiting for enough live ticks and a valid expiry"
+                    else -> "Market snapshot: SENT AND VALIDATED · ID ${decision.snapshotId.takeLast(8)}"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+            )
 
             if (decision == null) {
-                Text("AI decision: waiting for a valid market snapshot", style = MaterialTheme.typography.bodySmall)
+                Text("AI decision: none received yet", style = MaterialTheme.typography.bodySmall)
             } else {
                 val action = when (decision.action) {
                     SignalAction.BUY_CE -> "BUY CALL"
@@ -210,17 +242,17 @@ fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
                     SignalAction.WAIT -> "WAIT"
                 }
                 Text("AI: $action · ${decision.confidence}/100 · ${decision.regime.name}", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                Text("Model ${decision.modelVersion} · prompt ${decision.promptVersion}", style = MaterialTheme.typography.labelSmall)
+                Text("Received ${formatTime(decision.decidedAtMillis)} · model ${decision.modelVersion} · prompt ${decision.promptVersion}", style = MaterialTheme.typography.labelSmall)
                 decision.reasons.firstOrNull()?.let { Text(it, style = MaterialTheme.typography.labelSmall, maxLines = 2) }
             }
             Text("Final route: ${state.aiFinalReason}", style = MaterialTheme.typography.labelSmall)
-            if (state.aiRunMode == AiRunMode.SHADOW) {
-                Text("Shadow mode records AI analysis but cannot open a trade.", style = MaterialTheme.typography.labelSmall)
-            }
+            if (state.aiRunMode == AiRunMode.SHADOW) Text("Shadow mode analyzes and records but cannot open a trade.", style = MaterialTheme.typography.labelSmall)
             Text("Live broker order placement remains disabled.", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
         }
     }
 }
+
+private fun formatTime(epochMillis: Long): String = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(epochMillis))
 
 @Composable
 private fun SecretField(label: String, value: String, reveal: Boolean, onValueChange: (String) -> Unit) {

@@ -8,6 +8,9 @@ import com.parmod.ema.model.SignalAction
 /** Selects which decision provider controls the visible/final signal. */
 enum class SignalEngineMode { NATIVE, AI_BRAIN, HYBRID }
 
+/** Selects how the AI brain is reached. */
+enum class AiConnectionMode { BRIDGE_SERVER, DIRECT_OPENAI }
+
 /** AI can observe without trading, drive paper decisions, or be eligible for live validation. */
 enum class AiRunMode { SHADOW, PAPER, LIVE_CANDIDATE }
 
@@ -47,7 +50,6 @@ data class RiskContext(
     val dailyLossLocked: Boolean = false,
 )
 
-/** Compact feature snapshot sent to the secure VARDHANI AI Bridge, never raw credentials. */
 data class AiMarketSnapshot(
     val schemaVersion: Int = 1,
     val snapshotId: String,
@@ -109,5 +111,5 @@ data class AiBridgeHealth(
     val lastLatencyMillis: Long? = null,
     val lastSuccessMillis: Long? = null,
     val consecutiveFailures: Int = 0,
-    val message: String = "AI bridge not configured",
+    val message: String = "AI not configured",
 )

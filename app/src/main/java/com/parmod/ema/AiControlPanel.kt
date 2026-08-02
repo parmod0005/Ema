@@ -52,6 +52,8 @@ fun AiControlPanel(state: DashboardState, vm: TradingViewModel) {
     var upstoxRedirectUri by remember { mutableStateOf(initialCredentials.upstoxRedirectUri) }
     var vaultMessage by remember { mutableStateOf("") }
 
+    SecureWindowEffect(enabled = state.aiConnectionMode == AiConnectionMode.DIRECT_OPENAI)
+
     LaunchedEffect(Unit) {
         if (initialCredentials.hasOpenAi) {
             vm.configureDirectOpenAi(initialCredentials.openAiApiKey, initialCredentials.openAiModel)

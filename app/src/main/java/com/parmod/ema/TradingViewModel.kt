@@ -212,24 +212,48 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         val c = _state.value
         val providerConfigured = when (c.aiConnectionMode) { AiConnectionMode.BRIDGE_SERVER -> aiClient != null; AiConnectionMode.DIRECT_OPENAI -> directOpenAiClient != null }
         if (!providerConfigured || c.signalEngineMode == SignalEngineMode.NATIVE || !c.isConnected || !aiBuffer.isReady() || savedExpiry.isBlank()) return
-        val now = System.currentTimeMillis(); if (aiJob?.isActive == true || now - lastAiRequestMillis < 15_000L) return
-        val snapshot = aiBuffer.build(c, savedExpiry, now); lastAiRequestMillis = now; lastAiSnapshotSpot = snapshot.spot
-        aiJob = viewModelScope.launch {
-            try {
-                val response = withContext(Dispatchers.IO) {
-                    when (c.aiConnectionMode) {
-                        AiConnectionMode.BRIDGE_SERVER -> aiClient?.analyze(snapshot)?.let { it.decision to it.latencyMillis } ?: error("AI bridge not configured")
-                        AiConnectionMode.DIRECT_OPENAI -> directOpenAiClient?.analyze(snapshot)?.let { it.decision to it.latencyMillis } ?: error("Direct OpenAI not configured")
-                    }
+        val now = System.currentTimeMillis()
+        if (BackgroundAiRuntime.isActive() || now - lastAiRequestMillis < 15_000L) return
+        val snapshot = aiBuffer.build(c, savedExpiry, now)
+        lastAiRequestMillis = now
+        lastAiSnapshotSpot = snapshot.spot
+        val accepted = BackgroundAiRuntime.submit(
+            snapshotSpot = snapshot.spot,
+            request = {
+                when (c.aiConnectionMode) {
+                    AiConnectionMode.BRIDGE_SERVER -> aiClient?.analyze(snapshot)?.let { it.decision to it.latencyMillis } ?: error("AI bridge not configured")
+                    AiConnectionMode.DIRECT_OPENAI -> directOpenAiClient?.analyze(snapshot)?.let { it.decision to it.latencyMillis } ?: error("Direct OpenAI not configured")
                 }
+            },
+            onSuccess = { response ->
                 val providerName = if (c.aiConnectionMode == AiConnectionMode.BRIDGE_SERVER) "AI bridge" else "Direct OpenAI"
-                _state.value = _state.value.copy(aiBridgeHealth = AiBridgeHealth(configured = true, reachable = true, lastLatencyMillis = response.second, lastSuccessMillis = System.currentTimeMillis(), message = "$providerName online"), aiDecision = response.first)
-                applyAiRouting(snapshotSpot = snapshot.spot); runAutoIfEligible()
-            } catch (error: Exception) {
+                _state.value = _state.value.copy(
+                    aiBridgeHealth = AiBridgeHealth(
+                        configured = true,
+                        reachable = true,
+                        lastLatencyMillis = response.latencyMillis,
+                        lastSuccessMillis = System.currentTimeMillis(),
+                        message = "$providerName online · background runtime",
+                    ),
+                    aiDecision = response.decision,
+                )
+                applyAiRouting(snapshotSpot = response.snapshotSpot)
+                runAutoIfEligible()
+            },
+            onFailure = { error ->
                 val old = _state.value.aiBridgeHealth
-                _state.value = _state.value.copy(aiBridgeHealth = old.copy(configured = true, reachable = false, consecutiveFailures = old.consecutiveFailures + 1, message = error.message?.take(160) ?: "AI provider error")); applyAiRouting(snapshotSpot = snapshot.spot)
-            }
-        }
+                _state.value = _state.value.copy(
+                    aiBridgeHealth = old.copy(
+                        configured = true,
+                        reachable = false,
+                        consecutiveFailures = old.consecutiveFailures + 1,
+                        message = error.message?.take(160) ?: "AI provider error",
+                    ),
+                )
+                applyAiRouting(snapshotSpot = snapshot.spot)
+            },
+        )
+        if (!accepted) lastAiRequestMillis = 0L
     }
 
     private fun applyAiRouting(nativeSignal: SignalSnapshot = calculateLiveSignal(_state.value.spotPrice, _state.value.optionChain), snapshotSpot: Double = lastAiSnapshotSpot.takeIf { it > 0 } ?: _state.value.spotPrice) {
@@ -356,5 +380,10 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    override fun onCleared() { disconnectInternal(); super.onCleared() }
+    /**
+     * Do not tear down an explicitly connected paper session merely because the
+     * Activity is recreated, minimized, or locked. The foreground service keeps
+     * the process scheduled. Disconnect remains an explicit user action.
+     */
+    override fun onCleared() { super.onCleared() }
 }

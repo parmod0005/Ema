@@ -1,7 +1,6 @@
 package com.parmod.ema
 
 import android.content.Intent
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -70,9 +69,7 @@ private fun VardhaniApp(
     }
 
     fun stopBackgroundMarket() {
-        context.startService(
-            Intent(context, VardhaniMarketService::class.java).setAction(VardhaniMarketService.ACTION_STOP),
-        )
+        context.startService(Intent(context, VardhaniMarketService::class.java).setAction(VardhaniMarketService.ACTION_STOP))
     }
 
     fun connect(index: MarketIndex = state.index) {
@@ -138,16 +135,11 @@ private fun VardhaniApp(
                         startBackgroundMarket(state.index, it)
                     },
                     { connect() },
-                    {
-                        stopBackgroundMarket()
-                        vm.connectDemo()
-                    },
-                    {
-                        stopBackgroundMarket()
-                        vm.disconnect()
-                    },
+                    { stopBackgroundMarket(); vm.connectDemo() },
+                    { stopBackgroundMarket(); vm.disconnect() },
                 )
             }
+            item { UpstoxCredentialsPanel { saved -> token = saved.trim() } }
             item { MarketModePanel(state, vm) }
             item { AiControlPanel(state, vm) }
             item { SignalCard(state) }
@@ -184,7 +176,7 @@ private fun ConnectionPanel(
                     token, onToken, Modifier.fillMaxWidth(), singleLine = true,
                     label = { Text("Upstox access token") },
                     visualTransformation = PasswordVisualTransformation(),
-                    supportingText = { Text(if (token.isNotBlank()) "Encrypted token available · tap Connect Live" else "Paste a token or save one in the private credentials vault") },
+                    supportingText = { Text(if (token.isNotBlank()) "Encrypted token available · tap Connect Live" else "Paste a token or save one in the Upstox credentials panel") },
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Button(onConnect, Modifier.weight(1f), enabled = token.isNotBlank() && !connecting) { Text(if (connecting) "CONNECTING…" else "CONNECT LIVE") }

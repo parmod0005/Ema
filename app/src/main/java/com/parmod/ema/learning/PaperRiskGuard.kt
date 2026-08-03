@@ -7,7 +7,6 @@ import java.time.ZoneId
 class PaperRiskGuard(
     private val maximumDailyLossPct: Double = 2.0,
     private val maximumConsecutiveLosses: Int = 3,
-    private val maximumTradesPerDay: Int = 4,
 ) {
     data class Status(
         val locked: Boolean,
@@ -39,18 +38,16 @@ class PaperRiskGuard(
             if (trade.pnl < 0.0) consecutiveLosses++ else break
         }
         val consecutiveLossLocked = consecutiveLosses >= maximumConsecutiveLosses
-        val tradeCountLocked = todaysTrades.size >= maximumTradesPerDay
         val reason = when {
             dailyLossLocked -> "Daily paper loss limit reached"
             consecutiveLossLocked -> "$consecutiveLosses consecutive paper losses"
-            tradeCountLocked -> "Maximum $maximumTradesPerDay paper trades reached today"
             else -> "Paper risk gates clear"
         }
         return Status(
-            locked = dailyLossLocked || consecutiveLossLocked || tradeCountLocked,
+            locked = dailyLossLocked || consecutiveLossLocked,
             dailyLossLocked = dailyLossLocked,
             consecutiveLossLocked = consecutiveLossLocked,
-            tradeCountLocked = tradeCountLocked,
+            tradeCountLocked = false,
             todayPnl = todayPnl,
             todayTrades = todaysTrades.size,
             consecutiveLosses = consecutiveLosses,

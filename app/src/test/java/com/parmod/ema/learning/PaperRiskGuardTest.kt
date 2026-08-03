@@ -48,14 +48,15 @@ class PaperRiskGuardTest {
     }
 
     @Test
-    fun locksAfterMaximumDailyTradeCount() {
+    fun tradeCountAloneDoesNotLock() {
         val status = PaperRiskGuard().evaluate(
-            outcomes = (1..4).map { outcome(it, 50.0) },
+            outcomes = (1..8).map { outcome(it, 50.0) },
             startingCapital = 100_000.0,
             nowMillis = noon,
             zoneId = zone,
         )
-        assertTrue(status.tradeCountLocked)
+        assertFalse(status.tradeCountLocked)
+        assertFalse(status.locked)
     }
 
     private fun outcome(index: Int, pnl: Double): AdaptivePaperLearningEngine.PaperTradeOutcome {

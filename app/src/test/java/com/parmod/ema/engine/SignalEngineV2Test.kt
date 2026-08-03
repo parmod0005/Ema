@@ -13,13 +13,18 @@ class SignalEngineV2Test {
                 else -> 26.4 + (i - 120) * 0.95
             }
             val base = 100.0 + trend
-            val range = if (i < 120) 0.55 else 1.65
+            val isBreakoutBar = i == 159
+            val range = when {
+                isBreakoutBar -> 4.8
+                i < 120 -> 0.55
+                else -> 1.65
+            }
             SignalEngineV2.Bar(
                 open = base - 0.25,
-                high = base + range,
+                high = if (isBreakoutBar) base + 5.2 else base + range,
                 low = base - range * 0.35,
-                close = base + if (i < 120) 0.15 else 0.80,
-                volume = if (i >= 140) 2400 else 1000,
+                close = if (isBreakoutBar) base + 4.6 else base + if (i < 120) 0.15 else 0.80,
+                volume = if (isBreakoutBar) 5_000 else if (i >= 140) 2_400 else 1_000,
             )
         }
 

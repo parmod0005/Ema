@@ -126,29 +126,31 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
 
     private fun warmStartFromIntraday(candles: List<UpstoxIntradayCandleClient.Candle>) {
         val currentMinute = System.currentTimeMillis() / 60_000L
-        candles.asSequence()
-            .filter { it.time.toInstant().toEpochMilli() / 60_000L < currentMinute }
+        val recentCandles = candles
+            .filter { candle -> candle.time.toInstant().toEpochMilli() / 60_000L < currentMinute }
+            .sortedBy { candle -> candle.time.toInstant().toEpochMilli() }
             .takeLast(180)
-            .forEach { candle ->
-                val timestamp = candle.time.toInstant().toEpochMilli()
-                val participation = candle.volume.takeIf { it > 0L } ?: 100L
-                val range = (candle.high - candle.low).coerceAtLeast(0.0001)
-                val buyShare = ((candle.close - candle.low) / range).coerceIn(0.0, 1.0)
-                val buy = (participation * buyShare).toLong().coerceIn(0L, participation)
-                val sell = (participation - buy).coerceAtLeast(0L)
-                completedBars.addLast(
-                    AvwapLiquidityEngine.Bar(
-                        open = candle.open,
-                        high = candle.high,
-                        low = candle.low,
-                        close = candle.close,
-                        tickVolume = participation,
-                        buyTicks = buy,
-                        sellTicks = sell,
-                        timestamp = timestamp,
-                    ),
-                )
-            }
+
+        recentCandles.forEach { candle ->
+            val timestamp = candle.time.toInstant().toEpochMilli()
+            val participation = candle.volume.takeIf { it > 0L } ?: 100L
+            val range = (candle.high - candle.low).coerceAtLeast(0.0001)
+            val buyShare = ((candle.close - candle.low) / range).coerceIn(0.0, 1.0)
+            val buy = (participation * buyShare).toLong().coerceIn(0L, participation)
+            val sell = (participation - buy).coerceAtLeast(0L)
+            completedBars.addLast(
+                AvwapLiquidityEngine.Bar(
+                    open = candle.open,
+                    high = candle.high,
+                    low = candle.low,
+                    close = candle.close,
+                    tickVolume = participation,
+                    buyTicks = buy,
+                    sellTicks = sell,
+                    timestamp = timestamp,
+                ),
+            )
+        }
         while (completedBars.size > 180) completedBars.removeFirst()
     }
 

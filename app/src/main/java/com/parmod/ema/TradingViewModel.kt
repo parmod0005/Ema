@@ -3,6 +3,7 @@ package com.parmod.ema
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.parmod.ema.data.UpstoxIntradayCandleClient
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
 import com.parmod.ema.engine.AvwapLiquidityEngine
@@ -18,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.random.Random
 
@@ -78,21 +80,37 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
             executionMode = ExecutionMode.PAPER,
             optionChain = emptyList(),
             spotPrice = 0.0,
-            message = "Loading ${selectedIndex.name} contracts and single live feed…",
+            message = "Loading ${selectedIndex.name} contracts and warming 1-minute structure…",
         )
         feedJob = viewModelScope.launch {
             try {
                 val client = UpstoxLiveClient(savedAccessToken)
                 val snapshot = withContext(Dispatchers.IO) { client.fetchSnapshot(selectedIndex, savedExpiry) }
                 underlyingKey = snapshot.underlyingKey
+
+                val warmBars = withContext(Dispatchers.IO) {
+                    runCatching {
+                        UpstoxIntradayCandleClient(savedAccessToken)
+                            .getOneMinuteCandles(underlyingKey)
+                    }.getOrDefault(emptyList())
+                }
+                warmStartFromIntraday(warmBars)
                 publishLiveSnapshot(snapshot)
+                if (completedBars.isNotEmpty()) {
+                    evaluateCompletedMinute(completedBars.last().timestamp / 60_000L)
+                }
+
                 val keys = (listOf(snapshot.underlyingKey) + snapshot.options.mapNotNull { it.instrumentKey.takeIf(String::isNotBlank) }).distinct()
                 tickStream = UpstoxTickStream(
                     authorizedUrlProvider = { client.authorizedSocketUrl() },
                     instrumentKeys = keys,
                     listener = object : UpstoxTickStream.Listener {
                         override fun onOpen() {
-                            _state.value = _state.value.copy(isConnected = true, message = "${selectedIndex.name} live · dual paper engines · ${keys.size} instruments")
+                            _state.value = _state.value.copy(
+                                isConnected = true,
+                                message = "${selectedIndex.name} live · ${completedBars.size} warm 1m bars · dual PAPER engines ready",
+                            )
+                            runParallelAuto()
                         }
 
                         override fun onTick(tick: UpstoxTickStream.Tick) = applyTick(tick)
@@ -104,6 +122,34 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
                 _state.value = _state.value.copy(isConnected = false, message = error.message?.take(180) ?: "Upstox connection error")
             }
         }
+    }
+
+    private fun warmStartFromIntraday(candles: List<UpstoxIntradayCandleClient.Candle>) {
+        val currentMinute = System.currentTimeMillis() / 60_000L
+        candles.asSequence()
+            .filter { it.time.toInstant().toEpochMilli() / 60_000L < currentMinute }
+            .takeLast(180)
+            .forEach { candle ->
+                val timestamp = candle.time.toInstant().toEpochMilli()
+                val participation = candle.volume.takeIf { it > 0L } ?: 100L
+                val range = (candle.high - candle.low).coerceAtLeast(0.0001)
+                val buyShare = ((candle.close - candle.low) / range).coerceIn(0.0, 1.0)
+                val buy = (participation * buyShare).toLong().coerceIn(0L, participation)
+                val sell = (participation - buy).coerceAtLeast(0L)
+                completedBars.addLast(
+                    AvwapLiquidityEngine.Bar(
+                        open = candle.open,
+                        high = candle.high,
+                        low = candle.low,
+                        close = candle.close,
+                        tickVolume = participation,
+                        buyTicks = buy,
+                        sellTicks = sell,
+                        timestamp = timestamp,
+                    ),
+                )
+            }
+        while (completedBars.size > 180) completedBars.removeFirst()
     }
 
     fun connectDemo() {
@@ -244,7 +290,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
 
     private fun runParallelAuto() {
         val s = _state.value
-        if (s.tradingMode != TradingMode.AUTO || s.appMode != AppMode.LIVE_MARKET || s.riskLocked) return
+        if (!s.isConnected || s.tradingMode != TradingMode.AUTO || s.appMode != AppMode.LIVE_MARKET || s.riskLocked) return
         val now = System.currentTimeMillis()
         if (s.engine1.position == null && now - engine1LastExit >= 120_000L) {
             when (s.engine1.signal.action) {
@@ -380,7 +426,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         return (-5..5).flatMap { offset ->
             val strike = atm + offset * step
             val distance = spot - strike
-            val timeValue = max(18.0, 110.0 - kotlin.math.abs(offset) * 12.0)
+            val timeValue = max(18.0, 110.0 - abs(offset) * 12.0)
             val ceDelta = (0.50 + distance / (step * 10.0)).coerceIn(0.08, 0.92)
             listOf(
                 OptionQuote(strike.toDouble(), "CE", max(0.0, distance) + timeValue, 90_000L, 1_500L, ceDelta, 0.002, offset == 0, "CE$strike"),
@@ -390,8 +436,6 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     override fun onCleared() {
-        // Do not intentionally tear down an active personal paper session merely because
-        // Android recreated the Activity. Explicit Disconnect remains the stop control.
         super.onCleared()
     }
 }

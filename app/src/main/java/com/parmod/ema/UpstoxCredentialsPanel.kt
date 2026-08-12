@@ -22,14 +22,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
-import com.parmod.ema.ai.LocalCredentialVault
+import com.parmod.ema.data.LocalCredentialVault
 
-/**
- * Compact editor for the long-lived Upstox application credentials.
- *
- * The short-lived access token is intentionally entered only in the main
- * connection card, avoiding two token fields on the same screen.
- */
 @Composable
 fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
     val context = LocalContext.current
@@ -53,16 +47,11 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
                         style = MaterialTheme.typography.labelSmall,
                     )
                 }
-                OutlinedButton(onClick = { expanded = !expanded }) {
-                    Text(if (expanded) "CLOSE" else "EDIT")
-                }
+                OutlinedButton(onClick = { expanded = !expanded }) { Text(if (expanded) "CLOSE" else "EDIT") }
             }
 
             if (expanded) {
-                Text(
-                    "The access token is entered only in the connection card above. These longer-lived values are encrypted with Android Keystore.",
-                    style = MaterialTheme.typography.labelSmall,
-                )
+                Text("The access token is entered only in the connection card above. Values are encrypted with Android Keystore.", style = MaterialTheme.typography.labelSmall)
                 CredentialField("Upstox API key", apiKey, reveal) { apiKey = it.trim() }
                 CredentialField("Upstox API secret", apiSecret, reveal) { apiSecret = it.trim() }
                 OutlinedTextField(
@@ -73,20 +62,11 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(
-                        onClick = { reveal = !reveal },
-                        modifier = Modifier.weight(1f),
-                    ) { Text(if (reveal) "HIDE" else "REVEAL") }
+                    OutlinedButton(onClick = { reveal = !reveal }, modifier = Modifier.weight(1f)) { Text(if (reveal) "HIDE" else "REVEAL") }
                     Button(
                         onClick = {
                             val old = vault.read()
-                            vault.save(
-                                old.copy(
-                                    upstoxApiKey = apiKey,
-                                    upstoxApiSecret = apiSecret,
-                                    upstoxRedirectUri = redirectUri,
-                                ),
-                            )
+                            vault.save(old.copy(upstoxApiKey = apiKey, upstoxApiSecret = apiSecret, upstoxRedirectUri = redirectUri))
                             onAccessTokenSaved(old.upstoxAccessToken)
                             reveal = false
                             expanded = false
@@ -104,12 +84,7 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
 }
 
 @Composable
-private fun CredentialField(
-    label: String,
-    value: String,
-    reveal: Boolean,
-    onValueChange: (String) -> Unit,
-) {
+private fun CredentialField(label: String, value: String, reveal: Boolean, onValueChange: (String) -> Unit) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,

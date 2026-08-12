@@ -1,11 +1,5 @@
 package com.parmod.ema.model
 
-import com.parmod.ema.ai.AiBridgeHealth
-import com.parmod.ema.ai.AiConnectionMode
-import com.parmod.ema.ai.AiRunMode
-import com.parmod.ema.ai.AiTradeDecision
-import com.parmod.ema.ai.SignalEngineMode
-
 enum class TradingMode { MANUAL, AUTO }
 enum class ExecutionMode { PAPER, LIVE }
 enum class AppMode { LIVE_MARKET, BACKTEST }
@@ -14,6 +8,7 @@ enum class MarketIndex { NIFTY, SENSEX }
 enum class SignalAction { BUY_CE, BUY_PE, WAIT }
 enum class TrendDirection { BULLISH, BEARISH, NEUTRAL }
 enum class PositionSide { CE, PE }
+enum class EngineId { ENGINE_1_TREND, ENGINE_2_AVWAP_LIQUIDITY }
 
 data class OptionQuote(
     val strike: Double,
@@ -36,6 +31,7 @@ data class SignalSnapshot(
     val stopLoss: Double?,
     val target: Double?,
     val reasons: List<String>,
+    val setup: String = "WAIT",
 )
 
 data class PaperPosition(
@@ -49,56 +45,60 @@ data class PaperPosition(
     val targetPrice: Double = entryPrice * 1.30,
     val breakevenActive: Boolean = false,
     val trailingActive: Boolean = false,
+    val openedAtMillis: Long = System.currentTimeMillis(),
 ) {
     val pnl: Double get() = (currentPrice - entryPrice) * quantity
 }
 
-data class LearningDashboardState(
-    val completedTrades: Int = 0,
+data class EnginePerformance(
+    val trades: Int = 0,
     val wins: Int = 0,
     val losses: Int = 0,
-    val winRate: Double = 0.0,
-    val profitFactor: Double = 0.0,
-    val expectancy: Double = 0.0,
-    val maximumDrawdownPct: Double = 0.0,
-    val promotionEligible: Boolean = false,
-    val policyVersion: Int = 1,
-    val minimumAiConfidence: Int = 80,
-    val message: String = "No completed paper trades yet",
-)
+    val realizedPnl: Double = 0.0,
+    val grossProfit: Double = 0.0,
+    val grossLoss: Double = 0.0,
+    val peakEquity: Double = 0.0,
+    val maxDrawdown: Double = 0.0,
+) {
+    val winRate: Double get() = if (trades == 0) 0.0 else wins.toDouble() / trades * 100.0
+    val profitFactor: Double get() = when {
+        grossLoss > 0.0 -> grossProfit / grossLoss
+        grossProfit > 0.0 -> Double.POSITIVE_INFINITY
+        else -> 0.0
+    }
+}
+
+data class EngineState(
+    val id: EngineId,
+    val name: String,
+    val signal: SignalSnapshot = SignalSnapshot(SignalAction.WAIT, 0, TrendDirection.NEUTRAL, null, null, null, listOf("Waiting for market data")),
+    val position: PaperPosition? = null,
+    val performance: EnginePerformance = EnginePerformance(),
+    val message: String = "Ready",
+) {
+    val openPnl: Double get() = position?.pnl ?: 0.0
+    val totalPnl: Double get() = performance.realizedPnl + openPnl
+}
 
 data class DashboardState(
     val index: MarketIndex = MarketIndex.NIFTY,
-    val tradingMode: TradingMode = TradingMode.MANUAL,
+    val tradingMode: TradingMode = TradingMode.AUTO,
     val executionMode: ExecutionMode = ExecutionMode.PAPER,
     val appMode: AppMode = AppMode.LIVE_MARKET,
     val connectionMode: ConnectionMode = ConnectionMode.DEMO,
-    val signalEngineMode: SignalEngineMode = SignalEngineMode.NATIVE,
-    val aiConnectionMode: AiConnectionMode = AiConnectionMode.DIRECT_OPENAI,
-    val aiRunMode: AiRunMode = AiRunMode.SHADOW,
-    val aiBridgeHealth: AiBridgeHealth = AiBridgeHealth(),
-    val aiDecision: AiTradeDecision? = null,
-    val aiFinalReason: String = "AI not configured",
-    val directOpenAiModel: String = "gpt-5",
     val isConnected: Boolean = false,
-    val liveExecutionUnlocked: Boolean = false,
-    val liveTradingEnabled: Boolean = false,
     val startingCapital: Double = 100_000.0,
-    val realizedPnl: Double = 0.0,
     val spotPrice: Double = 0.0,
-    val pnl: Double = 0.0,
-    val signal: SignalSnapshot = SignalSnapshot(SignalAction.WAIT, 0, TrendDirection.NEUTRAL, null, null, null, listOf("Waiting for market data")),
     val optionChain: List<OptionQuote> = emptyList(),
-    val position: PaperPosition? = null,
-    val learning: LearningDashboardState = LearningDashboardState(),
-    val paperRiskLocked: Boolean = false,
-    val paperRiskReason: String = "Paper risk gates clear",
-    val todayPaperPnl: Double = 0.0,
-    val todayPaperTrades: Int = 0,
-    val consecutivePaperLosses: Int = 0,
-    val message: String = "Ready",
+    val engine1: EngineState = EngineState(EngineId.ENGINE_1_TREND, "ENGINE 1 · TREND / BREAKOUT"),
+    val engine2: EngineState = EngineState(EngineId.ENGINE_2_AVWAP_LIQUIDITY, "ENGINE 2 · AVWAP / LIQUIDITY"),
+    val message: String = "Ready · live paper trading only",
     val lastTickMillis: Long = 0L,
     val ticksReceived: Long = 0L,
+    val riskLocked: Boolean = false,
+    val riskReason: String = "Risk gates clear",
 ) {
-    val equity: Double get() = startingCapital + realizedPnl + pnl
+    val combinedRealizedPnl: Double get() = engine1.performance.realizedPnl + engine2.performance.realizedPnl
+    val combinedOpenPnl: Double get() = engine1.openPnl + engine2.openPnl
+    val combinedEquity: Double get() = startingCapital + combinedRealizedPnl + combinedOpenPnl
 }

@@ -11,6 +11,10 @@ import kotlin.math.sqrt
  * Tick-native signal core. Every underlying tick is ingested; no completed candle is required.
  * Engine 1: tick EMA trend + directional efficiency + breakout/anti-chop.
  * Engine 2: tick AVWAP + tick-profile POC + liquidity sweep + uptick/downtick order-flow proxy.
+ *
+ * Fast warm-up is intentionally supported for slower index feeds such as SENSEX. The initial
+ * evaluation thresholds are small, while all rolling lookbacks naturally deepen as more ticks
+ * arrive. Entry quality gates and full-confluence requirements remain unchanged.
  */
 class TickNativeDualEngine {
     data class Tick(val price: Double, val timestamp: Long)
@@ -41,19 +45,20 @@ class TickNativeDualEngine {
 
     private fun evaluateTrend(t: List<Tick>): SignalSnapshot {
         if (t.size < TREND_MIN_TICKS) {
-            return wait("Collecting live ticks ${t.size}/$TREND_MIN_TICKS", "TICK TREND WARMING")
+            return wait("Fast warm-up ${t.size}/$TREND_MIN_TICKS ticks", "TICK TREND WARMING")
         }
         val prices = t.map { it.price }
         val fast = ema(prices, 21)
         val slow = ema(prices, 55)
-        val prevFast = ema(prices.dropLast(12), 21)
-        val prevSlow = ema(prices.dropLast(12), 55)
+        val slopeGap = 12.coerceAtMost((prices.size / 4).coerceAtLeast(3))
+        val prevFast = ema(prices.dropLast(slopeGap), 21)
+        val prevSlow = ema(prices.dropLast(slopeGap), 55)
         val fastSlope = fast - prevFast
         val slowSlope = slow - prevSlow
         val microAtr = tickAtr(prices, 60)
         val separation = if (microAtr > 0.0) abs(fast - slow) / microAtr else 0.0
-        val efficiency = efficiencyRatio(prices, 80)
-        val crosses = emaCrossCount(prices, 21, 55, 100)
+        val efficiency = efficiencyRatio(prices, 80.coerceAtMost(prices.size - 1))
+        val crosses = emaCrossCount(prices, 21, 55, 100.coerceAtMost(prices.size))
         val current = prices.last()
         val prior = prices.dropLast(1).takeLast(100)
         val high = prior.maxOrNull() ?: current
@@ -73,6 +78,7 @@ class TickNativeDualEngine {
         if (crosses <= 3) { score += 14; reasons += "Low tick whipsaw count $crosses" }
         if (separation >= 0.70) { score += 14; reasons += "Tick EMA separation confirmed" }
         if (breakout) { score += 20; reasons += "Tick-range breakout confirmed" }
+        if (prices.size < 80) reasons += "Fast-start mode · depth ${prices.size} ticks"
         score = score.coerceIn(0, 100)
 
         val risk = max(microAtr * 7.0, current * 0.00065)
@@ -91,7 +97,7 @@ class TickNativeDualEngine {
 
     private fun evaluateAvwap(t: List<Tick>): SignalSnapshot {
         if (t.size < AVWAP_MIN_TICKS) {
-            return wait("Collecting live ticks ${t.size}/$AVWAP_MIN_TICKS", "TICK AVWAP WARMING")
+            return wait("Fast warm-up ${t.size}/$AVWAP_MIN_TICKS ticks", "TICK AVWAP WARMING")
         }
         val prices = t.map { it.price }
         val current = prices.last()
@@ -100,10 +106,11 @@ class TickNativeDualEngine {
         val poc = tickProfilePoc(prices.takeLast(1200), atr)
         val flow = orderFlowProxy(prices.takeLast(100))
 
-        val sweepSample = prices.dropLast(1).takeLast(140)
+        val sweepLookback = 140.coerceAtMost((prices.size - 1).coerceAtLeast(20))
+        val sweepSample = prices.dropLast(1).takeLast(sweepLookback)
         val priorLow = sweepSample.minOrNull() ?: current
         val priorHigh = sweepSample.maxOrNull() ?: current
-        val recent = prices.takeLast(12)
+        val recent = prices.takeLast(12.coerceAtMost(prices.size))
         val recentLow = recent.minOrNull() ?: current
         val recentHigh = recent.maxOrNull() ?: current
         val reclaimBuffer = max(atr * 0.15, current * 0.000025)
@@ -129,6 +136,7 @@ class TickNativeDualEngine {
         }
         val confidence = when (max(bullParts, bearParts)) { 4 -> 94; 3 -> 78; 2 -> 62; else -> 40 }
         val reasons = mutableListOf("Tick AVWAP ${fmt(avwap)} · POC ${fmt(poc)}", "Tick order-flow proxy ${fmt(flow)}")
+        if (prices.size < 120) reasons += "Fast-start mode · depth ${prices.size} ticks"
         if (bullishSweep) reasons += "Sell-side liquidity swept/reclaimed on ticks"
         if (bearishSweep) reasons += "Buy-side liquidity swept/rejected on ticks"
         if (!(fullBull || fullBear)) reasons += "AUTO waits for full four-factor tick confluence"
@@ -150,6 +158,7 @@ class TickNativeDualEngine {
 
     private fun efficiencyRatio(values: List<Double>, lookback: Int): Double {
         val s = values.takeLast(lookback + 1)
+        if (s.size < 2) return 0.0
         val net = abs(s.last() - s.first())
         val path = s.zipWithNext().sumOf { (a, b) -> abs(b - a) }
         return if (path > 0.0) (net / path).coerceIn(0.0, 1.0) else 0.0
@@ -205,8 +214,8 @@ class TickNativeDualEngine {
     private fun fmt(v: Double) = "%.2f".format(v)
 
     companion object {
-        private const val TREND_MIN_TICKS = 80
-        private const val AVWAP_MIN_TICKS = 120
+        private const val TREND_MIN_TICKS = 40
+        private const val AVWAP_MIN_TICKS = 60
         private const val MAX_TICKS = 5000
     }
 }

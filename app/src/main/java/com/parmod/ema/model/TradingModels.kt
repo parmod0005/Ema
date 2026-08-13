@@ -21,6 +21,9 @@ data class OptionQuote(
     val isAtm: Boolean = false,
     val instrumentKey: String = "",
     val lastTickMillis: Long = 0L,
+    val bid: Double = 0.0,
+    val ask: Double = 0.0,
+    val volume: Long = 0L,
 )
 
 data class SignalSnapshot(
@@ -46,7 +49,6 @@ data class PaperPosition(
     val breakevenActive: Boolean = false,
     val trailingActive: Boolean = false,
     val openedAtMillis: Long = System.currentTimeMillis(),
-    // Engine-3/V7.6 fields. Defaults keep Engines 1/2 unchanged.
     val strategy: String = "",
     val lotSize: Int = 0,
     val lots: Int = 1,

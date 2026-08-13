@@ -3,13 +3,11 @@ package com.parmod.ema
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.parmod.ema.data.UpstoxIntradayCandleClient
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
-import com.parmod.ema.engine.AvwapLiquidityEngine
 import com.parmod.ema.engine.ExecutionEngineV2
 import com.parmod.ema.engine.OptionSelector
-import com.parmod.ema.engine.SignalEngineV2
+import com.parmod.ema.engine.TickNativeDualEngine
 import com.parmod.ema.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -33,8 +31,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private var savedAccessToken = ""
     private var savedExpiry = ""
 
-    private val engine1Core = SignalEngineV2()
-    private val engine2Core = AvwapLiquidityEngine()
+    private val tickCore = TickNativeDualEngine()
     private val optionSelector = OptionSelector()
     private val executionEngine = ExecutionEngineV2()
 
@@ -42,22 +39,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private var engine2Execution: ExecutionEngineV2.State? = null
     private var engine1LastExit = 0L
     private var engine2LastExit = 0L
-    private var lastEvaluatedMinute = -1L
-
-    private data class WorkingBar(
-        val minute: Long,
-        val open: Double,
-        var high: Double,
-        var low: Double,
-        var close: Double,
-        var ticks: Long = 0,
-        var buyTicks: Long = 0,
-        var sellTicks: Long = 0,
-        var previousTick: Double = open,
-    )
-
-    private var workingBar: WorkingBar? = null
-    private val completedBars = ArrayDeque<AvwapLiquidityEngine.Bar>()
+    private var lastSignalPublishMillis = 0L
 
     fun connectLive(accessToken: String, expiryDate: String) {
         if (accessToken.isBlank() || expiryDate.isBlank()) {
@@ -80,25 +62,14 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
             executionMode = ExecutionMode.PAPER,
             optionChain = emptyList(),
             spotPrice = 0.0,
-            message = "Loading ${selectedIndex.name} contracts and warming 1-minute structure…",
+            message = "Loading ${selectedIndex.name} contracts · tick-native engines starting…",
         )
         feedJob = viewModelScope.launch {
             try {
                 val client = UpstoxLiveClient(savedAccessToken)
                 val snapshot = withContext(Dispatchers.IO) { client.fetchSnapshot(selectedIndex, savedExpiry) }
                 underlyingKey = snapshot.underlyingKey
-
-                val warmBars = withContext(Dispatchers.IO) {
-                    runCatching {
-                        UpstoxIntradayCandleClient(savedAccessToken)
-                            .getOneMinuteCandles(underlyingKey)
-                    }.getOrDefault(emptyList())
-                }
-                warmStartFromIntraday(warmBars)
                 publishLiveSnapshot(snapshot)
-                if (completedBars.isNotEmpty()) {
-                    evaluateCompletedMinute(completedBars.last().timestamp / 60_000L)
-                }
 
                 val keys = (listOf(snapshot.underlyingKey) + snapshot.options.mapNotNull { it.instrumentKey.takeIf(String::isNotBlank) }).distinct()
                 tickStream = UpstoxTickStream(
@@ -108,9 +79,8 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
                         override fun onOpen() {
                             _state.value = _state.value.copy(
                                 isConnected = true,
-                                message = "${selectedIndex.name} live · ${completedBars.size} warm 1m bars · dual PAPER engines ready",
+                                message = "${selectedIndex.name} live · tick-by-tick · dual PAPER engines",
                             )
-                            runParallelAuto()
                         }
 
                         override fun onTick(tick: UpstoxTickStream.Tick) = applyTick(tick)
@@ -124,40 +94,10 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun warmStartFromIntraday(candles: List<UpstoxIntradayCandleClient.Candle>) {
-        val currentMinute = System.currentTimeMillis() / 60_000L
-        val recentCandles = candles
-            .filter { candle -> candle.time.toInstant().toEpochMilli() / 60_000L < currentMinute }
-            .sortedBy { candle -> candle.time.toInstant().toEpochMilli() }
-            .takeLast(180)
-
-        recentCandles.forEach { candle ->
-            val timestamp = candle.time.toInstant().toEpochMilli()
-            val participation = candle.volume.takeIf { it > 0L } ?: 100L
-            val range = (candle.high - candle.low).coerceAtLeast(0.0001)
-            val buyShare = ((candle.close - candle.low) / range).coerceIn(0.0, 1.0)
-            val buy = (participation * buyShare).toLong().coerceIn(0L, participation)
-            val sell = (participation - buy).coerceAtLeast(0L)
-            completedBars.addLast(
-                AvwapLiquidityEngine.Bar(
-                    open = candle.open,
-                    high = candle.high,
-                    low = candle.low,
-                    close = candle.close,
-                    tickVolume = participation,
-                    buyTicks = buy,
-                    sellTicks = sell,
-                    timestamp = timestamp,
-                ),
-            )
-        }
-        while (completedBars.size > 180) completedBars.removeFirst()
-    }
-
     fun connectDemo() {
         disconnectInternal()
         resetMarketStructure()
-        _state.value = _state.value.copy(connectionMode = ConnectionMode.DEMO, isConnected = true, executionMode = ExecutionMode.PAPER, message = "Demo feed · dual engines")
+        _state.value = _state.value.copy(connectionMode = ConnectionMode.DEMO, isConnected = true, executionMode = ExecutionMode.PAPER, message = "Demo feed · tick-native dual engines")
         feedJob = viewModelScope.launch {
             var n = 0
             while (true) {
@@ -176,7 +116,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
                 updatePositions(chain)
                 managePositions()
                 n++
-                delay(500)
+                delay(100)
             }
         }
     }
@@ -239,7 +179,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
             optionChain = chain,
             lastTickMillis = tick.feedTimestamp,
             ticksReceived = current.ticksReceived + 1,
-            message = "${current.index.name} · ${current.ticksReceived + 1} ticks · 2 PAPER engines",
+            message = "${current.index.name} · ${current.ticksReceived + 1} ticks · tick-native · 2 PAPER engines",
         )
         updatePositions(chain)
         managePositions()
@@ -247,45 +187,16 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
 
     private fun onSpotTick(price: Double, timestamp: Long) {
         if (price <= 0.0) return
-        val minute = timestamp / 60_000L
-        val bar = workingBar
-        if (bar == null) {
-            workingBar = WorkingBar(minute, price, price, price, price, ticks = 1, previousTick = price)
-        } else if (bar.minute == minute) {
-            if (price > bar.previousTick) bar.buyTicks++ else if (price < bar.previousTick) bar.sellTicks++
-            bar.high = max(bar.high, price)
-            bar.low = minOf(bar.low, price)
-            bar.close = price
-            bar.previousTick = price
-            bar.ticks++
-        } else {
-            completedBars.addLast(bar.toEngine2Bar())
-            while (completedBars.size > 180) completedBars.removeFirst()
-            evaluateCompletedMinute(bar.minute)
-            workingBar = WorkingBar(minute, price, price, price, price, ticks = 1, previousTick = price)
-        }
+        tickCore.ingest(price, timestamp)
         _state.value = _state.value.copy(spotPrice = price, lastTickMillis = timestamp)
-    }
 
-    private fun WorkingBar.toEngine2Bar() = AvwapLiquidityEngine.Bar(open, high, low, close, ticks, buyTicks, sellTicks, minute * 60_000L)
-
-    private fun evaluateCompletedMinute(minute: Long) {
-        if (minute == lastEvaluatedMinute || completedBars.isEmpty()) return
-        lastEvaluatedMinute = minute
-        val bars = completedBars.toList()
-
-        val e1Bars = bars.map { SignalEngineV2.Bar(it.open, it.high, it.low, it.close, it.tickVolume) }
-        val e1Eval = engine1Core.evaluate(e1Bars)
-        val e1Signal = when (e1Eval.direction) {
-            SignalEngineV2.Direction.BULLISH -> SignalSnapshot(SignalAction.BUY_CE, e1Eval.score, TrendDirection.BULLISH, bars.last().close, bars.last().close - e1Eval.atr, bars.last().close + e1Eval.atr * 1.8, e1Eval.reasons, "TREND + BREAKOUT + ANTI-CHOP")
-            SignalEngineV2.Direction.BEARISH -> SignalSnapshot(SignalAction.BUY_PE, e1Eval.score, TrendDirection.BEARISH, bars.last().close, bars.last().close + e1Eval.atr, bars.last().close - e1Eval.atr * 1.8, e1Eval.reasons, "TREND + BREAKOUT + ANTI-CHOP")
-            SignalEngineV2.Direction.NEUTRAL -> SignalSnapshot(SignalAction.WAIT, e1Eval.score, TrendDirection.NEUTRAL, null, null, null, e1Eval.reasons, "ANTI-CHOP WAIT")
-        }
-
-        val e2Eval = engine2Core.evaluate(bars)
+        // Every tick is ingested. Signal/UI publication is throttled to avoid Compose lag.
+        if (timestamp - lastSignalPublishMillis < 250L) return
+        lastSignalPublishMillis = timestamp
+        val result = tickCore.evaluate()
         _state.value = _state.value.copy(
-            engine1 = _state.value.engine1.copy(signal = e1Signal, message = e1Signal.setup),
-            engine2 = _state.value.engine2.copy(signal = e2Eval.signal, message = e2Eval.signal.setup),
+            engine1 = _state.value.engine1.copy(signal = result.engine1, message = result.engine1.setup),
+            engine2 = _state.value.engine2.copy(signal = result.engine2, message = result.engine2.setup),
         )
         runParallelAuto()
     }
@@ -417,9 +328,8 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun resetMarketStructure() {
-        workingBar = null
-        completedBars.clear()
-        lastEvaluatedMinute = -1L
+        tickCore.reset()
+        lastSignalPublishMillis = 0L
     }
 
     private fun buildDemoChain(spot: Double): List<OptionQuote> {

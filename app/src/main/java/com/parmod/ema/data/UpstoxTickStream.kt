@@ -44,7 +44,9 @@ class UpstoxTickStream(
         .pingInterval(20, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
+    private val integrity = DataIntegrityMonitor()
     private var socket: WebSocket? = null
+    private var lastIntegrityNoticeMillis = 0L
 
     fun connect() {
         val url = authorizedUrlProvider()
@@ -64,8 +66,23 @@ class UpstoxTickStream(
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 try {
                     val response = FeedResponse.parseFrom(bytes.toByteArray())
+                    val now = System.currentTimeMillis()
                     response.feedsMap.forEach { (key, feed) ->
-                        decodeTick(key, feed, response.currentTs)?.let(listener::onTick)
+                        val tick = decodeTick(key, feed, response.currentTs) ?: return@forEach
+                        val timestamp = tick.ltt?.takeIf { it > 0L } ?: tick.feedTimestamp
+                        val report = integrity.checkLive(key, tick.ltp, timestamp, now)
+                        if (report.accepted) {
+                            listener.onTick(tick)
+                        } else if (!report.duplicate && now - lastIntegrityNoticeMillis >= INTEGRITY_NOTICE_THROTTLE_MS) {
+                            lastIntegrityNoticeMillis = now
+                            listener.onError("DATA INTEGRITY · ${report.message} · $key")
+                        }
+                    }
+
+                    val stalled = integrity.stalledInstruments(now)
+                    if (stalled.isNotEmpty() && now - lastIntegrityNoticeMillis >= INTEGRITY_NOTICE_THROTTLE_MS) {
+                        lastIntegrityNoticeMillis = now
+                        listener.onError("DATA INTEGRITY · stalled feed: ${stalled.take(3).joinToString()}")
                     }
                 } catch (error: Exception) {
                     listener.onError("Tick decode failed: ${error.message}")
@@ -117,5 +134,9 @@ class UpstoxTickStream(
             }
             else -> null
         }
+    }
+
+    companion object {
+        private const val INTEGRITY_NOTICE_THROTTLE_MS = 5_000L
     }
 }

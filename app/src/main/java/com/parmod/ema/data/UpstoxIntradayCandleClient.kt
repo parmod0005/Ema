@@ -19,7 +19,7 @@ class UpstoxIntradayCandleClient(private val accessToken: String) {
     )
 
     fun getOneMinuteCandles(instrumentKey: String): List<Candle> = fetch(
-        "https://api.upstox.com/v3/historical-candle/intraday/${encode(instrumentKey)}/minutes/1",
+        "https://api.upstox.com/v3/historical-candle/intraday/${encodePathSegment(instrumentKey)}/minutes/1",
     )
 
     /** Mirrors V7.6 HISTORICAL_WARMUP_DAYS=10 then merges current intraday candles. */
@@ -27,8 +27,9 @@ class UpstoxIntradayCandleClient(private val accessToken: String) {
         require(days > 0)
         val today = LocalDate.now()
         val from = today.minusDays(days.toLong())
+        val encoded = encodePathSegment(instrumentKey)
         val historical = fetch(
-            "https://api.upstox.com/v3/historical-candle/${encode(instrumentKey)}/minutes/1/$today/$from",
+            "https://api.upstox.com/v3/historical-candle/$encoded/minutes/1/$today/$from",
         )
         val intraday = runCatching { getOneMinuteCandles(instrumentKey) }.getOrDefault(emptyList())
         return (historical + intraday)
@@ -37,10 +38,15 @@ class UpstoxIntradayCandleClient(private val accessToken: String) {
             .sortedBy { it.time }
     }
 
-    private fun encode(instrumentKey: String): String {
+    /**
+     * URLEncoder is a form/query encoder and represents spaces as '+'. Upstox V3
+     * historical/intraday candle APIs place instrument_key in the URL path, where
+     * spaces must remain percent encoded. Keep %7C for '|' and convert '+' to %20.
+     */
+    private fun encodePathSegment(instrumentKey: String): String {
         require(accessToken.isNotBlank()) { "Upstox access token is required" }
         require(instrumentKey.isNotBlank()) { "Instrument key is required" }
-        return URLEncoder.encode(instrumentKey, Charsets.UTF_8.name())
+        return URLEncoder.encode(instrumentKey, Charsets.UTF_8.name()).replace("+", "%20")
     }
 
     private fun fetch(url: String): List<Candle> {

@@ -74,6 +74,9 @@ class UpstoxLiveClient(private val accessToken: String) {
             gamma = greeks.optDouble("gamma", 0.0),
             isAtm = isAtm,
             instrumentKey = node.optString("instrument_key"),
+            bid = market.optDouble("bid_price", 0.0),
+            ask = market.optDouble("ask_price", 0.0),
+            volume = market.optLong("volume", 0L),
         )
     }
 

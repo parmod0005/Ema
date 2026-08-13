@@ -28,6 +28,9 @@ class UpstoxTickStream(
         val delta: Double?,
         val gamma: Double?,
         val feedTimestamp: Long,
+        val bid: Double? = null,
+        val ask: Double? = null,
+        val volume: Long? = null,
     )
 
     interface Listener {
@@ -89,14 +92,21 @@ class UpstoxTickStream(
             Feed.FeedUnionCase.LTPC -> Tick(key, feed.ltpc.ltp, feed.ltpc.ltt, null, null, null, timestamp)
             Feed.FeedUnionCase.FIRSTLEVELWITHGREEKS -> {
                 val item = feed.firstLevelWithGreeks
-                Tick(key, item.ltpc.ltp, item.ltpc.ltt, item.oi.toLong(), item.optionGreeks.delta, item.optionGreeks.gamma, timestamp)
+                Tick(
+                    key, item.ltpc.ltp, item.ltpc.ltt, item.oi.toLong(), item.optionGreeks.delta, item.optionGreeks.gamma, timestamp,
+                    bid = item.firstDepth.bidP, ask = item.firstDepth.askP, volume = item.vtt,
+                )
             }
             Feed.FeedUnionCase.FULLFEED -> {
                 val full = feed.fullFeed
                 when (full.fullFeedUnionCase) {
                     FullFeed.FullFeedUnionCase.MARKETFF -> {
                         val item = full.marketFF
-                        Tick(key, item.ltpc.ltp, item.ltpc.ltt, item.oi.toLong(), item.optionGreeks.delta, item.optionGreeks.gamma, timestamp)
+                        val depth = item.marketLevel.bidAskQuoteList.firstOrNull()
+                        Tick(
+                            key, item.ltpc.ltp, item.ltpc.ltt, item.oi.toLong(), item.optionGreeks.delta, item.optionGreeks.gamma, timestamp,
+                            bid = depth?.bidP, ask = depth?.askP, volume = item.vtt,
+                        )
                     }
                     FullFeed.FullFeedUnionCase.INDEXFF -> {
                         val item = full.indexFF

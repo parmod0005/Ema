@@ -18,6 +18,8 @@ class UpstoxIntradayCandleClient(private val accessToken: String) {
         val volume: Long,
     )
 
+    private val integrity = DataIntegrityMonitor()
+
     fun getOneMinuteCandles(instrumentKey: String): List<Candle> = fetch(
         "https://api.upstox.com/v3/historical-candle/intraday/${encodePathSegment(instrumentKey)}/minutes/1",
     )
@@ -32,10 +34,17 @@ class UpstoxIntradayCandleClient(private val accessToken: String) {
             "https://api.upstox.com/v3/historical-candle/$encoded/minutes/1/$today/$from",
         )
         val intraday = runCatching { getOneMinuteCandles(instrumentKey) }.getOrDefault(emptyList())
-        return (historical + intraday)
+        val merged = (historical + intraday)
             .associateBy { it.time.toInstant().toEpochMilli() }
             .values
             .sortedBy { it.time }
+
+        val report = integrity.validateHistorical(merged)
+        if (!report.valid) error(report.message)
+        if (merged.size < MIN_V76_WARMUP_ROWS) {
+            error("Historical integrity failed: only ${merged.size}/$MIN_V76_WARMUP_ROWS 1m candles available")
+        }
+        return merged
     }
 
     /**
@@ -80,5 +89,9 @@ class UpstoxIntradayCandleClient(private val accessToken: String) {
         } finally {
             connection.disconnect()
         }
+    }
+
+    companion object {
+        private const val MIN_V76_WARMUP_ROWS = 220
     }
 }

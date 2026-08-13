@@ -5,7 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -14,14 +16,15 @@ import com.parmod.ema.MainActivity
 import com.parmod.ema.R
 
 /**
- * Foreground process keeper for the personal paper-trading build.
+ * Foreground process/network keeper for the personal paper-trading build.
  *
- * The TradingViewModel is the single owner of the Upstox WebSocket. This service
- * deliberately does not open another broker connection; it only keeps the
- * process scheduled while the app is minimized or the screen is locked.
+ * The live trading runtime owns the Upstox WebSocket elsewhere; this service
+ * prevents Android from suspending CPU/network work while the UI is minimized
+ * or the screen is locked. It deliberately contains no broker-order API.
  */
 class VardhaniMarketService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var shouldRun = false
     private var indexName = "NIFTY"
     private var expiry = ""
@@ -29,11 +32,19 @@ class VardhaniMarketService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "VARDHANI:PaperRuntime",
         ).apply { setReferenceCounted(false) }
+
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        @Suppress("DEPRECATION")
+        wifiLock = wifiManager?.createWifiLock(
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+            "VARDHANI:MarketDataWifi",
+        )?.apply { setReferenceCounted(false) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -48,9 +59,7 @@ class VardhaniMarketService : Service() {
                 indexName = intent?.getStringExtra(EXTRA_INDEX).orEmpty().ifBlank { indexName }
                 expiry = intent?.getStringExtra(EXTRA_EXPIRY).orEmpty().ifBlank { expiry }
                 shouldRun = true
-                if (wakeLock?.isHeld != true) {
-                    wakeLock?.acquire(12 * 60 * 60 * 1000L)
-                }
+                acquireRuntimeLocks()
                 startForeground(
                     NOTIFICATION_ID,
                     notification("$indexName paper runtime active${expiry.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""}"),
@@ -60,9 +69,19 @@ class VardhaniMarketService : Service() {
         return START_STICKY
     }
 
+    private fun acquireRuntimeLocks() {
+        if (wakeLock?.isHeld != true) {
+            wakeLock?.acquire(12 * 60 * 60 * 1000L)
+        }
+        if (wifiLock?.isHeld != true) {
+            runCatching { wifiLock?.acquire() }
+        }
+    }
+
     private fun stopRuntime() {
         shouldRun = false
-        if (wakeLock?.isHeld == true) wakeLock?.release()
+        if (wifiLock?.isHeld == true) runCatching { wifiLock?.release() }
+        if (wakeLock?.isHeld == true) runCatching { wakeLock?.release() }
         getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
     }
 
@@ -108,6 +127,7 @@ class VardhaniMarketService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         if (shouldRun) {
+            acquireRuntimeLocks()
             getSystemService(NotificationManager::class.java).notify(
                 NOTIFICATION_ID,
                 notification("$indexName paper runtime active · app minimized"),

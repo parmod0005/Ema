@@ -4,9 +4,10 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.time.LocalDate
 import java.time.OffsetDateTime
 
-/** Read-only V3 intraday candle loader used only to warm-start live signal engines. */
+/** Read-only V3 candle loader used only to warm-start live signal engines. */
 class UpstoxIntradayCandleClient(private val accessToken: String) {
     data class Candle(
         val time: OffsetDateTime,
@@ -17,13 +18,33 @@ class UpstoxIntradayCandleClient(private val accessToken: String) {
         val volume: Long,
     )
 
-    fun getOneMinuteCandles(instrumentKey: String): List<Candle> {
+    fun getOneMinuteCandles(instrumentKey: String): List<Candle> = fetch(
+        "https://api.upstox.com/v3/historical-candle/intraday/${encode(instrumentKey)}/minutes/1",
+    )
+
+    /** Mirrors V7.6 HISTORICAL_WARMUP_DAYS=10 then merges current intraday candles. */
+    fun getWarmupOneMinuteCandles(instrumentKey: String, days: Int = 10): List<Candle> {
+        require(days > 0)
+        val today = LocalDate.now()
+        val from = today.minusDays(days.toLong())
+        val historical = fetch(
+            "https://api.upstox.com/v3/historical-candle/${encode(instrumentKey)}/minutes/1/$today/$from",
+        )
+        val intraday = runCatching { getOneMinuteCandles(instrumentKey) }.getOrDefault(emptyList())
+        return (historical + intraday)
+            .associateBy { it.time.toInstant().toEpochMilli() }
+            .values
+            .sortedBy { it.time }
+    }
+
+    private fun encode(instrumentKey: String): String {
         require(accessToken.isNotBlank()) { "Upstox access token is required" }
         require(instrumentKey.isNotBlank()) { "Instrument key is required" }
-        val key = URLEncoder.encode(instrumentKey, Charsets.UTF_8.name())
-        val connection = URL(
-            "https://api.upstox.com/v3/historical-candle/intraday/$key/minutes/1",
-        ).openConnection() as HttpURLConnection
+        return URLEncoder.encode(instrumentKey, Charsets.UTF_8.name())
+    }
+
+    private fun fetch(url: String): List<Candle> {
+        val connection = URL(url).openConnection() as HttpURLConnection
         try {
             connection.requestMethod = "GET"
             connection.connectTimeout = 10_000
@@ -33,7 +54,7 @@ class UpstoxIntradayCandleClient(private val accessToken: String) {
             val code = connection.responseCode
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
             val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-            if (code !in 200..299) error("Upstox intraday warm-up HTTP $code: ${body.take(220)}")
+            if (code !in 200..299) error("Upstox candle warm-up HTTP $code: ${body.take(220)}")
             val rows = JSONObject(body).getJSONObject("data").getJSONArray("candles")
             return buildList {
                 for (i in 0 until rows.length()) {

@@ -28,6 +28,8 @@ import com.parmod.ema.data.UpstoxOptionDiscoveryClient
 import com.parmod.ema.model.*
 import com.parmod.ema.service.VardhaniMarketService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
@@ -39,10 +41,13 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
 private fun VardhaniApp(vm: TradingViewModel = viewModel(), backtestVm: BacktestViewModel = viewModel()) {
-    val state by vm.state.collectAsState()
+    // Engines continue to process every tick. The dashboard samples state at 4 Hz so
+    // Compose does not recompose the entire screen for every market packet.
+    val sampledState = remember(vm) { vm.state.sample(UI_REFRESH_MS) }
+    val state by sampledState.collectAsState(initial = vm.state.value)
     val backtest by backtestVm.state.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -261,3 +266,4 @@ private fun OptionChain(options: List<OptionQuote>) {
 
 private fun money(value: Double): String = if (value == 0.0) "₹0.00" else "₹" + String.format(Locale.US, "%,.2f", value)
 private fun formatPf(value: Double): String = if (value.isInfinite()) "∞" else String.format(Locale.US, "%.2f", value)
+private const val UI_REFRESH_MS = 250L

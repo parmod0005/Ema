@@ -8,7 +8,7 @@ enum class MarketIndex { NIFTY, SENSEX }
 enum class SignalAction { BUY_CE, BUY_PE, WAIT }
 enum class TrendDirection { BULLISH, BEARISH, NEUTRAL }
 enum class PositionSide { CE, PE }
-enum class EngineId { ENGINE_1_TREND, ENGINE_2_AVWAP_LIQUIDITY }
+enum class EngineId { ENGINE_1_TREND, ENGINE_2_AVWAP_LIQUIDITY, ENGINE_3_V76_SCALPER }
 
 data class OptionQuote(
     val strike: Double,
@@ -46,8 +46,18 @@ data class PaperPosition(
     val breakevenActive: Boolean = false,
     val trailingActive: Boolean = false,
     val openedAtMillis: Long = System.currentTimeMillis(),
+    // Engine-3/V7.6 fields. Defaults keep Engines 1/2 unchanged.
+    val strategy: String = "",
+    val lotSize: Int = 0,
+    val lots: Int = 1,
+    val initialQuantity: Int = quantity,
+    val indexInvalidation: Double = 0.0,
+    val target1Hit: Boolean = false,
+    val target1ExitQuantity: Int = 0,
+    val realizedPartialPnl: Double = 0.0,
+    val maxHoldMinutes: Int = 0,
 ) {
-    val pnl: Double get() = (currentPrice - entryPrice) * quantity
+    val pnl: Double get() = (currentPrice - entryPrice) * quantity + realizedPartialPnl
 }
 
 data class EnginePerformance(
@@ -92,13 +102,18 @@ data class DashboardState(
     val optionChain: List<OptionQuote> = emptyList(),
     val engine1: EngineState = EngineState(EngineId.ENGINE_1_TREND, "ENGINE 1 · TREND / BREAKOUT"),
     val engine2: EngineState = EngineState(EngineId.ENGINE_2_AVWAP_LIQUIDITY, "ENGINE 2 · AVWAP / LIQUIDITY"),
+    val engine3: EngineState = EngineState(EngineId.ENGINE_3_V76_SCALPER, "ENGINE 3 · V7.6 REVERSAL RUNNER"),
+    val enabledEngines: Set<EngineId> = EngineId.entries.toSet(),
+    val niftyLots: Int = 1,
+    val sensexLots: Int = 1,
     val message: String = "Ready · live paper trading only",
     val lastTickMillis: Long = 0L,
     val ticksReceived: Long = 0L,
     val riskLocked: Boolean = false,
     val riskReason: String = "Risk gates clear",
 ) {
-    val combinedRealizedPnl: Double get() = engine1.performance.realizedPnl + engine2.performance.realizedPnl
-    val combinedOpenPnl: Double get() = engine1.openPnl + engine2.openPnl
+    val selectedLots: Int get() = if (index == MarketIndex.NIFTY) niftyLots else sensexLots
+    val combinedRealizedPnl: Double get() = engine1.performance.realizedPnl + engine2.performance.realizedPnl + engine3.performance.realizedPnl
+    val combinedOpenPnl: Double get() = engine1.openPnl + engine2.openPnl + engine3.openPnl
     val combinedEquity: Double get() = startingCapital + combinedRealizedPnl + combinedOpenPnl
 }

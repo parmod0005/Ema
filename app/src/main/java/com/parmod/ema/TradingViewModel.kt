@@ -2,7 +2,6 @@ package com.parmod.ema
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
 import com.parmod.ema.data.UpstoxIntradayCandleClient
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
@@ -11,6 +10,7 @@ import com.parmod.ema.engine.OptionSelector
 import com.parmod.ema.engine.TickNativeDualEngine
 import com.parmod.ema.engine.V76ScalperEngine
 import com.parmod.ema.model.*
+import com.parmod.ema.runtime.ProcessTradingScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -28,8 +28,11 @@ import kotlin.math.min
 import kotlin.random.Random
 
 class TradingViewModel(application: Application) : AndroidViewModel(application) {
-    private val _state = MutableStateFlow(DashboardState())
-    val state: StateFlow<DashboardState> = _state.asStateFlow()
+    private val localState = MutableStateFlow(DashboardState())
+    private val _state: MutableStateFlow<DashboardState>
+        get() = runtimeOwner?.localState ?: localState
+    val state: StateFlow<DashboardState>
+        get() = _state.asStateFlow()
 
     private var feedJob: Job? = null
     private var tickStream: UpstoxTickStream? = null
@@ -48,6 +51,14 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private var engine1LastExit = 0L
     private var engine2LastExit = 0L
     private var lastSignalPublishMillis = 0L
+
+    init {
+        synchronized(TradingViewModel::class.java) {
+            if (runtimeOwner == null) runtimeOwner = this
+        }
+    }
+
+    private fun owner(): TradingViewModel = runtimeOwner ?: this
 
     private data class WorkingMinute(
         val minute: Long,
@@ -76,6 +87,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private val v76Sessions = mutableMapOf(MarketIndex.NIFTY to V76Session(), MarketIndex.SENSEX to V76Session())
 
     fun connectLive(accessToken: String, expiryDate: String) {
+        val active = owner(); if (active !== this) { active.connectLive(accessToken, expiryDate); return }
         if (accessToken.isBlank() || expiryDate.isBlank()) {
             _state.value = _state.value.copy(message = "Paste a valid Upstox token and select expiry")
             return
@@ -98,15 +110,20 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
             spotPrice = 0.0,
             message = "Loading ${selectedIndex.name} · 3 independent PAPER engines…",
         )
-        feedJob = viewModelScope.launch {
+        feedJob = ProcessTradingScope.scope.launch {
             try {
                 val client = UpstoxLiveClient(savedAccessToken)
                 val snapshot = withContext(Dispatchers.IO) { client.fetchSnapshot(selectedIndex, savedExpiry) }
                 underlyingKey = snapshot.underlyingKey
 
-                val warm = withContext(Dispatchers.IO) {
+                val warmResult = withContext(Dispatchers.IO) {
                     runCatching { UpstoxIntradayCandleClient(savedAccessToken).getWarmupOneMinuteCandles(underlyingKey, 10) }
-                        .getOrDefault(emptyList())
+                }
+                val warm = warmResult.getOrElse { error ->
+                    _state.value = _state.value.copy(
+                        message = "DATA INTEGRITY · V7.6 warm-up failed: ${error.message?.take(120) ?: "unknown error"}",
+                    )
+                    emptyList()
                 }
                 warmV76(warm)
                 publishLiveSnapshot(snapshot)
@@ -120,13 +137,13 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
                         override fun onOpen() {
                             _state.value = _state.value.copy(
                                 isConnected = true,
-                                message = "${selectedIndex.name} live · 2 tick-native + V7.6 MTF · 3 PAPER engines",
+                                message = "${selectedIndex.name} live · persistent process runtime · 3 PAPER engines",
                             )
                             runParallelAuto()
                         }
                         override fun onTick(tick: UpstoxTickStream.Tick) = applyTick(tick)
                         override fun onError(message: String) { _state.value = _state.value.copy(message = message.take(180)) }
-                        override fun onClosed() { _state.value = _state.value.copy(isConnected = false, message = "Tick stream closed") }
+                        override fun onClosed() { _state.value = _state.value.copy(isConnected = false, message = "Tick stream reconnecting…") }
                     },
                 ).also { withContext(Dispatchers.IO) { it.connect() } }
             } catch (error: Exception) {
@@ -147,10 +164,11 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun connectDemo() {
+        val active = owner(); if (active !== this) { active.connectDemo(); return }
         disconnectInternal()
         resetMarketStructure()
-        _state.value = _state.value.copy(connectionMode = ConnectionMode.DEMO, isConnected = true, executionMode = ExecutionMode.PAPER, message = "Demo feed · 3 PAPER engines")
-        feedJob = viewModelScope.launch {
+        _state.value = _state.value.copy(connectionMode = ConnectionMode.DEMO, isConnected = true, executionMode = ExecutionMode.PAPER, message = "Demo feed · persistent process runtime · 3 PAPER engines")
+        feedJob = ProcessTradingScope.scope.launch {
             var n = 0
             while (true) {
                 val base = if (_state.value.index == MarketIndex.NIFTY) 24_500.0 else 80_000.0
@@ -168,10 +186,14 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun disconnect() { disconnectInternal(); _state.value = _state.value.copy(isConnected = false, message = "Disconnected") }
+    fun disconnect() {
+        val active = owner(); if (active !== this) { active.disconnect(); return }
+        disconnectInternal(); _state.value = _state.value.copy(isConnected = false, message = "Disconnected")
+    }
     private fun disconnectInternal() { feedJob?.cancel(); feedJob = null; tickStream?.disconnect(); tickStream = null }
 
     fun selectIndex(index: MarketIndex) {
+        val active = owner(); if (active !== this) { active.selectIndex(index); return }
         if (_state.value.index == index) return
         EngineId.entries.forEach { closeEnginePosition(it, "Market changed") }
         resetMarketStructure()
@@ -180,22 +202,42 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         else if (_state.value.connectionMode == ConnectionMode.DEMO) connectDemo()
     }
 
-    fun setTradingMode(mode: TradingMode) { _state.value = _state.value.copy(tradingMode = mode, message = "$mode · selected engines · PAPER") }
-    fun setAppMode(mode: AppMode) { _state.value = _state.value.copy(appMode = mode) }
-    fun setStartingCapital(value: Double) { if (value > 0) _state.value = _state.value.copy(startingCapital = value) }
-    fun setLiveTradingEnabled(enabled: Boolean) { _state.value = _state.value.copy(executionMode = ExecutionMode.PAPER, message = "This build remains PAPER only") }
+    fun setTradingMode(mode: TradingMode) {
+        val active = owner(); if (active !== this) { active.setTradingMode(mode); return }
+        _state.value = _state.value.copy(tradingMode = mode, message = "$mode · selected engines · PAPER")
+    }
+    fun setAppMode(mode: AppMode) {
+        val active = owner(); if (active !== this) { active.setAppMode(mode); return }
+        _state.value = _state.value.copy(appMode = mode)
+    }
+    fun setStartingCapital(value: Double) {
+        val active = owner(); if (active !== this) { active.setStartingCapital(value); return }
+        if (value > 0) _state.value = _state.value.copy(startingCapital = value)
+    }
+    fun setLiveTradingEnabled(enabled: Boolean) {
+        val active = owner(); if (active !== this) { active.setLiveTradingEnabled(enabled); return }
+        _state.value = _state.value.copy(executionMode = ExecutionMode.PAPER, message = "This build remains PAPER only")
+    }
     fun toggleEngine(engine: EngineId) {
+        val active = owner(); if (active !== this) { active.toggleEngine(engine); return }
         val set = _state.value.enabledEngines.toMutableSet()
         if (!set.add(engine)) set.remove(engine)
         _state.value = _state.value.copy(enabledEngines = set, message = "${set.size} engine(s) selected for AUTO paper trading")
     }
     fun setLots(index: MarketIndex, lots: Int) {
+        val active = owner(); if (active !== this) { active.setLots(index, lots); return }
         val n = lots.coerceIn(1, 20)
         _state.value = if (index == MarketIndex.NIFTY) _state.value.copy(niftyLots = n) else _state.value.copy(sensexLots = n)
     }
 
-    fun manualBuy(engine: EngineId, side: PositionSide) = openEnginePosition(engine, side, "Manual paper entry")
-    fun exitEngine(engine: EngineId) = closeEnginePosition(engine, "Manual exit")
+    fun manualBuy(engine: EngineId, side: PositionSide) {
+        val active = owner(); if (active !== this) { active.manualBuy(engine, side); return }
+        openEnginePosition(engine, side, "Manual paper entry")
+    }
+    fun exitEngine(engine: EngineId) {
+        val active = owner(); if (active !== this) { active.exitEngine(engine); return }
+        closeEnginePosition(engine, "Manual exit")
+    }
 
     private fun publishLiveSnapshot(snapshot: UpstoxLiveClient.Snapshot) {
         val now = System.currentTimeMillis(); onSpotTick(snapshot.spot, now)
@@ -225,7 +267,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         _state.value = _state.value.copy(
             isConnected = true, optionChain = chain, lastTickMillis = tick.feedTimestamp,
             ticksReceived = current.ticksReceived + 1,
-            message = "${current.index.name} · ${current.ticksReceived + 1} ticks · 3 PAPER engines",
+            message = "${current.index.name} · ${current.ticksReceived + 1} ticks · persistent background runtime · 3 PAPER engines",
         )
         updatePositions(chain); managePositions()
     }
@@ -467,7 +509,10 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    companion object { private const val INDIA_VIX_KEY = "NSE_INDEX|India VIX" }
+    companion object {
+        @Volatile private var runtimeOwner: TradingViewModel? = null
+        private const val INDIA_VIX_KEY = "NSE_INDEX|India VIX"
+    }
 }
 
 private fun <T> Sequence<T>.takeLastCompat(count: Int): List<T> {

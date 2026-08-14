@@ -9,12 +9,8 @@ import kotlin.math.sqrt
 
 /**
  * Tick-native signal core. Every underlying tick is ingested; no completed candle is required.
- * Engine 1: tick EMA trend + directional efficiency + breakout/anti-chop.
+ * Engine 1: tick EMA trend + directional efficiency + breakout/anti-chop + late-chase protection.
  * Engine 2: tick AVWAP + tick-profile POC + liquidity sweep + uptick/downtick order-flow proxy.
- *
- * Fast warm-up is intentionally supported for slower index feeds such as SENSEX. The initial
- * evaluation thresholds are small, while all rolling lookbacks naturally deepen as more ticks
- * arrive. Entry quality gates and full-confluence requirements remain unchanged.
  */
 class TickNativeDualEngine {
     data class Tick(val price: Double, val timestamp: Long)
@@ -44,9 +40,8 @@ class TickNativeDualEngine {
     }
 
     private fun evaluateTrend(t: List<Tick>): SignalSnapshot {
-        if (t.size < TREND_MIN_TICKS) {
-            return wait("Fast warm-up ${t.size}/$TREND_MIN_TICKS ticks", "TICK TREND WARMING")
-        }
+        if (t.size < TREND_MIN_TICKS) return wait("Fast warm-up ${t.size}/$TREND_MIN_TICKS ticks", "TICK TREND WARMING")
+
         val prices = t.map { it.price }
         val fast = ema(prices, 21)
         val slow = ema(prices, 55)
@@ -60,6 +55,7 @@ class TickNativeDualEngine {
         val efficiency = efficiencyRatio(prices, 80.coerceAtMost(prices.size - 1))
         val crosses = emaCrossCount(prices, 21, 55, 100.coerceAtMost(prices.size))
         val current = prices.last()
+
         val prior = prices.dropLast(1).takeLast(100)
         val high = prior.maxOrNull() ?: current
         val low = prior.minOrNull() ?: current
@@ -71,6 +67,21 @@ class TickNativeDualEngine {
         val antiChop = efficiency >= 0.30 && crosses <= 3
         val breakout = (bullish && bullBreak) || (bearish && bearBreak)
 
+        // Late-chase protection. A valid trend can still be a poor entry after a vertical extension.
+        // Measure displacement from fast EMA, the recent impulse from a short base, and how far the
+        // current tick has travelled beyond the breakout boundary. Any one excessive condition blocks entry.
+        val extensionFromFastAtr = if (microAtr > 0.0) abs(current - fast) / microAtr else 0.0
+        val impulseLookback = 28.coerceAtMost(prices.size - 1)
+        val impulseBase = prices[prices.size - 1 - impulseLookback]
+        val impulseAtr = if (microAtr > 0.0) abs(current - impulseBase) / microAtr else 0.0
+        val breakoutOvershootAtr = when {
+            bullBreak && microAtr > 0.0 -> (current - high) / microAtr
+            bearBreak && microAtr > 0.0 -> (low - current) / microAtr
+            else -> 0.0
+        }
+        val overextended = extensionFromFastAtr > MAX_FAST_EXTENSION_ATR ||
+            impulseAtr > MAX_IMPULSE_ATR || breakoutOvershootAtr > MAX_BREAKOUT_OVERSHOOT_ATR
+
         var score = 0
         val reasons = mutableListOf<String>()
         if (bullish || bearish) { score += 30; reasons += "Tick EMA21/55 aligned" }
@@ -81,6 +92,18 @@ class TickNativeDualEngine {
         if (prices.size < 80) reasons += "Fast-start mode · depth ${prices.size} ticks"
         score = score.coerceIn(0, 100)
 
+        if (overextended) {
+            reasons += "Blocked: OVEREXTENDED / WAIT FOR PULLBACK"
+            reasons += "Extension ${fmt(extensionFromFastAtr)} ATR · impulse ${fmt(impulseAtr)} ATR · overshoot ${fmt(breakoutOvershootAtr)} ATR"
+            return SignalSnapshot(
+                SignalAction.WAIT,
+                score,
+                if (bullish) TrendDirection.BULLISH else if (bearish) TrendDirection.BEARISH else TrendDirection.NEUTRAL,
+                null, null, null, reasons,
+                "OVEREXTENDED · WAIT FOR PULLBACK",
+            )
+        }
+
         val risk = max(microAtr * 7.0, current * 0.00065)
         return when {
             bullish && antiChop && bullBreak && separation >= 0.55 && score >= 82 ->
@@ -90,15 +113,13 @@ class TickNativeDualEngine {
             else -> {
                 if (!antiChop) reasons += "Blocked: tick chop/whipsaw"
                 if (!breakout) reasons += "Blocked: no tick-range breakout"
-                SignalSnapshot(SignalAction.WAIT, score, TrendDirection.NEUTRAL, null, null, null, reasons, "TICK ANTI-CHOP WAIT")
+                SignalSnapshot(SignalAction.WAIT, score, if (bullish) TrendDirection.BULLISH else if (bearish) TrendDirection.BEARISH else TrendDirection.NEUTRAL, null, null, null, reasons, "TICK ANTI-CHOP WAIT")
             }
         }
     }
 
     private fun evaluateAvwap(t: List<Tick>): SignalSnapshot {
-        if (t.size < AVWAP_MIN_TICKS) {
-            return wait("Fast warm-up ${t.size}/$AVWAP_MIN_TICKS ticks", "TICK AVWAP WARMING")
-        }
+        if (t.size < AVWAP_MIN_TICKS) return wait("Fast warm-up ${t.size}/$AVWAP_MIN_TICKS ticks", "TICK AVWAP WARMING")
         val prices = t.map { it.price }
         val current = prices.last()
         val avwap = if (cumulativeWeight > 0.0) cumulativePv / cumulativeWeight else current
@@ -217,5 +238,8 @@ class TickNativeDualEngine {
         private const val TREND_MIN_TICKS = 40
         private const val AVWAP_MIN_TICKS = 60
         private const val MAX_TICKS = 5000
+        private const val MAX_FAST_EXTENSION_ATR = 4.8
+        private const val MAX_IMPULSE_ATR = 8.0
+        private const val MAX_BREAKOUT_OVERSHOOT_ATR = 3.0
     }
 }

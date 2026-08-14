@@ -32,6 +32,9 @@ import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -44,8 +47,6 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
 private fun VardhaniApp(vm: TradingViewModel = viewModel(), backtestVm: BacktestViewModel = viewModel()) {
-    // Engines continue to process every tick. The dashboard samples state at 4 Hz so
-    // Compose does not recompose the entire screen for every market packet.
     val sampledState = remember(vm) { vm.state.sample(UI_REFRESH_MS) }
     val state by sampledState.collectAsState(initial = vm.state.value)
     val backtest by backtestVm.state.collectAsState()
@@ -105,6 +106,7 @@ private fun VardhaniApp(vm: TradingViewModel = viewModel(), backtestVm: Backtest
             item { EngineCard(state.engine1, state, vm) }
             item { EngineCard(state.engine2, state, vm) }
             item { EngineCard(state.engine3, state, vm) }
+            item { TradeLogCard(state.tradeLog) }
             if (state.appMode == AppMode.BACKTEST) item { BacktestCard(token, state.index, backtest, backtestVm) }
             item { Text(state.message, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(4.dp)) }
             if (state.appMode == AppMode.LIVE_MARKET) item { OptionChain(state.optionChain) }
@@ -237,6 +239,47 @@ private fun EngineCard(engine: EngineState, state: DashboardState, vm: TradingVi
         Text(engine.message, style = MaterialTheme.typography.labelSmall)
     } }
 }
+
+@Composable
+private fun TradeLogCard(log: List<TradeLogEntry>) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("TRADE LOG", Modifier.weight(1f), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                Text("${log.size} record(s)", style = MaterialTheme.typography.labelSmall)
+            }
+            if (log.isEmpty()) {
+                Text("No trades yet. Entries and exits from all three engines will appear here.", style = MaterialTheme.typography.labelSmall)
+            } else {
+                log.takeLast(10).asReversed().forEach { t ->
+                    HorizontalDivider()
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("${shortEngine(t.engineId)} · ${t.index} · ${t.strike.toInt()} ${t.side} ×${t.quantity}", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                            Text("IN ${timeText(t.entryTimeMillis)} @ ${money(t.entryPrice)} · spot ${money(t.entrySpot)}", style = MaterialTheme.typography.labelSmall)
+                            if (t.status == TradeStatus.CLOSED) {
+                                Text("OUT ${t.exitTimeMillis?.let(::timeText) ?: "—"} @ ${t.exitPrice?.let(::money) ?: "—"} · ${t.exitReason}", style = MaterialTheme.typography.labelSmall)
+                            } else {
+                                Text("OPEN · ${t.setup}", style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                        Text(if (t.status == TradeStatus.OPEN) "OPEN" else t.pnl?.let(::money) ?: "₹0.00", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun shortEngine(id: EngineId): String = when (id) {
+    EngineId.ENGINE_1_TREND -> "E1"
+    EngineId.ENGINE_2_AVWAP_LIQUIDITY -> "E2"
+    EngineId.ENGINE_3_V76_SCALPER -> "E3"
+}
+
+private fun timeText(millis: Long): String = Instant.ofEpochMilli(millis)
+    .atZone(ZoneId.of("Asia/Kolkata"))
+    .format(DateTimeFormatter.ofPattern("HH:mm:ss"))
 
 @Composable private fun Metric(label: String, value: String, modifier: Modifier) = Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) { Text(label, fontSize = 9.sp); Text(value, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
 

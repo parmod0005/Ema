@@ -9,6 +9,7 @@ enum class SignalAction { BUY_CE, BUY_PE, WAIT }
 enum class TrendDirection { BULLISH, BEARISH, NEUTRAL }
 enum class PositionSide { CE, PE }
 enum class EngineId { ENGINE_1_TREND, ENGINE_2_AVWAP_LIQUIDITY, ENGINE_3_V76_SCALPER }
+enum class TradeStatus { OPEN, CLOSED }
 
 data class OptionQuote(
     val strike: Double,
@@ -35,6 +36,27 @@ data class SignalSnapshot(
     val target: Double?,
     val reasons: List<String>,
     val setup: String = "WAIT",
+)
+
+data class TradeLogEntry(
+    val id: Long,
+    val engineId: EngineId,
+    val engineName: String,
+    val index: MarketIndex,
+    val side: PositionSide,
+    val strike: Double,
+    val quantity: Int,
+    val lots: Int,
+    val entryPrice: Double,
+    val entrySpot: Double,
+    val entryTimeMillis: Long,
+    val setup: String,
+    val status: TradeStatus = TradeStatus.OPEN,
+    val exitPrice: Double? = null,
+    val exitSpot: Double? = null,
+    val exitTimeMillis: Long? = null,
+    val pnl: Double? = null,
+    val exitReason: String = "",
 )
 
 data class PaperPosition(
@@ -113,6 +135,7 @@ data class DashboardState(
     val ticksReceived: Long = 0L,
     val riskLocked: Boolean = false,
     val riskReason: String = "Risk gates clear",
+    val tradeLog: List<TradeLogEntry> = emptyList(),
 ) {
     val selectedLots: Int get() = if (index == MarketIndex.NIFTY) niftyLots else sensexLots
     val combinedRealizedPnl: Double get() = engine1.performance.realizedPnl + engine2.performance.realizedPnl + engine3.performance.realizedPnl

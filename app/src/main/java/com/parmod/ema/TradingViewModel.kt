@@ -311,17 +311,30 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun runParallelAuto() {
-        val s = _state.value
-        if (!s.isConnected || s.tradingMode != TradingMode.AUTO || s.appMode != AppMode.LIVE_MARKET || s.riskLocked) return
-        val enabled = s.enabledEngines
+        val snapshot = _state.value
+        if (!snapshot.isConnected || snapshot.tradingMode != TradingMode.AUTO || snapshot.appMode != AppMode.LIVE_MARKET || snapshot.riskLocked) return
+        val enabled = snapshot.enabledEngines
         val now = System.currentTimeMillis()
-        if (EngineId.ENGINE_1_TREND in enabled && s.engine1.position == null && now - engine1LastExit >= 120_000L) {
-            when (s.engine1.signal.action) { SignalAction.BUY_CE -> openEnginePosition(EngineId.ENGINE_1_TREND, PositionSide.CE, s.engine1.signal.setup); SignalAction.BUY_PE -> openEnginePosition(EngineId.ENGINE_1_TREND, PositionSide.PE, s.engine1.signal.setup); else -> Unit }
+
+        val e1Signal = snapshot.engine1.signal
+        if (EngineId.ENGINE_1_TREND in enabled && snapshot.engine1.position == null && now - engine1LastExit >= 120_000L) {
+            when (e1Signal.action) {
+                SignalAction.BUY_CE -> openEnginePosition(EngineId.ENGINE_1_TREND, PositionSide.CE, e1Signal.setup, expectedSignal = e1Signal)
+                SignalAction.BUY_PE -> openEnginePosition(EngineId.ENGINE_1_TREND, PositionSide.PE, e1Signal.setup, expectedSignal = e1Signal)
+                else -> Unit
+            }
         }
+
         val s2 = _state.value
-        if (EngineId.ENGINE_2_AVWAP_LIQUIDITY in enabled && s2.engine2.position == null && now - engine2LastExit >= 120_000L && s2.engine2.signal.confidence >= 90) {
-            when (s2.engine2.signal.action) { SignalAction.BUY_CE -> openEnginePosition(EngineId.ENGINE_2_AVWAP_LIQUIDITY, PositionSide.CE, s2.engine2.signal.setup); SignalAction.BUY_PE -> openEnginePosition(EngineId.ENGINE_2_AVWAP_LIQUIDITY, PositionSide.PE, s2.engine2.signal.setup); else -> Unit }
+        val e2Signal = s2.engine2.signal
+        if (EngineId.ENGINE_2_AVWAP_LIQUIDITY in enabled && s2.engine2.position == null && now - engine2LastExit >= 120_000L && e2Signal.confidence >= 90) {
+            when (e2Signal.action) {
+                SignalAction.BUY_CE -> openEnginePosition(EngineId.ENGINE_2_AVWAP_LIQUIDITY, PositionSide.CE, e2Signal.setup, expectedSignal = e2Signal)
+                SignalAction.BUY_PE -> openEnginePosition(EngineId.ENGINE_2_AVWAP_LIQUIDITY, PositionSide.PE, e2Signal.setup, expectedSignal = e2Signal)
+                else -> Unit
+            }
         }
+
         val s3 = _state.value
         if (EngineId.ENGINE_3_V76_SCALPER in enabled && s3.engine3.position == null) tryOpenV76()
     }
@@ -342,9 +355,25 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         openEnginePosition(EngineId.ENGINE_3_V76_SCALPER, side, eval.strategy ?: "PULLBACK")
     }
 
-    private fun openEnginePosition(engine: EngineId, side: PositionSide, reason: String) {
+    private fun openEnginePosition(
+        engine: EngineId,
+        side: PositionSide,
+        reason: String,
+        expectedSignal: SignalSnapshot? = null,
+    ) {
         val s = _state.value
         if (!s.isConnected || s.riskLocked || engineState(engine).position != null) return
+
+        if (expectedSignal != null) {
+            val liveSignal = engineState(engine).signal
+            val sideMatches = (side == PositionSide.CE && expectedSignal.action == SignalAction.BUY_CE) ||
+                (side == PositionSide.PE && expectedSignal.action == SignalAction.BUY_PE)
+            if (!sideMatches || liveSignal != expectedSignal || liveSignal.action == SignalAction.WAIT) {
+                setEngineState(engine, engineState(engine).copy(message = "ENTRY CANCELLED · signal changed before fill"))
+                return
+            }
+        }
+
         val selection = if (engine == EngineId.ENGINE_3_V76_SCALPER) selectV76Option(s.optionChain, side, s.spotPrice) else optionSelector.select(s.optionChain, side.name)?.quote
         val q = selection ?: run { setEngineState(engine, engineState(engine).copy(message = "No liquid ${side.name} contract")); return }
         val lotSize = if (s.index == MarketIndex.NIFTY) 65 else 20
@@ -366,13 +395,52 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
             )
             sessionV76().trades++
             setEngineState(engine, engineState(engine).copy(position = p, message = "V7.6 PAPER ${side.name} ${q.strike.toInt()} · $strategy"))
+            recordOpenTrade(engine, p, strategy)
             return
         }
 
-        val exec = executionEngine.open(q.ltp)
-        val p = PaperPosition(side, q.strike, qty, q.ltp, q.ltp, exec.highestPrice, exec.stopPrice, exec.targetPrice, openedAtMillis = System.currentTimeMillis(), lotSize = lotSize, lots = lots, initialQuantity = qty)
+        val entry = if (q.ask > 0.0) q.ask else q.ltp
+        val exec = executionEngine.open(entry)
+        val p = PaperPosition(side, q.strike, qty, entry, q.ltp, exec.highestPrice, exec.stopPrice, exec.targetPrice, openedAtMillis = System.currentTimeMillis(), lotSize = lotSize, lots = lots, initialQuantity = qty)
         if (engine == EngineId.ENGINE_1_TREND) engine1Execution = exec else engine2Execution = exec
         setEngineState(engine, engineState(engine).copy(position = p, message = "PAPER ${side.name} ${q.strike.toInt()} · $reason"))
+        recordOpenTrade(engine, p, reason)
+    }
+
+    private fun recordOpenTrade(engine: EngineId, p: PaperPosition, setup: String) {
+        val s = _state.value
+        val e = engineState(engine)
+        val entry = TradeLogEntry(
+            id = p.openedAtMillis,
+            engineId = engine,
+            engineName = e.name,
+            index = s.index,
+            side = p.side,
+            strike = p.strike,
+            quantity = p.quantity,
+            lots = p.lots,
+            entryPrice = p.entryPrice,
+            entrySpot = s.spotPrice,
+            entryTimeMillis = p.openedAtMillis,
+            setup = setup,
+        )
+        _state.value = s.copy(tradeLog = (s.tradeLog + entry).takeLast(MAX_TRADE_LOG))
+    }
+
+    private fun recordCloseTrade(engine: EngineId, p: PaperPosition, exitPrice: Double, pnl: Double, reason: String) {
+        val s = _state.value
+        val idx = s.tradeLog.indexOfLast { it.engineId == engine && it.status == TradeStatus.OPEN && it.entryTimeMillis == p.openedAtMillis }
+        if (idx < 0) return
+        val updated = s.tradeLog.toMutableList()
+        updated[idx] = updated[idx].copy(
+            status = TradeStatus.CLOSED,
+            exitPrice = exitPrice,
+            exitSpot = s.spotPrice,
+            exitTimeMillis = System.currentTimeMillis(),
+            pnl = pnl,
+            exitReason = reason,
+        )
+        _state.value = s.copy(tradeLog = updated.takeLast(MAX_TRADE_LOG))
     }
 
     private fun selectV76Option(chain: List<OptionQuote>, side: PositionSide, spot: Double): OptionQuote? {
@@ -466,10 +534,11 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private fun closeEnginePosition(engine: EngineId, reason: String) {
         val current = engineState(engine); val position = current.position ?: return
         var pnl = position.pnl
+        var exitPrice = position.currentPrice
         if (engine == EngineId.ENGINE_3_V76_SCALPER) {
             val q = _state.value.optionChain.firstOrNull { it.strike == position.strike && it.type == position.side.name }
-            val exit = q?.let(::paperSell) ?: position.currentPrice
-            pnl = position.realizedPartialPnl + (exit - position.entryPrice) * position.quantity - V76ScalperEngine.PAPER_FIXED_COST_PER_TRADE
+            exitPrice = q?.let(::paperSell) ?: position.currentPrice
+            pnl = position.realizedPartialPnl + (exitPrice - position.entryPrice) * position.quantity - V76ScalperEngine.PAPER_FIXED_COST_PER_TRADE
             val session = sessionV76(); session.pnl += pnl; session.consecutiveLosses = if (pnl < 0) session.consecutiveLosses + 1 else 0
             session.kill = session.pnl <= V76ScalperEngine.MAX_DAILY_LOSS_INR_PER_INDEX || session.consecutiveLosses >= V76ScalperEngine.MAX_CONSECUTIVE_LOSSES
             session.lastExitMillis = System.currentTimeMillis(); session.lastExitSide = position.side
@@ -478,6 +547,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         val perf = old.copy(trades = old.trades + 1, wins = old.wins + if (pnl > 0) 1 else 0, losses = old.losses + if (pnl < 0) 1 else 0,
             realizedPnl = realized, grossProfit = old.grossProfit + pnl.coerceAtLeast(0.0), grossLoss = old.grossLoss + (-pnl).coerceAtLeast(0.0), peakEquity = peak, maxDrawdown = max(old.maxDrawdown, drawdown))
         setEngineState(engine, current.copy(position = null, performance = perf, message = "$reason · P&L ₹${"%.2f".format(pnl)}"))
+        recordCloseTrade(engine, position, exitPrice, pnl, reason)
         when (engine) { EngineId.ENGINE_1_TREND -> { engine1Execution = null; engine1LastExit = System.currentTimeMillis() }; EngineId.ENGINE_2_AVWAP_LIQUIDITY -> { engine2Execution = null; engine2LastExit = System.currentTimeMillis() }; else -> Unit }
         updateRiskLock()
     }
@@ -512,6 +582,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     companion object {
         @Volatile private var runtimeOwner: TradingViewModel? = null
         private const val INDIA_VIX_KEY = "NSE_INDEX|India VIX"
+        private const val MAX_TRADE_LOG = 200
     }
 }
 

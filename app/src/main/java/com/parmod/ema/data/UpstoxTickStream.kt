@@ -217,7 +217,7 @@ class UpstoxTickStream(
                     ask = item.firstDepth.askP,
                     volume = item.vtt,
                     ltq = item.ltpc.ltq,
-                    depth = listOf(DepthLevel(item.firstDepth.bidP, item.firstDepth.bidQ, item.firstDepth.askP, item.firstDepth.askQ)),
+                    depth = listOf(DepthLevel(item.firstDepth.bidP, item.firstDepth.bidQ.toLong(), item.firstDepth.askP, item.firstDepth.askQ.toLong())),
                 )
             }
             Feed.FeedUnionCase.FULLFEED -> {
@@ -228,9 +228,9 @@ class UpstoxTickStream(
                         val levels = item.marketLevel.bidAskQuoteList.take(30).map {
                             DepthLevel(
                                 bidPrice = it.bidP,
-                                bidQty = it.bidQ,
+                                bidQty = it.bidQ.toLong(),
                                 askPrice = it.askP,
-                                askQty = it.askQ,
+                                askQty = it.askQ.toLong(),
                             )
                         }
                         val first = levels.firstOrNull()

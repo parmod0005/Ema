@@ -1,5 +1,6 @@
 package com.parmod.ema.data
 
+import com.parmod.ema.engine.V76ExecutionQualityEngine
 import com.upstox.marketdatafeederv3udapi.rpc.proto.Feed
 import com.upstox.marketdatafeederv3udapi.rpc.proto.FeedResponse
 import com.upstox.marketdatafeederv3udapi.rpc.proto.FullFeed
@@ -95,11 +96,19 @@ class UpstoxTickStream(
             try {
                 val response = FeedResponse.parseFrom(bytes.toByteArray())
                 val now = System.currentTimeMillis()
+                val underlyingKey = instrumentKeys.firstOrNull()
                 response.feedsMap.forEach { (key, feed) ->
                     val tick = decodeTick(key, feed, response.currentTs) ?: return@forEach
                     val timestamp = tick.ltt?.takeIf { it > 0L } ?: tick.feedTimestamp
                     val report = integrity.checkLive(key, tick.ltp, timestamp, now)
                     if (report.accepted) {
+                        if (key == underlyingKey && tick.ltp != null) {
+                            V76ExecutionQualityEngine.ingestSpot(tick.ltp, timestamp)
+                        } else {
+                            V76ExecutionQualityEngine.ingestOption(
+                                key, tick.ltp, tick.oi, tick.volume, tick.bid, tick.ask, timestamp,
+                            )
+                        }
                         listener.onTick(tick)
                     } else if (!report.duplicate && now - lastIntegrityNoticeMillis >= INTEGRITY_NOTICE_THROTTLE_MS) {
                         lastIntegrityNoticeMillis = now

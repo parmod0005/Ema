@@ -98,7 +98,7 @@ class UpstoxTickStream(
                 .put("guid", UUID.randomUUID().toString())
                 .put("method", "sub")
                 .put("data", JSONObject()
-                    .put("mode", "full_d30")
+                    .put("mode", REQUEST_MODE_D30)
                     .put("instrumentKeys", JSONArray(instrumentKeys)))
             webSocket.send(ByteString.of(*requestJson.toString().toByteArray(Charsets.UTF_8)))
             listener.onOpen()
@@ -246,10 +246,10 @@ class UpstoxTickStream(
                             ask = first?.askPrice,
                             volume = item.vtt,
                             ltq = item.ltpc.ltq,
-                            totalBuyQty = item.tbq,
-                            totalSellQty = item.tsq,
+                            totalBuyQty = item.tbq.toLong(),
+                            totalSellQty = item.tsq.toLong(),
                             depth = levels,
-                            requestMode = full.requestMode,
+                            requestMode = REQUEST_MODE_D30,
                         )
                     }
                     FullFeed.FullFeedUnionCase.INDEXFF -> {
@@ -263,7 +263,7 @@ class UpstoxTickStream(
                             gamma = null,
                             feedTimestamp = timestamp,
                             ltq = item.ltpc.ltq,
-                            requestMode = full.requestMode,
+                            requestMode = REQUEST_MODE_D30,
                         )
                     }
                     else -> null
@@ -275,5 +275,6 @@ class UpstoxTickStream(
 
     companion object {
         private const val INTEGRITY_NOTICE_THROTTLE_MS = 5_000L
+        private const val REQUEST_MODE_D30 = "full_d30"
     }
 }

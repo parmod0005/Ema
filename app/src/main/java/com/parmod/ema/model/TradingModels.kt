@@ -136,6 +136,8 @@ data class DashboardState(
     val riskLocked: Boolean = false,
     val riskReason: String = "Risk gates clear",
     val tradeLog: List<TradeLogEntry> = emptyList(),
+    val marketDepthMode: String = "WAITING",
+    val marketDepthLevels: Int = 0,
 ) {
     val selectedLots: Int get() = if (index == MarketIndex.NIFTY) niftyLots else sensexLots
     val combinedRealizedPnl: Double get() = engine1.performance.realizedPnl + engine2.performance.realizedPnl + engine3.performance.realizedPnl

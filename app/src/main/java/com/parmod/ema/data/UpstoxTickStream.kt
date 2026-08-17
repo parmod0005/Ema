@@ -24,6 +24,13 @@ class UpstoxTickStream(
     private val instrumentKeys: List<String>,
     private val listener: Listener,
 ) {
+    data class DepthLevel(
+        val bidPrice: Double,
+        val bidQty: Long,
+        val askPrice: Double,
+        val askQty: Long,
+    )
+
     data class Tick(
         val instrumentKey: String,
         val ltp: Double?,
@@ -35,6 +42,11 @@ class UpstoxTickStream(
         val bid: Double? = null,
         val ask: Double? = null,
         val volume: Long? = null,
+        val ltq: Long? = null,
+        val totalBuyQty: Long? = null,
+        val totalSellQty: Long? = null,
+        val depth: List<DepthLevel> = emptyList(),
+        val requestMode: String = "",
     )
 
     interface Listener {
@@ -86,7 +98,7 @@ class UpstoxTickStream(
                 .put("guid", UUID.randomUUID().toString())
                 .put("method", "sub")
                 .put("data", JSONObject()
-                    .put("mode", "full")
+                    .put("mode", "full_d30")
                     .put("instrumentKeys", JSONArray(instrumentKeys)))
             webSocket.send(ByteString.of(*requestJson.toString().toByteArray(Charsets.UTF_8)))
             listener.onOpen()
@@ -106,7 +118,21 @@ class UpstoxTickStream(
                             V76ExecutionQualityEngine.ingestSpot(tick.ltp, timestamp)
                         } else {
                             V76ExecutionQualityEngine.ingestOption(
-                                key, tick.ltp, tick.oi, tick.volume, tick.bid, tick.ask, timestamp,
+                                instrumentKey = key,
+                                ltp = tick.ltp,
+                                oi = tick.oi,
+                                volume = tick.volume,
+                                bid = tick.bid,
+                                ask = tick.ask,
+                                timestamp = timestamp,
+                                ltq = tick.ltq,
+                                totalBuyQty = tick.totalBuyQty,
+                                totalSellQty = tick.totalSellQty,
+                                depth = tick.depth.map {
+                                    V76ExecutionQualityEngine.DepthLevel(
+                                        it.bidPrice, it.bidQty, it.askPrice, it.askQty,
+                                    )
+                                },
                             )
                         }
                         listener.onTick(tick)
@@ -167,12 +193,31 @@ class UpstoxTickStream(
 
     private fun decodeTick(key: String, feed: Feed, timestamp: Long): Tick? {
         return when (feed.feedUnionCase) {
-            Feed.FeedUnionCase.LTPC -> Tick(key, feed.ltpc.ltp, feed.ltpc.ltt, null, null, null, timestamp)
+            Feed.FeedUnionCase.LTPC -> Tick(
+                instrumentKey = key,
+                ltp = feed.ltpc.ltp,
+                ltt = feed.ltpc.ltt,
+                oi = null,
+                delta = null,
+                gamma = null,
+                feedTimestamp = timestamp,
+                ltq = feed.ltpc.ltq,
+            )
             Feed.FeedUnionCase.FIRSTLEVELWITHGREEKS -> {
                 val item = feed.firstLevelWithGreeks
                 Tick(
-                    key, item.ltpc.ltp, item.ltpc.ltt, item.oi.toLong(), item.optionGreeks.delta, item.optionGreeks.gamma, timestamp,
-                    bid = item.firstDepth.bidP, ask = item.firstDepth.askP, volume = item.vtt,
+                    instrumentKey = key,
+                    ltp = item.ltpc.ltp,
+                    ltt = item.ltpc.ltt,
+                    oi = item.oi.toLong(),
+                    delta = item.optionGreeks.delta,
+                    gamma = item.optionGreeks.gamma,
+                    feedTimestamp = timestamp,
+                    bid = item.firstDepth.bidP,
+                    ask = item.firstDepth.askP,
+                    volume = item.vtt,
+                    ltq = item.ltpc.ltq,
+                    depth = listOf(DepthLevel(item.firstDepth.bidP, item.firstDepth.bidQ, item.firstDepth.askP, item.firstDepth.askQ)),
                 )
             }
             Feed.FeedUnionCase.FULLFEED -> {
@@ -180,15 +225,46 @@ class UpstoxTickStream(
                 when (full.fullFeedUnionCase) {
                     FullFeed.FullFeedUnionCase.MARKETFF -> {
                         val item = full.marketFF
-                        val depth = item.marketLevel.bidAskQuoteList.firstOrNull()
+                        val levels = item.marketLevel.bidAskQuoteList.take(30).map {
+                            DepthLevel(
+                                bidPrice = it.bidP,
+                                bidQty = it.bidQ,
+                                askPrice = it.askP,
+                                askQty = it.askQ,
+                            )
+                        }
+                        val first = levels.firstOrNull()
                         Tick(
-                            key, item.ltpc.ltp, item.ltpc.ltt, item.oi.toLong(), item.optionGreeks.delta, item.optionGreeks.gamma, timestamp,
-                            bid = depth?.bidP, ask = depth?.askP, volume = item.vtt,
+                            instrumentKey = key,
+                            ltp = item.ltpc.ltp,
+                            ltt = item.ltpc.ltt,
+                            oi = item.oi.toLong(),
+                            delta = item.optionGreeks.delta,
+                            gamma = item.optionGreeks.gamma,
+                            feedTimestamp = timestamp,
+                            bid = first?.bidPrice,
+                            ask = first?.askPrice,
+                            volume = item.vtt,
+                            ltq = item.ltpc.ltq,
+                            totalBuyQty = item.tbq,
+                            totalSellQty = item.tsq,
+                            depth = levels,
+                            requestMode = full.requestMode,
                         )
                     }
                     FullFeed.FullFeedUnionCase.INDEXFF -> {
                         val item = full.indexFF
-                        Tick(key, item.ltpc.ltp, item.ltpc.ltt, null, null, null, timestamp)
+                        Tick(
+                            instrumentKey = key,
+                            ltp = item.ltpc.ltp,
+                            ltt = item.ltpc.ltt,
+                            oi = null,
+                            delta = null,
+                            gamma = null,
+                            feedTimestamp = timestamp,
+                            ltq = item.ltpc.ltq,
+                            requestMode = full.requestMode,
+                        )
                     }
                     else -> null
                 }

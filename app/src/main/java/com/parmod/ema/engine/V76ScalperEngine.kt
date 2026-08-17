@@ -1,6 +1,7 @@
 package com.parmod.ema.engine
 
 import com.parmod.ema.model.OptionQuote
+import com.parmod.ema.model.PositionSide
 import com.parmod.ema.model.SignalAction
 import com.parmod.ema.model.SignalSnapshot
 import com.parmod.ema.model.TrendDirection
@@ -15,6 +16,10 @@ import kotlin.math.sqrt
  * Engine 3 is a direct Kotlin port of the user supplied UPSTOX V7.6 strategy.
  * Signal structure and numeric presets are intentionally kept the same:
  * 5m directional bias -> 3m pullback/BB breakout -> 1m micro trigger.
+ *
+ * A separate tick-native execution-quality layer is applied only after the original V7.6
+ * directional/setup/trigger logic has passed. This prevents late/exhausted entries without
+ * changing the original V7.6 bias, setup or target/stop presets.
  */
 class V76ScalperEngine {
     data class Bar(
@@ -102,15 +107,49 @@ class V76ScalperEngine {
         if (!trigger.first) return wait(trigger.second, "3M $strategy READY", scored.first)
 
         val invalidation = if (direction == "CE") min(biasRow.ema21, biasRow.vwap) else max(biasRow.ema21, biasRow.vwap)
-        val reasons = listOf(
+        val trend = if (direction == "CE") TrendDirection.BULLISH else TrendDirection.BEARISH
+        val side = if (direction == "CE") PositionSide.CE else PositionSide.PE
+        val quality = V76ExecutionQualityEngine.evaluate(side, optionChain, spot)
+        val coreReasons = listOf(
             "5m $direction bias score ${scored.first}/11",
             setupResult.second,
             trigger.second,
         ) + scored.second.take(4)
+        val reasons = coreReasons + quality.reasons.take(6)
+
+        if (!quality.canEnter) {
+            return Evaluation(
+                signal = SignalSnapshot(
+                    SignalAction.WAIT,
+                    quality.score.coerceIn(0, 100),
+                    trend,
+                    spot,
+                    null,
+                    null,
+                    reasons,
+                    "V7.6 $strategy · ${quality.label}",
+                ),
+                strategy = strategy,
+                score = scored.first,
+                indexInvalidation = invalidation,
+                signalTimeMillis = trigger.third,
+            )
+        }
+
         val action = if (direction == "CE") SignalAction.BUY_CE else SignalAction.BUY_PE
-        val trend = if (direction == "CE") TrendDirection.BULLISH else TrendDirection.BEARISH
+        val v76Confidence = (scored.first * 100 / 11).coerceIn(0, 100)
+        val combinedConfidence = (v76Confidence * 0.55 + quality.score * 0.45).toInt().coerceIn(0, 100)
         return Evaluation(
-            signal = SignalSnapshot(action, (scored.first * 100 / 11).coerceIn(0, 100), trend, spot, null, null, reasons, "V7.6 $strategy"),
+            signal = SignalSnapshot(
+                action,
+                combinedConfidence,
+                trend,
+                spot,
+                null,
+                null,
+                reasons,
+                "V7.6 $strategy · ${quality.label}",
+            ),
             strategy = strategy,
             score = scored.first,
             indexInvalidation = invalidation,

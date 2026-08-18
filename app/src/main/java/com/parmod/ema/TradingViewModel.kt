@@ -8,6 +8,7 @@ import com.parmod.ema.data.UpstoxTickStream
 import com.parmod.ema.engine.ExecutionEngineV2
 import com.parmod.ema.engine.OptionSelector
 import com.parmod.ema.engine.TickNativeDualEngine
+import com.parmod.ema.engine.V76ExecutionQualityEngine
 import com.parmod.ema.engine.V76ScalperEngine
 import com.parmod.ema.model.*
 import com.parmod.ema.runtime.ProcessTradingScope
@@ -229,6 +230,11 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         val n = lots.coerceIn(1, 20)
         _state.value = if (index == MarketIndex.NIFTY) _state.value.copy(niftyLots = n) else _state.value.copy(sensexLots = n)
     }
+    fun setDailyTradeLimit(limit: Int) {
+        val active = owner(); if (active !== this) { active.setDailyTradeLimit(limit); return }
+        val n = limit.coerceIn(1, 50)
+        _state.value = _state.value.copy(dailyTradeLimit = n, message = "Daily trade limit set to $n per index · all engines combined")
+    }
 
     fun manualBuy(engine: EngineId, side: PositionSide) {
         val active = owner(); if (active !== this) { active.manualBuy(engine, side); return }
@@ -264,10 +270,14 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
         }
+        val depthLevels = if (tick.depth.isNotEmpty()) tick.depth.size else current.marketDepthLevels
+        val depthMode = if (tick.requestMode.isNotBlank()) tick.requestMode.uppercase() else current.marketDepthMode
         _state.value = _state.value.copy(
             isConnected = true, optionChain = chain, lastTickMillis = tick.feedTimestamp,
             ticksReceived = current.ticksReceived + 1,
-            message = "${current.index.name} · ${current.ticksReceived + 1} ticks · persistent background runtime · 3 PAPER engines",
+            marketDepthMode = depthMode,
+            marketDepthLevels = depthLevels,
+            message = "${current.index.name} · ${current.ticksReceived + 1} ticks · $depthMode D$depthLevels · 3 PAPER engines",
         )
         updatePositions(chain); managePositions()
     }
@@ -280,12 +290,61 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         if (timestamp - lastSignalPublishMillis >= 250L) {
             lastSignalPublishMillis = timestamp
             val result = tickCore.evaluate()
+            val e2Confirmed = confirmEngine2(result.engine2)
             _state.value = _state.value.copy(
                 engine1 = _state.value.engine1.copy(signal = result.engine1, message = result.engine1.setup),
-                engine2 = _state.value.engine2.copy(signal = result.engine2, message = result.engine2.setup),
+                engine2 = _state.value.engine2.copy(signal = e2Confirmed, message = e2Confirmed.setup),
             )
             runParallelAuto()
         }
+    }
+
+    private fun confirmEngine2(raw: SignalSnapshot): SignalSnapshot {
+        val side = when {
+            raw.action == SignalAction.BUY_CE -> PositionSide.CE
+            raw.action == SignalAction.BUY_PE -> PositionSide.PE
+            raw.confidence >= ENGINE2_SPOT_CANDIDATE_SCORE && raw.trend == TrendDirection.BULLISH -> PositionSide.CE
+            raw.confidence >= ENGINE2_SPOT_CANDIDATE_SCORE && raw.trend == TrendDirection.BEARISH -> PositionSide.PE
+            else -> return raw
+        }
+        if (_state.value.connectionMode == ConnectionMode.DEMO) return raw
+
+        val quality = V76ExecutionQualityEngine.evaluate(side, _state.value.optionChain, _state.value.spotPrice)
+        val trend = if (side == PositionSide.CE) TrendDirection.BULLISH else TrendDirection.BEARISH
+        val combinedScore = ((raw.confidence * 45 + quality.score * 55) / 100).coerceIn(0, 100)
+        val reasons = (raw.reasons + quality.reasons).distinct()
+        val spot = _state.value.spotPrice
+        val risk = max(spot * 0.00070, 1.0)
+
+        if (quality.canEnter && raw.confidence >= ENGINE2_SPOT_CANDIDATE_SCORE) {
+            val action = if (side == PositionSide.CE) SignalAction.BUY_CE else SignalAction.BUY_PE
+            return SignalSnapshot(
+                action = action,
+                confidence = max(ENGINE2_CONFIRMED_MIN_SCORE, combinedScore),
+                trend = trend,
+                entry = spot,
+                stopLoss = if (side == PositionSide.CE) spot - risk else spot + risk,
+                target = if (side == PositionSide.CE) spot + risk * 2.0 else spot - risk * 2.0,
+                reasons = reasons,
+                setup = "E2 EARLY CONFIRMED · AVWAP + OPTION FLOW + D30",
+            )
+        }
+
+        val setup = when (quality.decision) {
+            V76ExecutionQualityEngine.Decision.WAIT_PULLBACK -> "E2 EXTENDED · WAIT FOR PULLBACK"
+            V76ExecutionQualityEngine.Decision.EXHAUSTION_RISK -> "E2 REVERSAL / ABSORPTION RISK"
+            else -> "E2 WAIT · OPTION / D30 CONFIRMATION"
+        }
+        return SignalSnapshot(
+            action = SignalAction.WAIT,
+            confidence = combinedScore,
+            trend = trend,
+            entry = null,
+            stopLoss = null,
+            target = null,
+            reasons = reasons,
+            setup = setup,
+        )
     }
 
     private fun ingestV76Minute(price: Double, timestamp: Long) {
@@ -327,7 +386,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
 
         val s2 = _state.value
         val e2Signal = s2.engine2.signal
-        if (EngineId.ENGINE_2_AVWAP_LIQUIDITY in enabled && s2.engine2.position == null && now - engine2LastExit >= 120_000L && e2Signal.confidence >= 90) {
+        if (EngineId.ENGINE_2_AVWAP_LIQUIDITY in enabled && s2.engine2.position == null && now - engine2LastExit >= 120_000L) {
             when (e2Signal.action) {
                 SignalAction.BUY_CE -> openEnginePosition(EngineId.ENGINE_2_AVWAP_LIQUIDITY, PositionSide.CE, e2Signal.setup, expectedSignal = e2Signal)
                 SignalAction.BUY_PE -> openEnginePosition(EngineId.ENGINE_2_AVWAP_LIQUIDITY, PositionSide.PE, e2Signal.setup, expectedSignal = e2Signal)
@@ -344,7 +403,8 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         val side = when (eval.signal.action) { SignalAction.BUY_CE -> PositionSide.CE; SignalAction.BUY_PE -> PositionSide.PE; else -> return }
         if (eval.signalTimeMillis == 0L || eval.signalTimeMillis == lastV76SignalMillis) return
         val session = sessionV76()
-        if (session.kill || session.trades >= V76ScalperEngine.MAX_TRADES_PER_DAY_PER_INDEX) return
+        val s = _state.value
+        if (session.kill || todayTradeCount(s.index) >= s.dailyTradeLimit) return
         if (session.lastExitMillis > 0) {
             val elapsed = System.currentTimeMillis() - session.lastExitMillis
             val same = session.lastExitSide == side
@@ -363,6 +423,11 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     ) {
         val s = _state.value
         if (!s.isConnected || s.riskLocked || engineState(engine).position != null) return
+        val usedToday = todayTradeCount(s.index)
+        if (usedToday >= s.dailyTradeLimit) {
+            setEngineState(engine, engineState(engine).copy(message = "DAILY TRADE LIMIT · $usedToday/${s.dailyTradeLimit} used for ${s.index.name}"))
+            return
+        }
 
         if (expectedSignal != null) {
             val liveSignal = engineState(engine).signal
@@ -405,6 +470,13 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         if (engine == EngineId.ENGINE_1_TREND) engine1Execution = exec else engine2Execution = exec
         setEngineState(engine, engineState(engine).copy(position = p, message = "PAPER ${side.name} ${q.strike.toInt()} · $reason"))
         recordOpenTrade(engine, p, reason)
+    }
+
+    private fun todayTradeCount(index: MarketIndex): Int {
+        val today = LocalDate.now(ZoneId.of("Asia/Kolkata"))
+        return _state.value.tradeLog.count { entry ->
+            entry.index == index && Instant.ofEpochMilli(entry.entryTimeMillis).atZone(ZoneId.of("Asia/Kolkata")).toLocalDate() == today
+        }
     }
 
     private fun recordOpenTrade(engine: EngineId, p: PaperPosition, setup: String) {
@@ -566,7 +638,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private fun engineState(engine: EngineId) = when (engine) { EngineId.ENGINE_1_TREND -> _state.value.engine1; EngineId.ENGINE_2_AVWAP_LIQUIDITY -> _state.value.engine2; EngineId.ENGINE_3_V76_SCALPER -> _state.value.engine3 }
     private fun setEngineState(engine: EngineId, value: EngineState) { _state.value = when (engine) { EngineId.ENGINE_1_TREND -> _state.value.copy(engine1 = value); EngineId.ENGINE_2_AVWAP_LIQUIDITY -> _state.value.copy(engine2 = value); EngineId.ENGINE_3_V76_SCALPER -> _state.value.copy(engine3 = value) } }
 
-    private fun resetMarketStructure() { tickCore.reset(); lastSignalPublishMillis = 0L; v76Working = null; v76Bars.clear(); lastV76SignalMillis = 0L; vixLtp = 0.0 }
+    private fun resetMarketStructure() { tickCore.reset(); V76ExecutionQualityEngine.reset(); lastSignalPublishMillis = 0L; v76Working = null; v76Bars.clear(); lastV76SignalMillis = 0L; vixLtp = 0.0 }
 
     private fun buildDemoChain(spot: Double): List<OptionQuote> {
         val step = if (_state.value.index == MarketIndex.NIFTY) 50 else 100; val atm = (spot / step).toInt() * step
@@ -583,6 +655,8 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         @Volatile private var runtimeOwner: TradingViewModel? = null
         private const val INDIA_VIX_KEY = "NSE_INDEX|India VIX"
         private const val MAX_TRADE_LOG = 200
+        private const val ENGINE2_SPOT_CANDIDATE_SCORE = 78
+        private const val ENGINE2_CONFIRMED_MIN_SCORE = 82
     }
 }
 

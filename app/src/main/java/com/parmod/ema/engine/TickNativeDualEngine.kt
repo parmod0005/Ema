@@ -67,9 +67,6 @@ class TickNativeDualEngine {
         val antiChop = efficiency >= 0.30 && crosses <= 3
         val breakout = (bullish && bullBreak) || (bearish && bearBreak)
 
-        // Late-chase protection. A valid trend can still be a poor entry after a vertical extension.
-        // Measure displacement from fast EMA, the recent impulse from a short base, and how far the
-        // current tick has travelled beyond the breakout boundary. Any one excessive condition blocks entry.
         val extensionFromFastAtr = if (microAtr > 0.0) abs(current - fast) / microAtr else 0.0
         val impulseLookback = 28.coerceAtMost(prices.size - 1)
         val impulseBase = prices[prices.size - 1 - impulseLookback]
@@ -148,10 +145,17 @@ class TickNativeDualEngine {
         val bearParts = listOf(belowAvwap, belowPoc, bearishSweep, bearishFlow).count { it }
         val fullBull = bullParts == 4
         val fullBear = bearParts == 4
+        val candidateBull = bullParts >= 3 && bullParts > bearParts
+        val candidateBear = bearParts >= 3 && bearParts > bullParts
+        val candidateTrend = when {
+            candidateBull -> TrendDirection.BULLISH
+            candidateBear -> TrendDirection.BEARISH
+            else -> TrendDirection.NEUTRAL
+        }
 
         val setup = when {
             fullBull || fullBear -> "TICK AVWAP + PROFILE + SWEEP + ORDER FLOW · FULL CONFLUENCE"
-            max(bullParts, bearParts) == 3 -> "TICK THREE-FACTOR CONFLUENCE"
+            max(bullParts, bearParts) == 3 -> "TICK THREE-FACTOR CONFLUENCE · D30 CANDIDATE"
             max(bullParts, bearParts) == 2 -> "TICK TWO-FACTOR CONFLUENCE"
             else -> "TICK NO CONFLUENCE"
         }
@@ -160,13 +164,13 @@ class TickNativeDualEngine {
         if (prices.size < 120) reasons += "Fast-start mode · depth ${prices.size} ticks"
         if (bullishSweep) reasons += "Sell-side liquidity swept/reclaimed on ticks"
         if (bearishSweep) reasons += "Buy-side liquidity swept/rejected on ticks"
-        if (!(fullBull || fullBear)) reasons += "AUTO waits for full four-factor tick confluence"
+        if (candidateBull || candidateBear) reasons += "Directional candidate armed · waiting for option/D30 confirmation"
         val risk = max(atr * 8.0, current * 0.00070)
 
         return when {
             fullBull -> SignalSnapshot(SignalAction.BUY_CE, confidence, TrendDirection.BULLISH, current, current - risk, current + risk * 2.0, reasons, setup)
             fullBear -> SignalSnapshot(SignalAction.BUY_PE, confidence, TrendDirection.BEARISH, current, current + risk, current - risk * 2.0, reasons, setup)
-            else -> SignalSnapshot(SignalAction.WAIT, confidence, TrendDirection.NEUTRAL, null, null, null, reasons, setup)
+            else -> SignalSnapshot(SignalAction.WAIT, confidence, candidateTrend, null, null, null, reasons, setup)
         }
     }
 

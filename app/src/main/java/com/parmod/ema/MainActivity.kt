@@ -102,6 +102,7 @@ private fun VardhaniApp(vm: TradingViewModel = viewModel(), backtestVm: Backtest
             item { MarketModePanel(state, vm) }
             item { EngineSelectionPanel(state, vm) }
             item { LotSelectorPanel(state, vm) }
+            item { DailyTradeLimitPanel(state, vm) }
             item { CombinedSummary(state) }
             item { EngineCard(state.engine1, state, vm) }
             item { EngineCard(state.engine2, state, vm) }
@@ -158,7 +159,7 @@ private fun EngineSelectionPanel(state: DashboardState, vm: TradingViewModel) {
         Text("Select any one, any two, or all three. Each selected engine trades independently.", style = MaterialTheme.typography.labelSmall)
         Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
             EngineToggle("E1 TREND", EngineId.ENGINE_1_TREND, state, vm, Modifier.weight(1f))
-            EngineToggle("E2 AVWAP", EngineId.ENGINE_2_AVWAP_LIQUIDITY, state, vm, Modifier.weight(1f))
+            EngineToggle("E2 AVWAP+D30", EngineId.ENGINE_2_AVWAP_LIQUIDITY, state, vm, Modifier.weight(1f))
             EngineToggle("E3 V7.6", EngineId.ENGINE_3_V76_SCALPER, state, vm, Modifier.weight(1f))
         }
         Text("Selected: ${state.enabledEngines.size}/3", style = MaterialTheme.typography.labelSmall)
@@ -193,6 +194,22 @@ private fun LotRow(name: String, lots: Int, set: (Int) -> Unit, suffix: String) 
 }
 
 @Composable
+private fun DailyTradeLimitPanel(state: DashboardState, vm: TradingViewModel) {
+    Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("DAILY TRADE LIMIT", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("${state.index.name} · all engines combined", fontSize = 11.sp)
+                Text("Resets each trading day · applies to AUTO and manual paper entries", style = MaterialTheme.typography.labelSmall)
+            }
+            OutlinedButton({ vm.setDailyTradeLimit(state.dailyTradeLimit - 1) }, enabled = state.dailyTradeLimit > 1, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("−") }
+            Text(state.dailyTradeLimit.toString(), Modifier.width(42.dp), textAlign = TextAlign.Center, fontWeight = FontWeight.Bold)
+            OutlinedButton({ vm.setDailyTradeLimit(state.dailyTradeLimit + 1) }, enabled = state.dailyTradeLimit < 50, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("+") }
+        }
+    } }
+}
+
+@Composable
 private fun Choice(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
     if (selected) Button({}, modifier, enabled = false, contentPadding = PaddingValues(horizontal = 3.dp)) { Text(label, fontSize = 10.sp) }
     else OutlinedButton(onClick, modifier, contentPadding = PaddingValues(horizontal = 3.dp)) { Text(label, fontSize = 10.sp) }
@@ -202,6 +219,7 @@ private fun Choice(label: String, selected: Boolean, modifier: Modifier, onClick
 private fun CombinedSummary(state: DashboardState) {
     Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
         Row { Metric("SPOT", money(state.spotPrice), Modifier.weight(1f)); Metric("COMBINED EQ", money(state.combinedEquity), Modifier.weight(1f)); Metric("COMBINED P&L", money(state.combinedRealizedPnl + state.combinedOpenPnl), Modifier.weight(1f)) }
+        Text("Depth ${state.marketDepthMode} · D${state.marketDepthLevels} · daily cap ${state.dailyTradeLimit}", style = MaterialTheme.typography.labelSmall)
         Text(if (state.riskLocked) "PAPER RISK LOCK · ${state.riskReason}" else "3 engines independent · ${state.enabledEngines.size} selected for AUTO", style = MaterialTheme.typography.labelSmall, color = if (state.riskLocked) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
     } }
 }

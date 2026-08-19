@@ -1,5 +1,6 @@
 package com.parmod.ema.engine
 
+import com.parmod.ema.model.EngineId
 import com.parmod.ema.model.SignalAction
 import com.parmod.ema.model.SignalSnapshot
 import com.parmod.ema.model.TrendDirection
@@ -11,6 +12,9 @@ import kotlin.math.sqrt
  * Tick-native signal core. Every underlying tick is ingested; no completed candle is required.
  * Engine 1: tick EMA trend + directional efficiency + breakout/anti-chop + late-chase protection.
  * Engine 2: tick AVWAP + tick-profile POC + liquidity sweep + uptick/downtick order-flow proxy.
+ *
+ * Numerical Meta Brain runs in SHADOW mode: E1/E2 decisions are unchanged, but every meaningful
+ * candidate is scored and automatically labelled from subsequent live spot movement.
  */
 class TickNativeDualEngine {
     data class Tick(val price: Double, val timestamp: Long)
@@ -24,6 +28,7 @@ class TickNativeDualEngine {
         ticks.clear()
         cumulativePv = 0.0
         cumulativeWeight = 0.0
+        MetaBrainRuntime.resetSession()
     }
 
     fun ingest(price: Double, timestamp: Long) {
@@ -32,6 +37,7 @@ class TickNativeDualEngine {
         cumulativePv += price
         cumulativeWeight += 1.0
         while (ticks.size > MAX_TICKS) ticks.removeFirst()
+        MetaBrainRuntime.observeSpot(price, timestamp)
     }
 
     fun evaluate(): Result {
@@ -55,6 +61,7 @@ class TickNativeDualEngine {
         val efficiency = efficiencyRatio(prices, 80.coerceAtMost(prices.size - 1))
         val crosses = emaCrossCount(prices, 21, 55, 100.coerceAtMost(prices.size))
         val current = prices.last()
+        val now = t.last().timestamp
 
         val prior = prices.dropLast(1).takeLast(100)
         val high = prior.maxOrNull() ?: current
@@ -89,20 +96,41 @@ class TickNativeDualEngine {
         if (prices.size < 80) reasons += "Fast-start mode · depth ${prices.size} ticks"
         score = score.coerceIn(0, 100)
 
+        val trend = if (bullish) TrendDirection.BULLISH else if (bearish) TrendDirection.BEARISH else TrendDirection.NEUTRAL
+        val signedFlow = orderFlowProxy(prices.takeLast(100)) * if (bearish) -1.0 else 1.0
+        val acceleration = if (microAtr > 0.0) ((fastSlope + slowSlope) / microAtr) * if (bearish) -1.0 else ((fastSlope + slowSlope) / microAtr) else 0.0
+        val qualityScore = when {
+            overextended -> 8.0
+            antiChop && breakout -> 36.0
+            antiChop -> 25.0
+            else -> 12.0
+        }
+
         if (overextended) {
             reasons += "Blocked: OVEREXTENDED / WAIT FOR PULLBACK"
             reasons += "Extension ${fmt(extensionFromFastAtr)} ATR · impulse ${fmt(impulseAtr)} ATR · overshoot ${fmt(breakoutOvershootAtr)} ATR"
-            return SignalSnapshot(
+            val raw = SignalSnapshot(
                 SignalAction.WAIT,
                 score,
-                if (bullish) TrendDirection.BULLISH else if (bearish) TrendDirection.BEARISH else TrendDirection.NEUTRAL,
+                trend,
                 null, null, null, reasons,
                 "OVEREXTENDED · WAIT FOR PULLBACK",
+            )
+            return if (trend == TrendDirection.NEUTRAL) raw else MetaBrainRuntime.decorate(
+                engine = EngineId.ENGINE_1_TREND,
+                raw = raw,
+                spot = current,
+                timestamp = now,
+                directionScore = score * 0.60,
+                entryQualityScore = qualityScore,
+                orderFlow = signedFlow,
+                acceleration = acceleration,
+                extensionAtr = extensionFromFastAtr,
             )
         }
 
         val risk = max(microAtr * 7.0, current * 0.00065)
-        return when {
+        val raw = when {
             bullish && antiChop && bullBreak && separation >= 0.55 && score >= 82 ->
                 SignalSnapshot(SignalAction.BUY_CE, score, TrendDirection.BULLISH, current, current - risk, current + risk * 1.8, reasons, "TICK TREND + BREAKOUT + ANTI-CHOP")
             bearish && antiChop && bearBreak && separation >= 0.55 && score >= 82 ->
@@ -110,15 +138,27 @@ class TickNativeDualEngine {
             else -> {
                 if (!antiChop) reasons += "Blocked: tick chop/whipsaw"
                 if (!breakout) reasons += "Blocked: no tick-range breakout"
-                SignalSnapshot(SignalAction.WAIT, score, if (bullish) TrendDirection.BULLISH else if (bearish) TrendDirection.BEARISH else TrendDirection.NEUTRAL, null, null, null, reasons, "TICK ANTI-CHOP WAIT")
+                SignalSnapshot(SignalAction.WAIT, score, trend, null, null, null, reasons, "TICK ANTI-CHOP WAIT")
             }
         }
+        return if (raw.trend == TrendDirection.NEUTRAL) raw else MetaBrainRuntime.decorate(
+            engine = EngineId.ENGINE_1_TREND,
+            raw = raw,
+            spot = current,
+            timestamp = now,
+            directionScore = score * 0.60,
+            entryQualityScore = qualityScore,
+            orderFlow = signedFlow,
+            acceleration = acceleration,
+            extensionAtr = extensionFromFastAtr,
+        )
     }
 
     private fun evaluateAvwap(t: List<Tick>): SignalSnapshot {
         if (t.size < AVWAP_MIN_TICKS) return wait("Fast warm-up ${t.size}/$AVWAP_MIN_TICKS ticks", "TICK AVWAP WARMING")
         val prices = t.map { it.price }
         val current = prices.last()
+        val now = t.last().timestamp
         val avwap = if (cumulativeWeight > 0.0) cumulativePv / cumulativeWeight else current
         val atr = tickAtr(prices, 80)
         val poc = tickProfilePoc(prices.takeLast(1200), atr)
@@ -167,11 +207,25 @@ class TickNativeDualEngine {
         if (candidateBull || candidateBear) reasons += "Directional candidate armed · waiting for option/D30 confirmation"
         val risk = max(atr * 8.0, current * 0.00070)
 
-        return when {
+        val raw = when {
             fullBull -> SignalSnapshot(SignalAction.BUY_CE, confidence, TrendDirection.BULLISH, current, current - risk, current + risk * 2.0, reasons, setup)
             fullBear -> SignalSnapshot(SignalAction.BUY_PE, confidence, TrendDirection.BEARISH, current, current + risk, current - risk * 2.0, reasons, setup)
             else -> SignalSnapshot(SignalAction.WAIT, confidence, candidateTrend, null, null, null, reasons, setup)
         }
+        if (raw.trend == TrendDirection.NEUTRAL) return raw
+        val alignedFlow = flow * if (raw.trend == TrendDirection.BEARISH) -1.0 else 1.0
+        val extension = if (atr > 0.0) abs(current - avwap) / atr else 0.0
+        val parts = max(bullParts, bearParts)
+        return MetaBrainRuntime.decorate(
+            engine = EngineId.ENGINE_2_AVWAP_LIQUIDITY,
+            raw = raw,
+            spot = current,
+            timestamp = now,
+            directionScore = (parts / 4.0) * 60.0,
+            entryQualityScore = (parts / 4.0) * 40.0,
+            orderFlow = alignedFlow,
+            extensionAtr = extension,
+        )
     }
 
     private fun tickAtr(values: List<Double>, lookback: Int): Double {

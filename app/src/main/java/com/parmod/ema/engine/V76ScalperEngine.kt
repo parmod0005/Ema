@@ -1,5 +1,6 @@
 package com.parmod.ema.engine
 
+import com.parmod.ema.model.EngineId
 import com.parmod.ema.model.OptionQuote
 import com.parmod.ema.model.PositionSide
 import com.parmod.ema.model.SignalAction
@@ -18,8 +19,8 @@ import kotlin.math.sqrt
  * 5m directional bias -> 3m pullback/BB breakout -> 1m micro trigger.
  *
  * A separate tick-native execution-quality layer is applied only after the original V7.6
- * directional/setup/trigger logic has passed. This prevents late/exhausted entries without
- * changing the original V7.6 bias, setup or target/stop presets.
+ * directional/setup/trigger logic has passed. The Numerical Meta Brain then observes the complete
+ * V7.6 + D30 feature state in SHADOW mode; it never changes the E3 action in this build.
  */
 class V76ScalperEngine {
     data class Bar(
@@ -118,17 +119,37 @@ class V76ScalperEngine {
         val reasons = coreReasons + quality.reasons.take(6)
 
         if (!quality.canEnter) {
+            val raw = SignalSnapshot(
+                SignalAction.WAIT,
+                quality.score.coerceIn(0, 100),
+                trend,
+                spot,
+                null,
+                null,
+                reasons,
+                "V7.6 $strategy · ${quality.label}",
+            )
+            val meta = MetaBrainRuntime.decorate(
+                engine = EngineId.ENGINE_3_V76_SCALPER,
+                raw = raw,
+                spot = spot,
+                timestamp = trigger.third,
+                directionScore = quality.directionScore.toDouble(),
+                entryQualityScore = quality.entryQualityScore.toDouble(),
+                orderFlow = quality.orderFlowProxy,
+                relativeActivity = quality.relativeActivity,
+                oiImpulse = quality.optionOiImpulse,
+                optionFlow = quality.optionFlowProxy,
+                acceleration = quality.acceleration,
+                extensionAtr = quality.extensionAtr,
+                depthImbalance = quality.depthImbalance,
+                micropricePressure = quality.micropricePressure,
+                totalBookPressure = quality.totalBookPressure,
+                wallPressure = quality.wallPressure,
+                depthLevels = quality.depthLevels.toDouble(),
+            )
             return Evaluation(
-                signal = SignalSnapshot(
-                    SignalAction.WAIT,
-                    quality.score.coerceIn(0, 100),
-                    trend,
-                    spot,
-                    null,
-                    null,
-                    reasons,
-                    "V7.6 $strategy · ${quality.label}",
-                ),
+                signal = meta,
                 strategy = strategy,
                 score = scored.first,
                 indexInvalidation = invalidation,
@@ -139,17 +160,37 @@ class V76ScalperEngine {
         val action = if (direction == "CE") SignalAction.BUY_CE else SignalAction.BUY_PE
         val v76Confidence = (scored.first * 100 / 11).coerceIn(0, 100)
         val combinedConfidence = (v76Confidence * 0.55 + quality.score * 0.45).toInt().coerceIn(0, 100)
+        val raw = SignalSnapshot(
+            action,
+            combinedConfidence,
+            trend,
+            spot,
+            null,
+            null,
+            reasons,
+            "V7.6 $strategy · ${quality.label}",
+        )
+        val meta = MetaBrainRuntime.decorate(
+            engine = EngineId.ENGINE_3_V76_SCALPER,
+            raw = raw,
+            spot = spot,
+            timestamp = trigger.third,
+            directionScore = quality.directionScore.toDouble(),
+            entryQualityScore = quality.entryQualityScore.toDouble(),
+            orderFlow = quality.orderFlowProxy,
+            relativeActivity = quality.relativeActivity,
+            oiImpulse = quality.optionOiImpulse,
+            optionFlow = quality.optionFlowProxy,
+            acceleration = quality.acceleration,
+            extensionAtr = quality.extensionAtr,
+            depthImbalance = quality.depthImbalance,
+            micropricePressure = quality.micropricePressure,
+            totalBookPressure = quality.totalBookPressure,
+            wallPressure = quality.wallPressure,
+            depthLevels = quality.depthLevels.toDouble(),
+        )
         return Evaluation(
-            signal = SignalSnapshot(
-                action,
-                combinedConfidence,
-                trend,
-                spot,
-                null,
-                null,
-                reasons,
-                "V7.6 $strategy · ${quality.label}",
-            ),
+            signal = meta,
             strategy = strategy,
             score = scored.first,
             indexInvalidation = invalidation,

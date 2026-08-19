@@ -9,6 +9,7 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
 
     <application
+        android:name=".VardhaniApplication"
         android:allowBackup="false"
         android:fullBackupContent="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -26,6 +27,15 @@
         <activity
             android:name=".OAuthLauncherActivity"
             android:exported="false" />
+        <activity
+            android:name=".MetaBrainLabActivity"
+            android:exported="true"
+            android:label="VARDHANI AI LAB">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
         <activity
             android:name=".MainActivity"
             android:exported="true">

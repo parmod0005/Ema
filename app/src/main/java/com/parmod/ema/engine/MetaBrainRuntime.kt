@@ -5,7 +5,6 @@ import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.PositionSide
 import com.parmod.ema.model.SignalSnapshot
 import com.parmod.ema.model.TrendDirection
-import kotlin.math.abs
 import kotlin.math.max
 
 /**
@@ -17,6 +16,18 @@ import kotlin.math.max
  * do not exist in that historical ledger start neutral and are learned from live data.
  */
 object MetaBrainRuntime {
+    // Declare the frozen historical prior before the brain initializer so Kotlin object
+    // initialization is deterministic on both JVM unit tests and Android runtime.
+    private const val HISTORICAL_PRIOR_SAMPLES = 71L
+    private const val HISTORICAL_PRIOR_BIAS = 0.2001902471
+    private val HISTORICAL_PRIOR_WEIGHTS = doubleArrayOf(
+        -0.0001358893, -0.1465515448, 0.0, -0.3469553189, -0.1191122290,
+        -0.1191122290, 0.0036725290, 0.0, -0.0000452964, 0.0,
+        0.0, 0.0, -0.0000271779, 0.0, 0.0,
+        0.0, 0.0, 0.0, -0.2276839730, -0.0000679447,
+        -0.0000452964,
+    )
+
     data class Status(
         val engine: EngineId,
         val probability: Int,
@@ -108,7 +119,6 @@ object MetaBrainRuntime {
             else -> return raw
         }
         val index = if (spot >= SENSEX_SPOT_CUTOFF) MarketIndex.SENSEX else MarketIndex.NIFTY
-        val minutes = minutesFromOpen(timestamp)
         val features = NumericalMetaBrain.Features(
             engine = engine,
             index = index,
@@ -127,18 +137,18 @@ object MetaBrainRuntime {
             totalBookPressure = totalBookPressure,
             wallPressure = wallPressure,
             depthLevels = depthLevels,
-            minutesFromOpen = minutes,
+            minutesFromOpen = minutesFromOpen(timestamp),
             recentEngineWinRate = 50.0,
             recentEngineProfitFactor = 1.0,
         )
         val prediction = brain.predict(features)
         statusByEngine[engine] = Status(
-            engine,
-            prediction.confidence,
-            prediction.decision,
-            prediction.samplesLearned,
-            prediction.modelVersion,
-            timestamp,
+            engine = engine,
+            probability = prediction.confidence,
+            decision = prediction.decision,
+            samples = prediction.samplesLearned,
+            modelVersion = prediction.modelVersion,
+            lastUpdated = timestamp,
         )
 
         // Learn from BUY signals and strong rejected/waiting candidates too. Dedupe prevents a
@@ -166,25 +176,14 @@ object MetaBrainRuntime {
         )
     }
 
-    @Synchronized fun status(engine: EngineId): Status? = statusByEngine[engine]
+    @Synchronized
+    fun status(engine: EngineId): Status? = statusByEngine[engine]
 
     private fun minutesFromOpen(timestamp: Long): Double {
-        // Timestamp is epoch millis; trading day length normalization only needs local intraday phase.
         val totalMinutesUtc = (timestamp / 60_000L) % (24L * 60L)
-        // IST = UTC+330 minutes. Normalize to 09:15 IST.
         val ist = (totalMinutesUtc + 330L) % (24L * 60L)
         return (ist - (9L * 60L + 15L)).coerceAtLeast(0L).toDouble()
     }
-
-    private const val HISTORICAL_PRIOR_SAMPLES = 71L
-    private const val HISTORICAL_PRIOR_BIAS = 0.2001902471
-    private val HISTORICAL_PRIOR_WEIGHTS = doubleArrayOf(
-        -0.0001358893, -0.1465515448, 0.0, -0.3469553189, -0.1191122290,
-        -0.1191122290, 0.0036725290, 0.0, -0.0000452964, 0.0,
-        0.0, 0.0, -0.0000271779, 0.0, 0.0,
-        0.0, 0.0, 0.0, -0.2276839730, -0.0000679447,
-        -0.0000452964,
-    )
 
     private const val SENSEX_SPOT_CUTOFF = 50_000.0
     private const val CANDIDATE_CONFIDENCE = 70

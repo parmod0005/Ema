@@ -272,11 +272,22 @@ object MetaBrainRuntime {
         )
 
         // Gate uses only the frozen PRODUCTION model. Candidate never directly controls orders.
-        if (gateEnabled && raw.action != SignalAction.WAIT && prodPrediction.decision == NumericalMetaBrain.Decision.REJECT) {
+        // A production REJECT also neutralizes a high-confidence WAIT candidate. This is essential
+        // for Engine 2: its 3-factor spot state is intentionally WAIT until D30 confirms it, and
+        // must not be allowed to re-arm after the validated production model rejected the setup.
+        val productionReject = gateEnabled &&
+            raw.confidence >= CANDIDATE_CONFIDENCE &&
+            prodPrediction.decision == NumericalMetaBrain.Decision.REJECT
+        if (productionReject) {
             decorated = decorated.copy(
                 action = SignalAction.WAIT,
+                confidence = 0,
+                trend = TrendDirection.NEUTRAL,
+                entry = null,
+                stopLoss = null,
+                target = null,
                 setup = "${raw.setup} · AI GATE REJECT ${prodPrediction.confidence}%",
-                reasons = (decorated.reasons + "Production meta-model rejected entry").takeLast(10),
+                reasons = (decorated.reasons + "Production meta-model rejected candidate; downstream re-arm blocked").takeLast(10),
             )
         }
         return decorated

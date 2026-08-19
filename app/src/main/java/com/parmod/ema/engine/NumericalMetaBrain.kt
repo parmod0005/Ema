@@ -7,14 +7,7 @@ import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
-/**
- * Numerical Meta Brain.
- *
- * This is deliberately numerical and local: no LLM/API call sits in the execution path.
- * The production use starts in SHADOW mode. A frozen historical prior can seed the weights,
- * while delayed live outcomes update a separate online learner. Promotion to an execution gate
- * is intentionally external and must happen only after out-of-sample validation.
- */
+/** Local numerical meta-model used for fast on-device inference and online learning. */
 class NumericalMetaBrain(
     private val learningRate: Double = 0.015,
     private val l2: Double = 0.0005,
@@ -78,13 +71,12 @@ class NumericalMetaBrain(
         val mode: Mode,
     )
 
-    data class Pending(
-        val id: Long,
-        val createdAt: Long,
-        val optionKey: String,
-        val entryPremium: Double,
-        val features: Features,
-        val prediction: Prediction,
+    data class ModelState(
+        val weights: DoubleArray,
+        val bias: Double,
+        val samplesLearned: Long,
+        val modelVersion: Long,
+        val mode: Mode,
     )
 
     private val weights = DoubleArray(FEATURE_COUNT)
@@ -96,14 +88,24 @@ class NumericalMetaBrain(
 
     fun setMode(value: Mode) { mode = value }
 
-    /** Seed from an offline historical trainer. Length must match the feature vector. */
     fun loadHistoricalPrior(priorWeights: DoubleArray, priorBias: Double, priorSamples: Long) {
         require(priorWeights.size == FEATURE_COUNT)
         priorWeights.copyInto(weights)
         bias = priorBias
-        learned = max(learned, priorSamples)
+        learned = priorSamples.coerceAtLeast(0L)
         version++
     }
+
+    fun restore(state: ModelState) {
+        require(state.weights.size == FEATURE_COUNT)
+        state.weights.copyInto(weights)
+        bias = state.bias.coerceIn(-8.0, 8.0)
+        learned = state.samplesLearned.coerceAtLeast(0L)
+        version = state.modelVersion.coerceAtLeast(1L)
+        mode = state.mode
+    }
+
+    fun snapshot(): ModelState = ModelState(weights.copyOf(), bias, learned, version, mode)
 
     fun predict(features: Features): Prediction {
         val x = features.vector()
@@ -115,20 +117,9 @@ class NumericalMetaBrain(
             p <= REJECT_THRESHOLD -> Decision.REJECT
             else -> Decision.CAUTION
         }
-        return Prediction(
-            probabilitySuccess = p,
-            confidence = (p * 100.0).toInt().coerceIn(0, 100),
-            decision = decision,
-            modelVersion = version,
-            samplesLearned = learned,
-            mode = mode,
-        )
+        return Prediction(p, (p * 100.0).toInt().coerceIn(0, 100), decision, version, learned, mode)
     }
 
-    /**
-     * Online logistic update from a delayed, objective outcome.
-     * success=1 means the candidate achieved the configured favorable outcome before its adverse barrier.
-     */
     fun learn(features: Features, success: Boolean, sampleWeight: Double = 1.0) {
         val x = features.vector()
         val p = predict(features).probabilitySuccess
@@ -143,12 +134,10 @@ class NumericalMetaBrain(
         if (learned % 100L == 0L) version++
     }
 
-    fun snapshotWeights(): Pair<DoubleArray, Double> = weights.copyOf() to bias
-
     companion object {
-        private const val FEATURE_COUNT = 21
-        private const val TAKE_THRESHOLD = 0.66
-        private const val REJECT_THRESHOLD = 0.42
+        const val FEATURE_COUNT = 21
+        const val TAKE_THRESHOLD = 0.66
+        const val REJECT_THRESHOLD = 0.42
 
         private fun sigmoid(value: Double): Double = when {
             value >= 35.0 -> 1.0

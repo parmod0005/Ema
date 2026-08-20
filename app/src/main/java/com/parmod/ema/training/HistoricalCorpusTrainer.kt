@@ -24,6 +24,8 @@ import kotlin.math.pow
  * - labels use the actual future option-premium path including MFE/MAE,
  * - ambiguous same-candle target/stop is treated as stop-first,
  * - a locked chronological holdout is opened only after walk-forward robustness,
+ * - strict governance requires TAKE/REJECT evidence, positive TAKE net return,
+ *   Production improvement and non-degenerate engine-proxy coverage,
  * - the result is returned as a Candidate state; Production is never modified here,
  * - unavailable historical D30/depth fields stay zero and are explicitly reported as proxy/missing.
  */
@@ -200,14 +202,7 @@ class HistoricalCorpusTrainer(
 
         work.forEachIndexed { contractIndex, contract ->
             if (shouldCancel()) error("Training cancelled")
-            onProgress(
-                Progress(
-                    "CORPUS",
-                    contractIndex,
-                    work.size,
-                    "${contract.expiry} ${contract.strike.toInt()} ${contract.optionType} · ${samples.size} causal samples",
-                ),
-            )
+            onProgress(Progress("CORPUS", contractIndex, work.size, "${contract.expiry} ${contract.strike.toInt()} ${contract.optionType} · ${samples.size} causal samples"))
             runCatching {
                 val start = contract.expiry.minusDays(7).coerceAtLeast(from)
                 val candles = client.getExpiredCandles(contract.instrumentKey, config.interval, start, contract.expiry)
@@ -221,12 +216,11 @@ class HistoricalCorpusTrainer(
                         EngineId.ENGINE_3_V76_SCALPER -> e3Samples++
                     }
                 }
-            }.onFailure { failure ->
-                errors += "${contract.expiry} ${contract.strike.toInt()} ${contract.optionType}: ${failure.message}"
-            }
+            }.onFailure { failure -> errors += "${contract.expiry} ${contract.strike.toInt()} ${contract.optionType}: ${failure.message}" }
         }
 
         val corpus = samples.sortedBy { it.timestamp }
+        val coverage = Coverage(ceSamples, peSamples, e1Samples, e2Samples, e3Samples, 0)
         onProgress(Progress("CORPUS", work.size, work.size, "Corpus ready · ${corpus.size} samples"))
         if (corpus.size < config.minimumCorpusSamples) {
             return Result(
@@ -237,7 +231,7 @@ class HistoricalCorpusTrainer(
                 expiries = expiries.size,
                 contractsDownloaded = work.size,
                 corpusSamples = corpus.size,
-                coverage = Coverage(ceSamples, peSamples, e1Samples, e2Samples, e3Samples, 0),
+                coverage = coverage,
                 averageMfeReturn = corpus.map { it.mfeReturn }.averageOrZero(),
                 averageMaeReturn = corpus.map { it.maeReturn }.averageOrZero(),
                 averageNetReturn = corpus.map { it.netReturn }.averageOrZero(),
@@ -252,8 +246,7 @@ class HistoricalCorpusTrainer(
             )
         }
 
-        val developmentEnd = (corpus.size * config.developmentFraction).toInt()
-            .coerceIn(config.walkForwardFolds + 2, corpus.size - 1)
+        val developmentEnd = (corpus.size * config.developmentFraction).toInt().coerceIn(config.walkForwardFolds + 2, corpus.size - 1)
         val development = corpus.subList(0, developmentEnd)
         val holdout = corpus.subList(developmentEnd, corpus.size)
         val hypers = candidateHyperParameters()
@@ -272,6 +265,7 @@ class HistoricalCorpusTrainer(
         var holdoutCandidate: Metrics? = null
         var holdoutProduction: Metrics? = null
         var championState: NumericalMetaBrain.ModelState? = null
+        var governance = HistoricalCandidateGovernance.Decision(HistoricalCandidateGovernance.Status.CLOSED, listOf("Locked holdout was not opened"))
 
         if (robust && best != null) {
             holdoutOpened = true
@@ -281,7 +275,14 @@ class HistoricalCorpusTrainer(
             val production = brainFromBaseline(productionBaseline.hyperParameters)
             holdoutCandidate = evaluate(champion, holdout).metrics()
             holdoutProduction = evaluate(production, holdout).metrics()
-            holdoutPassed = holdoutPass(holdoutCandidate, holdoutProduction)
+            governance = HistoricalCandidateGovernance.evaluate(
+                candidate = holdoutCandidate,
+                production = holdoutProduction,
+                coverage = coverage,
+                corpusSamples = corpus.size,
+                holdoutOpened = true,
+            )
+            holdoutPassed = governance.passed
             if (holdoutPassed) championState = champion.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW)
         }
 
@@ -291,13 +292,15 @@ class HistoricalCorpusTrainer(
                 hypers.size,
                 hypers.size,
                 when {
-                    championState != null -> "Historical champion passed locked holdout · ready for fresh live shadow validation"
-                    holdoutOpened -> "Locked holdout failed · Production unchanged"
+                    championState != null -> "Historical governance PASS · ready for fresh live shadow validation"
+                    governance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "Historical governance INSUFFICIENT DATA · ${governance.reasons.firstOrNull().orEmpty()}"
+                    holdoutOpened -> "Historical governance FAIL · ${governance.reasons.firstOrNull().orEmpty()}"
                     else -> "No walk-forward-robust candidate · locked holdout stayed closed"
                 },
             ),
         )
 
+        val governanceNote = if (holdoutOpened) " · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}" else ""
         return Result(
             index = index,
             months = config.months,
@@ -306,7 +309,7 @@ class HistoricalCorpusTrainer(
             expiries = expiries.size,
             contractsDownloaded = work.size,
             corpusSamples = corpus.size,
-            coverage = Coverage(ceSamples, peSamples, e1Samples, e2Samples, e3Samples, 0),
+            coverage = coverage,
             averageMfeReturn = corpus.map { it.mfeReturn }.averageOrZero(),
             averageMaeReturn = corpus.map { it.maeReturn }.averageOrZero(),
             averageNetReturn = corpus.map { it.netReturn }.averageOrZero(),
@@ -318,6 +321,7 @@ class HistoricalCorpusTrainer(
             holdoutProduction = holdoutProduction,
             championState = championState,
             errors = errors,
+            note = "Historical D30/order-book depth is unavailable in expired OHLCV/OI candles; those feature slots remain zero rather than being fabricated$governanceNote.",
         )
     }
 
@@ -434,15 +438,6 @@ class HistoricalCorpusTrainer(
         return accuracyGain + brierGain + 0.18 * takeBonus + 0.10 * rejectBonus + 0.20 * candidate.takeAverageNetReturn
     }
 
-    private fun holdoutPass(candidate: Metrics, production: Metrics): Boolean {
-        if (candidate.labels < 30) return false
-        val qualityGain = candidate.accuracy - production.accuracy >= 0.005 || production.brier - candidate.brier >= 0.002
-        if (!qualityGain) return false
-        if (candidate.takeSamples >= 10 && candidate.takePrecision < 0.52) return false
-        if (candidate.rejectSamples >= 10 && candidate.rejectPrecision < 0.52) return false
-        return true
-    }
-
     private fun learn(brain: NumericalMetaBrain, samples: List<Sample>) {
         samples.forEach { sample -> brain.learn(sample.features, sample.success, sample.weight) }
     }
@@ -453,15 +448,9 @@ class HistoricalCorpusTrainer(
         return stats
     }
 
-    private fun brainFromBaseline(hyper: NumericalMetaBrain.HyperParameters): NumericalMetaBrain =
-        NumericalMetaBrain().apply {
-            restore(
-                productionBaseline.copy(
-                    mode = NumericalMetaBrain.Mode.SHADOW,
-                    hyperParameters = hyper.sanitized(),
-                ),
-            )
-        }
+    private fun brainFromBaseline(hyper: NumericalMetaBrain.HyperParameters): NumericalMetaBrain = NumericalMetaBrain().apply {
+        restore(productionBaseline.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = hyper.sanitized()))
+    }
 
     private fun candidateHyperParameters(): List<NumericalMetaBrain.HyperParameters> {
         val seeds = MetaBrainRuntime.CandidateProfile.entries.map { it.hyper.sanitized() }
@@ -484,8 +473,7 @@ class HistoricalCorpusTrainer(
         return all.distinctBy { signature(it) }
     }
 
-    private fun signature(h: NumericalMetaBrain.HyperParameters): String =
-        "%.6f|%.7f|%.4f|%.4f".format(h.learningRate, h.l2, h.takeThreshold, h.rejectThreshold)
+    private fun signature(h: NumericalMetaBrain.HyperParameters): String = "%.6f|%.7f|%.4f|%.4f".format(h.learningRate, h.l2, h.takeThreshold, h.rejectThreshold)
 
     private fun historicalEngineProxy(e: SignalEngineV2.Evaluation, oiImpulse: Double): EngineId = when {
         e.volumeRatio >= 1.40 || abs(oiImpulse) >= 0.04 -> EngineId.ENGINE_2_AVWAP_LIQUIDITY
@@ -521,11 +509,7 @@ class HistoricalCorpusTrainer(
         val strikes = contracts.map { it.strike }.distinct().sorted()
         val centre = strikes[strikes.size / 2]
         val selected = strikes.sortedBy { abs(it - centre) }.take(eachSide * 2 + 1).toSet()
-        return contracts.filter { it.strike in selected }.sortedWith(
-            compareBy<UpstoxPlusHistoricalClient.ExpiredContract> { it.expiry }
-                .thenBy { it.strike }
-                .thenBy { it.optionType },
-        )
+        return contracts.filter { it.strike in selected }.sortedWith(compareBy<UpstoxPlusHistoricalClient.ExpiredContract> { it.expiry }.thenBy { it.strike }.thenBy { it.optionType })
     }
 
     private fun LocalDate.coerceAtLeast(minimum: LocalDate): LocalDate = if (isBefore(minimum)) minimum else this

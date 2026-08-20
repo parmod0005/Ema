@@ -72,9 +72,7 @@ class LocalHistoricalCorpusStore(private val context: Context) {
         val candles = linkedMapOf<ParsedContractKey, MutableList<UpstoxPlusHistoricalClient.Candle>>()
     }
 
-    init {
-        seriesDir.mkdirs()
-    }
+    init { seriesDir.mkdirs() }
 
     fun importUris(
         uris: List<Uri>,
@@ -148,24 +146,11 @@ class LocalHistoricalCorpusStore(private val context: Context) {
         shouldCancel: () -> Boolean,
     ) {
         if (depth > 2) error("Nested ZIP depth exceeds safety limit")
-        val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
-        when (ext) {
-            "csv", "txt" -> {
-                stats.supportedFiles++
-                parseCsv(name, input, parsed, stats, shouldCancel)
-            }
-            "xlsx" -> {
-                stats.supportedFiles++
-                parseXlsx(name, readLimited(input, MAX_XLSX_BYTES), parsed, stats, shouldCancel)
-            }
-            "json" -> {
-                stats.supportedFiles++
-                parseJson(name, readLimited(input, MAX_JSON_BYTES), parsed, stats, shouldCancel)
-            }
-            "zip" -> {
-                stats.supportedFiles++
-                parseZip(name, input, parsed, stats, depth, shouldCancel)
-            }
+        when (name.substringAfterLast('.', "").lowercase(Locale.ROOT)) {
+            "csv", "txt" -> { stats.supportedFiles++; parseCsv(name, input, parsed, stats, shouldCancel) }
+            "xlsx" -> { stats.supportedFiles++; parseXlsx(name, readLimited(input, MAX_XLSX_BYTES), parsed, stats, shouldCancel) }
+            "json" -> { stats.supportedFiles++; parseJson(name, readLimited(input, MAX_JSON_BYTES), parsed, stats, shouldCancel) }
+            "zip" -> { stats.supportedFiles++; parseZip(name, input, parsed, stats, depth, shouldCancel) }
             else -> stats.warnings += "$name skipped: supported formats are CSV/XLSX/JSON/ZIP"
         }
     }
@@ -215,7 +200,6 @@ class LocalHistoricalCorpusStore(private val context: Context) {
                 if (stats.rowsRead > MAX_IMPORTED_ROWS) error("Imported row limit exceeded")
             }
         }
-        table.finish()
     }
 
     private fun parseJson(
@@ -250,7 +234,6 @@ class LocalHistoricalCorpusStore(private val context: Context) {
                 table.accept(headers.map { obj.opt(it)?.toString().orEmpty() })
             }
         } else if (first is JSONArray) {
-            // Upstox-style candle arrays need option metadata in filename.
             table.accept(listOf("timestamp", "open", "high", "low", "close", "volume", "oi"))
             for (i in 0 until array.length()) {
                 if (shouldCancel()) error("Corpus import cancelled")
@@ -258,7 +241,6 @@ class LocalHistoricalCorpusStore(private val context: Context) {
                 table.accept((0 until row.length()).map { row.opt(it)?.toString().orEmpty() })
             }
         }
-        table.finish()
     }
 
     private fun parseXlsx(
@@ -280,7 +262,6 @@ class LocalHistoricalCorpusStore(private val context: Context) {
                     if (sheets > MAX_XLSX_SHEETS) error("XLSX contains too many sheets")
                     val table = TableAccumulator("$name#${entry.name.substringAfterLast('/')}", parsed, stats)
                     parseXlsxSheet(zip, sharedStrings, table, shouldCancel)
-                    table.finish()
                 }
                 zip.closeEntry()
             }
@@ -296,15 +277,15 @@ class LocalHistoricalCorpusStore(private val context: Context) {
                     val result = mutableListOf<String>()
                     val current = StringBuilder()
                     var inSi = false
-                    SAXParserFactory.newInstance().newSAXParser().parse(zip, object : DefaultHandler() {
+                    namespaceAwareSaxFactory().newSAXParser().parse(zip, object : DefaultHandler() {
                         override fun startElement(uri: String?, localName: String?, qName: String?, attributes: Attributes?) {
-                            if ((localName ?: qName) == "si") { inSi = true; current.setLength(0) }
+                            if (tag(localName, qName) == "si") { inSi = true; current.setLength(0) }
                         }
                         override fun characters(ch: CharArray, start: Int, length: Int) {
                             if (inSi) current.append(ch, start, length)
                         }
                         override fun endElement(uri: String?, localName: String?, qName: String?) {
-                            if ((localName ?: qName) == "si") { result += current.toString(); inSi = false }
+                            if (tag(localName, qName) == "si") { result += current.toString(); inSi = false }
                         }
                     })
                     return result
@@ -326,10 +307,9 @@ class LocalHistoricalCorpusStore(private val context: Context) {
         var cellType = ""
         var value = StringBuilder()
         var capture = false
-        SAXParserFactory.newInstance().newSAXParser().parse(input, object : DefaultHandler() {
+        namespaceAwareSaxFactory().newSAXParser().parse(input, object : DefaultHandler() {
             override fun startElement(uri: String?, localName: String?, qName: String?, attributes: Attributes?) {
-                val tag = localName ?: qName
-                when (tag) {
+                when (tag(localName, qName)) {
                     "row" -> row = sortedMapOf()
                     "c" -> {
                         cellColumn = columnIndex(attributes?.getValue("r").orEmpty())
@@ -343,8 +323,7 @@ class LocalHistoricalCorpusStore(private val context: Context) {
                 if (capture) value.append(ch, start, length)
             }
             override fun endElement(uri: String?, localName: String?, qName: String?) {
-                val tag = localName ?: qName
-                when (tag) {
+                when (tag(localName, qName)) {
                     "v", "t" -> capture = false
                     "c" -> {
                         val raw = value.toString()
@@ -387,7 +366,7 @@ class LocalHistoricalCorpusStore(private val context: Context) {
             }
             val optionType = parseOptionType(value(row, map, "optiontype", "instrumenttype", "type") + " $symbol $sourceName") ?: run {
                 stats.rowsRejected++
-                if (!nonOptionWarningEmitted) { stats.warnings += "$sourceName: underlying-only rows retained outside AI option training are not yet supported; option CE/PE rows required"; nonOptionWarningEmitted = true }
+                if (!nonOptionWarningEmitted) { stats.warnings += "$sourceName: underlying-only rows are not used for option-premium AI labels; CE/PE rows are required"; nonOptionWarningEmitted = true }
                 return
             }
             val strike = value(row, map, "strike", "strikeprice").toDoubleOrNull()
@@ -417,14 +396,9 @@ class LocalHistoricalCorpusStore(private val context: Context) {
             parsed.candles.getOrPut(key) { mutableListOf() } += UpstoxPlusHistoricalClient.Candle(timestamp, open, high, low, close, volume, oi)
             stats.rowsAccepted++
         }
-
-        fun finish() = Unit
     }
 
-    private data class InferredMetadata(
-        val symbol: String,
-        val expiry: LocalDate?,
-    )
+    private data class InferredMetadata(val symbol: String, val expiry: LocalDate?)
 
     private fun inferMetadata(name: String): InferredMetadata = InferredMetadata(
         symbol = name.substringAfterLast('/').substringBeforeLast('.'),
@@ -499,7 +473,8 @@ class LocalHistoricalCorpusStore(private val context: Context) {
         val lotSize = input.readInt()
         val symbol = input.readUTF()
         val source = input.readUTF()
-        val count = input.readInt().coerceIn(0, MAX_SERIES_ROWS)
+        val count = input.readInt()
+        require(count in 0..MAX_SERIES_ROWS) { "Imported corpus contract exceeds row limit" }
         val candles = ArrayList<UpstoxPlusHistoricalClient.Candle>(count)
         repeat(count) {
             val epochMs = input.readLong()
@@ -534,7 +509,7 @@ class LocalHistoricalCorpusStore(private val context: Context) {
     }
 
     private fun readStats(): Properties = Properties().apply {
-        if (statsFile.isFile) runCatching { FileInputStream(statsFile).use(::load) }
+        if (statsFile.isFile) runCatching { FileInputStream(statsFile).use { input -> load(input) } }
     }
 
     private fun seriesFile(index: MarketIndex, expiry: LocalDate, strike: Double, optionType: String): File {
@@ -597,9 +572,7 @@ class LocalHistoricalCorpusStore(private val context: Context) {
         runCatching { return ZonedDateTime.parse(s).toOffsetDateTime() }
         runCatching { return Instant.parse(s).atOffset(IST) }
         for (pattern in DATE_TIME_PATTERNS) {
-            try {
-                return LocalDateTime.parse(s, DateTimeFormatter.ofPattern(pattern, Locale.ENGLISH)).atOffset(IST)
-            } catch (_: DateTimeParseException) { }
+            try { return LocalDateTime.parse(s, DateTimeFormatter.ofPattern(pattern, Locale.ENGLISH)).atOffset(IST) } catch (_: DateTimeParseException) { }
         }
         parseDateFlexible(s)?.let { return it.atStartOfDay().atOffset(IST) }
         return null
@@ -657,6 +630,9 @@ class LocalHistoricalCorpusStore(private val context: Context) {
         }
         return if (chars == 0) 0 else result - 1
     }
+
+    private fun namespaceAwareSaxFactory(): SAXParserFactory = SAXParserFactory.newInstance().apply { isNamespaceAware = true }
+    private fun tag(localName: String?, qName: String?): String = localName?.takeIf { it.isNotEmpty() } ?: qName.orEmpty()
 
     private fun readLimited(input: InputStream, maxBytes: Long): ByteArray {
         val buffer = ByteArray(64 * 1024)

@@ -2,7 +2,9 @@ package com.parmod.ema
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -17,6 +19,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.model.MarketIndex
+import com.parmod.ema.training.HistoricalCorpusSource
 import com.parmod.ema.training.HistoricalCorpusTrainingViewModel
 import kotlinx.coroutines.delay
 import java.text.DateFormat
@@ -36,6 +39,9 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
     val training by trainingVm.state.collectAsState()
     var message by remember { mutableStateOf("AI TRAINING CENTER ready") }
     var profileMenu by remember { mutableStateOf(false) }
+    val corpusPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) trainingVm.importLocalCorpus(uris)
+    }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -49,7 +55,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text("VARDHANI AI TRAINING CENTER", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text("Historical corpus → walk-forward → locked holdout → live shadow → manual promotion", style = MaterialTheme.typography.labelMedium)
+        Text("Upstox / local / combined corpus → walk-forward → locked holdout → live shadow → manual promotion", style = MaterialTheme.typography.labelMedium)
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -71,20 +77,22 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
                     LabMetric("Generation", if (report.candidateAdaptive) "G${report.candidateGeneration}" else "SEED", Modifier.weight(1f))
                 }
                 Text("Current Candidate: ${report.candidateName}", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                if (report.candidateOrigin.isNotBlank()) {
-                    Text("Origin: ${report.candidateOrigin}", style = MaterialTheme.typography.labelSmall)
-                }
+                if (report.candidateOrigin.isNotBlank()) Text("Origin: ${report.candidateOrigin}", style = MaterialTheme.typography.labelSmall)
                 LabMetric("Pending delayed live labels", report.pendingLabels.toString(), Modifier.fillMaxWidth())
                 Text("Saved: ${formatTime(report.lastSavedAt)} · promoted: ${formatTime(report.lastPromotedAt)}", style = MaterialTheme.typography.labelSmall)
             }
         }
 
-        HistoricalTrainingCard(training, trainingVm)
+        HistoricalTrainingCard(
+            state = training,
+            vm = trainingVm,
+            onImport = { corpusPicker.launch(arrayOf("*/*")) },
+        )
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("ADAPTIVE LIVE CANDIDATE SEARCH", fontWeight = FontWeight.Bold)
-                Text("Use this after historical training, or as a live-only fallback. Named profiles are safe seeds; adaptive search evolves bounded LR/L2/TAKE/REJECT settings around the strongest archived live Candidate.", style = MaterialTheme.typography.labelSmall)
+                Text("Use after historical training or as a live-only fallback. Adaptive search evolves bounded LR/L2/TAKE/REJECT settings around the strongest archived live Candidate.", style = MaterialTheme.typography.labelSmall)
                 Text("Current: ${report.candidateName}", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                 Box {
                     OutlinedButton({ profileMenu = true }, Modifier.fillMaxWidth()) { Text("Seed profile: ${report.candidateProfile.title}") }
@@ -101,10 +109,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
                     }
                 }
                 val hp = report.candidateHyperParameters
-                Text(
-                    "LR ${"%.4f".format(hp.learningRate)} · L2 ${"%.5f".format(hp.l2)} · TAKE ≥ ${pct(hp.takeThreshold)} · REJECT ≤ ${pct(hp.rejectThreshold)}",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                Text("LR ${"%.4f".format(hp.learningRate)} · L2 ${"%.5f".format(hp.l2)} · TAKE ≥ ${pct(hp.takeThreshold)} · REJECT ≤ ${pct(hp.rejectThreshold)}", style = MaterialTheme.typography.bodySmall)
                 report.bestArchivedScore?.let { Text("Best archived live-search score ${"%.3f".format(it)}", style = MaterialTheme.typography.labelSmall) }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Button({ message = MetaBrainRuntime.evolveBestCandidate().second }, Modifier.weight(1f)) { Text("EVOLVE BEST NOW", fontSize = 9.sp) }
@@ -113,9 +118,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
                         message = "Candidate reset to frozen Production with current hyperparameters"
                     }, Modifier.weight(1f)) { Text("RESET / RETRAIN", fontSize = 9.sp) }
                 }
-                OutlinedButton({ message = MetaBrainRuntime.startNextCandidate().second }, Modifier.fillMaxWidth()) {
-                    Text("ARCHIVE + NEXT NAMED SEED", fontSize = 9.sp)
-                }
+                OutlinedButton({ message = MetaBrainRuntime.startNextCandidate().second }, Modifier.fillMaxWidth()) { Text("ARCHIVE + NEXT NAMED SEED", fontSize = 9.sp) }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("AUTO ADAPTIVE SEARCH", fontWeight = FontWeight.Bold, fontSize = 11.sp)
@@ -133,7 +136,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("FRESH LIVE UNSEEN VALIDATION", fontWeight = FontWeight.Bold)
-                Text("Production and Candidate are scored before the Candidate learns each new live outcome. Historical champions must still pass this stage before promotion.", style = MaterialTheme.typography.labelSmall)
+                Text("Production and Candidate are scored before Candidate learns each new live outcome. Historical champions must still pass this stage before promotion.", style = MaterialTheme.typography.labelSmall)
                 Row {
                     LabMetric("Labels", v.labels.toString(), Modifier.weight(1f))
                     LabMetric("Pending", report.pendingLabels.toString(), Modifier.weight(1f))
@@ -163,10 +166,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("LIVE CANDIDATE LEADERBOARD", Modifier.weight(1f), fontWeight = FontWeight.Bold)
-                        TextButton({
-                            MetaBrainRuntime.clearCandidateHistory()
-                            message = "Live Candidate history cleared"
-                        }) { Text("CLEAR") }
+                        TextButton({ MetaBrainRuntime.clearCandidateHistory(); message = "Live Candidate history cleared" }) { Text("CLEAR") }
                     }
                     report.candidateHistory.take(8).forEachIndexed { index, r ->
                         if (index > 0) HorizontalDivider()
@@ -192,7 +192,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
                     Button({ message = if (MetaBrainRuntime.forceSave()) "Model + live validation saved" else "Save failed" }, Modifier.weight(1f)) { Text("SAVE NOW", fontSize = 10.sp) }
                     OutlinedButton({
                         MetaBrainRuntime.resetCandidateLearning()
-                        message = "Candidate reset to frozen Production; any installed historical Candidate is discarded"
+                        message = "Candidate reset to frozen Production; installed historical Candidate discarded"
                     }, Modifier.weight(1f)) { Text("RESET CANDIDATE", fontSize = 9.sp) }
                 }
             }
@@ -214,16 +214,17 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
                         Text(if (report.gateEnabled) "DISABLE GATE" else "ENABLE AI GATE", fontSize = 9.sp)
                     }
                 }
-                Text("Historical training, adaptive search and live learning can modify Candidate only. Production changes only after this promotion gate. Learning or failed Candidates never place or force trades.", style = MaterialTheme.typography.labelSmall)
+                Text("Historical training, adaptive search and live learning can modify Candidate only. Production changes only after the promotion gate. Learning or failed Candidates never place or force trades.", style = MaterialTheme.typography.labelSmall)
             }
         }
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("TRAINING VALIDITY / FEATURE COVERAGE", fontWeight = FontWeight.Bold)
-                Text("Historical corpus: actual expired CE/PE premium OHLCV+OI · completed-bar features · next-bar entry · actual 5-bar option-premium MFE/MAE · conservative stop-first ambiguity · slippage + ₹70.80 brokerage/GST · chronological walk-forward · locked holdout.", style = MaterialTheme.typography.bodySmall)
-                Text("Historical expired candles do not contain native D30 order-book depth, microprice or walls; those historical feature slots are zero and are not fabricated. Fresh live Candidate learning still receives E1/E2/E3 identity, CE/PE side, engine confidence, direction/entry quality, order flow, OI impulse, option flow, acceleration, D30 imbalance, microprice, TBQ/TSQ/book pressure, wall pressure, depth count and intraday phase when available.", style = MaterialTheme.typography.bodySmall)
-                Text("Live labels remain the fixed 5-minute directional reality check so the historical premium-trained Candidate must generalize to fresh market behavior before promotion.", style = MaterialTheme.typography.bodySmall)
+                Text("Historical corpus: imported or Upstox expired CE/PE premium OHLCV+OI · completed-bar features · next-bar entry · actual 5-bar option-premium MFE/MAE · conservative stop-first ambiguity · slippage + ₹70.80 brokerage/GST · chronological walk-forward · locked holdout.", style = MaterialTheme.typography.bodySmall)
+                Text("Local import supports CSV, XLSX, JSON and ZIP containing those formats. Rows are schema-checked, normalized, deduplicated and copied to app-private storage before training.", style = MaterialTheme.typography.bodySmall)
+                Text("Historical files do not provide native D30 order-book depth, microprice or walls unless explicitly present in a future compatible schema; current historical depth feature slots remain zero rather than fabricated. Fresh live learning still receives actual D30/order-flow inputs when available.", style = MaterialTheme.typography.bodySmall)
+                Text("Live labels remain a fresh 5-minute directional reality check, so a premium-trained historical Candidate must generalize to current market behavior before promotion.", style = MaterialTheme.typography.bodySmall)
             }
         }
 
@@ -236,19 +237,65 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
 private fun HistoricalTrainingCard(
     state: HistoricalCorpusTrainingViewModel.UiState,
     vm: HistoricalCorpusTrainingViewModel,
+    onImport: () -> Unit,
 ) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("HISTORICAL CORPUS TRAINING", fontWeight = FontWeight.Bold)
-            Text("Downloads/resumes expired Upstox CE/PE candles, builds causal option-premium labels, tests 18 hyperparameter Candidates through chronological walk-forward folds, and opens the final holdout only after robustness. A holdout PASS is installed as Candidate only.", style = MaterialTheme.typography.labelSmall)
+            Text("HISTORICAL CORPUS + AI RESEARCH", fontWeight = FontWeight.Bold)
+            Text("One pipeline for Upstox downloads, your own files, or both combined. Every source uses causal premium labels, chronological walk-forward and the same locked holdout before any historical champion can become Candidate.", style = MaterialTheme.typography.labelSmall)
 
+            Text("CORPUS SOURCE", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                HistoricalCorpusSource.entries.forEach { source ->
+                    TrainingChoice(source.label, state.selectedSource == source, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectSource(source) }
+                }
+            }
+
+            Button(onImport, Modifier.fillMaxWidth(), enabled = !state.isRunning && !state.isImporting) {
+                Text("IMPORT LOCAL CORPUS · CSV / XLSX / JSON / ZIP", fontSize = 10.sp)
+            }
+
+            val local = state.localSummary
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("LOCAL CORPUS QUALITY", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                    Row {
+                        LabMetric("Contracts", local.optionContracts.toString(), Modifier.weight(1f))
+                        LabMetric("Candles", local.rowsAccepted.toString(), Modifier.weight(1f))
+                        LabMetric("Rejected", local.rowsRejected.toString(), Modifier.weight(1f))
+                    }
+                    Row {
+                        LabMetric("NIFTY", local.niftyContracts.toString(), Modifier.weight(1f))
+                        LabMetric("SENSEX", local.sensexContracts.toString(), Modifier.weight(1f))
+                        LabMetric("Deduped", local.duplicatesRemoved.toString(), Modifier.weight(1f))
+                    }
+                    Text("CE ${local.ceContracts} · PE ${local.peContracts} · files ${local.filesImported} · supported ${local.supportedFiles}", style = MaterialTheme.typography.labelSmall)
+                    if (local.fromDate != null || local.toDate != null) Text("Coverage ${local.fromDate ?: "?"} → ${local.toDate ?: "?"}", style = MaterialTheme.typography.labelSmall)
+                    if (local.inferredLotSizeContracts > 0) Text("⚠ ${local.inferredLotSizeContracts} contract(s) use inferred lot size; cost metrics are approximate for those contracts.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                    local.warnings.takeLast(3).forEach { Text("⚠ $it", style = MaterialTheme.typography.labelSmall) }
+                    local.errors.takeLast(2).forEach { Text("ERROR · $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedButton(vm::refreshLocalSummary, Modifier.weight(1f), enabled = !state.isRunning && !state.isImporting) { Text("REFRESH", fontSize = 9.sp) }
+                        OutlinedButton(vm::clearLocalCorpus, Modifier.weight(1f), enabled = !state.isRunning && !state.isImporting && local.optionContracts > 0) { Text("CLEAR LOCAL", fontSize = 9.sp) }
+                    }
+                }
+            }
+
+            if (state.isImporting) {
+                LinearProgressIndicator({ state.importProgress }, Modifier.fillMaxWidth())
+                Text("IMPORT · ${state.importCompleted}/${state.importTotal.coerceAtLeast(1)}", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                Text(state.importMessage, style = MaterialTheme.typography.labelSmall)
+                OutlinedButton(vm::cancel, Modifier.fillMaxWidth()) { Text("CANCEL IMPORT SAFELY") }
+            }
+
+            Text("MARKET / WINDOW", fontWeight = FontWeight.Bold, fontSize = 10.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                TrainingChoice("NIFTY", state.selectedIndex == MarketIndex.NIFTY, Modifier.weight(1f), !state.isRunning) { vm.selectIndex(MarketIndex.NIFTY) }
-                TrainingChoice("SENSEX", state.selectedIndex == MarketIndex.SENSEX, Modifier.weight(1f), !state.isRunning) { vm.selectIndex(MarketIndex.SENSEX) }
+                TrainingChoice("NIFTY", state.selectedIndex == MarketIndex.NIFTY, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectIndex(MarketIndex.NIFTY) }
+                TrainingChoice("SENSEX", state.selectedIndex == MarketIndex.SENSEX, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectIndex(MarketIndex.SENSEX) }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 listOf(1, 3, 6, 12).forEach { months ->
-                    TrainingChoice("${months}M", state.selectedMonths == months, Modifier.weight(1f), !state.isRunning) { vm.selectMonths(months) }
+                    TrainingChoice("${months}M", state.selectedMonths == months, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectMonths(months) }
                 }
             }
 
@@ -256,12 +303,12 @@ private fun HistoricalTrainingCard(
                 LinearProgressIndicator({ state.progress }, Modifier.fillMaxWidth())
                 Text("${state.stage} · ${state.completed}/${state.total.coerceAtLeast(1)}", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 Text(state.message, style = MaterialTheme.typography.labelSmall)
-                OutlinedButton(vm::cancel, Modifier.fillMaxWidth()) { Text("CANCEL SAFELY") }
-            } else {
-                Button(vm::runOrResume, Modifier.fillMaxWidth()) { Text("RUN / RESUME HISTORICAL AI TRAINING") }
+                OutlinedButton(vm::cancel, Modifier.fillMaxWidth()) { Text("CANCEL TRAINING SAFELY") }
+            } else if (!state.isImporting) {
+                Button(vm::runOrResume, Modifier.fillMaxWidth()) { Text("RUN / RESUME ${state.selectedSource.label} HISTORICAL AI TRAINING") }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(vm::clearHistoricalCache, Modifier.weight(1f)) { Text("CLEAR CACHE", fontSize = 9.sp) }
-                    LabMetric("Cache hits", state.cacheHits.toString(), Modifier.weight(1f))
+                    OutlinedButton(vm::clearUpstoxCache, Modifier.weight(1f)) { Text("CLEAR UPSTOX CACHE", fontSize = 8.sp) }
+                    LabMetric("Cache", state.cacheHits.toString(), Modifier.weight(1f))
                     LabMetric("Network", state.networkRequests.toString(), Modifier.weight(1f))
                 }
                 Text(state.message, style = MaterialTheme.typography.labelSmall)

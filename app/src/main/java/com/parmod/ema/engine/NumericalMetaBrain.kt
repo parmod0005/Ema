@@ -4,16 +4,35 @@ import com.parmod.ema.model.EngineId
 import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.PositionSide
 import kotlin.math.exp
-import kotlin.math.max
 import kotlin.math.min
 
 /** Local numerical meta-model used for fast on-device inference and online learning. */
 class NumericalMetaBrain(
-    private val learningRate: Double = 0.015,
-    private val l2: Double = 0.0005,
+    learningRate: Double = DEFAULT_LEARNING_RATE,
+    l2: Double = DEFAULT_L2,
+    takeThreshold: Double = DEFAULT_TAKE_THRESHOLD,
+    rejectThreshold: Double = DEFAULT_REJECT_THRESHOLD,
 ) {
     enum class Mode { SHADOW, GATE }
     enum class Decision { TAKE, CAUTION, REJECT }
+
+    data class HyperParameters(
+        val learningRate: Double = DEFAULT_LEARNING_RATE,
+        val l2: Double = DEFAULT_L2,
+        val takeThreshold: Double = DEFAULT_TAKE_THRESHOLD,
+        val rejectThreshold: Double = DEFAULT_REJECT_THRESHOLD,
+    ) {
+        fun sanitized(): HyperParameters {
+            val take = takeThreshold.coerceIn(0.51, 0.90)
+            val reject = rejectThreshold.coerceIn(0.10, 0.49).coerceAtMost(take - 0.02)
+            return copy(
+                learningRate = learningRate.coerceIn(0.001, 0.10),
+                l2 = l2.coerceIn(0.0, 0.02),
+                takeThreshold = take,
+                rejectThreshold = reject,
+            )
+        }
+    }
 
     data class Features(
         val engine: EngineId,
@@ -77,16 +96,25 @@ class NumericalMetaBrain(
         val samplesLearned: Long,
         val modelVersion: Long,
         val mode: Mode,
+        val hyperParameters: HyperParameters = HyperParameters(),
     )
 
     private val weights = DoubleArray(FEATURE_COUNT)
     private var bias = -0.05
     private var learned = 0L
     private var version = 1L
+    private var hyperParameters = HyperParameters(learningRate, l2, takeThreshold, rejectThreshold).sanitized()
     var mode: Mode = Mode.SHADOW
         private set
 
     fun setMode(value: Mode) { mode = value }
+
+    fun configure(value: HyperParameters, bumpVersion: Boolean = true) {
+        hyperParameters = value.sanitized()
+        if (bumpVersion) version++
+    }
+
+    fun currentHyperParameters(): HyperParameters = hyperParameters
 
     fun loadHistoricalPrior(priorWeights: DoubleArray, priorBias: Double, priorSamples: Long) {
         require(priorWeights.size == FEATURE_COUNT)
@@ -103,9 +131,10 @@ class NumericalMetaBrain(
         learned = state.samplesLearned.coerceAtLeast(0L)
         version = state.modelVersion.coerceAtLeast(1L)
         mode = state.mode
+        hyperParameters = state.hyperParameters.sanitized()
     }
 
-    fun snapshot(): ModelState = ModelState(weights.copyOf(), bias, learned, version, mode)
+    fun snapshot(): ModelState = ModelState(weights.copyOf(), bias, learned, version, mode, hyperParameters)
 
     fun predict(features: Features): Prediction {
         val x = features.vector()
@@ -113,8 +142,8 @@ class NumericalMetaBrain(
         for (i in x.indices) z += weights[i] * x[i]
         val p = sigmoid(z)
         val decision = when {
-            p >= TAKE_THRESHOLD -> Decision.TAKE
-            p <= REJECT_THRESHOLD -> Decision.REJECT
+            p >= hyperParameters.takeThreshold -> Decision.TAKE
+            p <= hyperParameters.rejectThreshold -> Decision.REJECT
             else -> Decision.CAUTION
         }
         return Prediction(p, (p * 100.0).toInt().coerceIn(0, 100), decision, version, learned, mode)
@@ -126,18 +155,20 @@ class NumericalMetaBrain(
         val y = if (success) 1.0 else 0.0
         val error = (y - p) * sampleWeight.coerceIn(0.1, 5.0)
         for (i in weights.indices) {
-            weights[i] += learningRate * (error * x[i] - l2 * weights[i])
+            weights[i] += hyperParameters.learningRate * (error * x[i] - hyperParameters.l2 * weights[i])
             weights[i] = weights[i].coerceIn(-8.0, 8.0)
         }
-        bias = (bias + learningRate * error).coerceIn(-8.0, 8.0)
+        bias = (bias + hyperParameters.learningRate * error).coerceIn(-8.0, 8.0)
         learned++
         if (learned % 100L == 0L) version++
     }
 
     companion object {
         const val FEATURE_COUNT = 21
-        const val TAKE_THRESHOLD = 0.66
-        const val REJECT_THRESHOLD = 0.42
+        const val DEFAULT_LEARNING_RATE = 0.015
+        const val DEFAULT_L2 = 0.0005
+        const val DEFAULT_TAKE_THRESHOLD = 0.66
+        const val DEFAULT_REJECT_THRESHOLD = 0.42
 
         private fun sigmoid(value: Double): Double = when {
             value >= 35.0 -> 1.0

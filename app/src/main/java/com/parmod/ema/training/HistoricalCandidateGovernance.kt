@@ -39,15 +39,54 @@ object HistoricalCandidateGovernance {
     const val MAX_DOMINANT_ENGINE_SHARE = 0.85
     const val MIN_DISTINCT_ENGINES = 2
 
+    /** Strict gate for the one-time locked holdout. */
     fun evaluate(
         candidate: HistoricalCorpusTrainer.Metrics?,
         production: HistoricalCorpusTrainer.Metrics?,
         coverage: HistoricalCorpusTrainer.Coverage,
         corpusSamples: Int,
         holdoutOpened: Boolean,
+    ): Decision = evaluateEvidence(
+        candidate = candidate,
+        production = production,
+        coverage = coverage,
+        corpusSamples = corpusSamples,
+        evidenceAvailable = holdoutOpened,
+        minimumLabels = MIN_HOLDOUT_LABELS,
+        evidenceName = "locked-holdout",
+    )
+
+    /**
+     * Pre-holdout qualification used by adaptive historical evolution.
+     * Only walk-forward/development metrics reach this gate; locked test evidence is
+     * deliberately unavailable here, preventing test-set tuning across generations.
+     */
+    fun evaluateDevelopment(
+        candidate: HistoricalCorpusTrainer.Metrics?,
+        production: HistoricalCorpusTrainer.Metrics?,
+        coverage: HistoricalCorpusTrainer.Coverage,
+        corpusSamples: Int,
+    ): Decision = evaluateEvidence(
+        candidate = candidate,
+        production = production,
+        coverage = coverage,
+        corpusSamples = corpusSamples,
+        evidenceAvailable = candidate != null && production != null,
+        minimumLabels = MIN_HOLDOUT_LABELS,
+        evidenceName = "walk-forward validation",
+    )
+
+    private fun evaluateEvidence(
+        candidate: HistoricalCorpusTrainer.Metrics?,
+        production: HistoricalCorpusTrainer.Metrics?,
+        coverage: HistoricalCorpusTrainer.Coverage,
+        corpusSamples: Int,
+        evidenceAvailable: Boolean,
+        minimumLabels: Long,
+        evidenceName: String,
     ): Decision {
-        if (!holdoutOpened || candidate == null || production == null) {
-            return Decision(Status.CLOSED, listOf("Locked holdout was not opened"))
+        if (!evidenceAvailable || candidate == null || production == null) {
+            return Decision(Status.CLOSED, listOf("$evidenceName evidence is not available"))
         }
 
         val requiredTake = requiredActionSamples(candidate.labels)
@@ -63,8 +102,8 @@ object HistoricalCandidateGovernance {
         val dominantShare = if (corpusSamples <= 0) 0.0 else (dominant?.second ?: 0).toDouble() / corpusSamples
 
         val insufficient = mutableListOf<String>()
-        if (candidate.labels < MIN_HOLDOUT_LABELS) {
-            insufficient += "Need at least $MIN_HOLDOUT_LABELS locked-holdout labels; found ${candidate.labels}"
+        if (candidate.labels < minimumLabels) {
+            insufficient += "Need at least $minimumLabels $evidenceName labels; found ${candidate.labels}"
         }
         if (candidate.takeSamples < requiredTake) {
             insufficient += "Need at least $requiredTake TAKE decisions; found ${candidate.takeSamples}"

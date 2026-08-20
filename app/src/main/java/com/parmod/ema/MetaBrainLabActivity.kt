@@ -19,6 +19,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.model.MarketIndex
+import com.parmod.ema.training.HistoricalCandidateGovernance
 import com.parmod.ema.training.HistoricalCorpusSource
 import com.parmod.ema.training.HistoricalCorpusTrainingViewModel
 import kotlinx.coroutines.delay
@@ -55,7 +56,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text("VARDHANI AI TRAINING CENTER", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text("Upstox / local / combined corpus → walk-forward → locked holdout → live shadow → manual promotion", style = MaterialTheme.typography.labelMedium)
+        Text("Upstox / local / combined corpus → walk-forward → strict locked holdout → live shadow → manual promotion", style = MaterialTheme.typography.labelMedium)
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -222,7 +223,8 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("TRAINING VALIDITY / FEATURE COVERAGE", fontWeight = FontWeight.Bold)
                 Text("Historical corpus: imported or Upstox expired CE/PE premium OHLCV+OI · completed-bar features · next-bar entry · actual 5-bar option-premium MFE/MAE · conservative stop-first ambiguity · slippage + ₹70.80 brokerage/GST · chronological walk-forward · locked holdout.", style = MaterialTheme.typography.bodySmall)
-                Text("Local import supports CSV, XLSX, JSON and ZIP containing those formats. Rows are schema-checked, normalized, deduplicated and copied to app-private storage before training.", style = MaterialTheme.typography.bodySmall)
+                Text("Strict historical governance: ≥${HistoricalCandidateGovernance.MIN_HOLDOUT_LABELS} holdout labels · meaningful TAKE + REJECT counts · TAKE precision ≥${pct(HistoricalCandidateGovernance.MIN_TAKE_PRECISION)} · REJECT precision ≥${pct(HistoricalCandidateGovernance.MIN_REJECT_PRECISION)} · positive cost-adjusted TAKE net return · Candidate improvement over Production · ≥${HistoricalCandidateGovernance.MIN_DISTINCT_ENGINES} represented engine proxies · no engine >${pct(HistoricalCandidateGovernance.MAX_DOMINANT_ENGINE_SHARE)} of corpus.", style = MaterialTheme.typography.bodySmall)
+                Text("Local import supports CSV, XLSX, JSON, NDJSON and ZIP containing those formats. Rows are schema-checked, normalized and copied to app-private storage before training.", style = MaterialTheme.typography.bodySmall)
                 Text("Historical files do not provide native D30 order-book depth, microprice or walls unless explicitly present in a future compatible schema; current historical depth feature slots remain zero rather than fabricated. Fresh live learning still receives actual D30/order-flow inputs when available.", style = MaterialTheme.typography.bodySmall)
                 Text("Live labels remain a fresh 5-minute directional reality check, so a premium-trained historical Candidate must generalize to current market behavior before promotion.", style = MaterialTheme.typography.bodySmall)
             }
@@ -242,7 +244,7 @@ private fun HistoricalTrainingCard(
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("HISTORICAL CORPUS + AI RESEARCH", fontWeight = FontWeight.Bold)
-            Text("One pipeline for Upstox downloads, your own files, or both combined. Every source uses causal premium labels, chronological walk-forward and the same locked holdout before any historical champion can become Candidate.", style = MaterialTheme.typography.labelSmall)
+            Text("One pipeline for Upstox downloads, your own files, or both combined. Every source uses causal premium labels, chronological walk-forward and strict historical governance before any champion can become Candidate.", style = MaterialTheme.typography.labelSmall)
 
             Text("CORPUS SOURCE", fontWeight = FontWeight.Bold, fontSize = 10.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -252,7 +254,7 @@ private fun HistoricalTrainingCard(
             }
 
             Button(onImport, Modifier.fillMaxWidth(), enabled = !state.isRunning && !state.isImporting) {
-                Text("IMPORT LOCAL CORPUS · CSV / XLSX / JSON / ZIP", fontSize = 10.sp)
+                Text("IMPORT LOCAL CORPUS · CSV / XLSX / JSON / NDJSON / ZIP", fontSize = 10.sp)
             }
 
             val local = state.localSummary
@@ -344,20 +346,40 @@ private fun HistoricalTrainingCard(
                     Text("LR ${"%.4f".format(h.learningRate)} · L2 ${"%.5f".format(h.l2)} · TAKE ${pct(h.takeThreshold)} · REJECT ${pct(h.rejectThreshold)}", style = MaterialTheme.typography.labelSmall)
                     Text("WF Candidate acc ${pct(best.candidate.accuracy)} / Brier ${"%.4f".format(best.candidate.brier)} vs Production ${pct(best.production.accuracy)} / ${"%.4f".format(best.production.brier)}", style = MaterialTheme.typography.labelSmall)
                 }
+
+                val governance = HistoricalCandidateGovernance.evaluate(
+                    candidate = r.holdoutCandidate,
+                    production = r.holdoutProduction,
+                    coverage = r.coverage,
+                    corpusSamples = r.corpusSamples,
+                    holdoutOpened = r.lockedHoldoutOpened,
+                )
+                val governanceColor = when (governance.status) {
+                    HistoricalCandidateGovernance.Status.PASS -> MaterialTheme.colorScheme.primary
+                    HistoricalCandidateGovernance.Status.FAIL -> MaterialTheme.colorScheme.error
+                    HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> MaterialTheme.colorScheme.secondary
+                    HistoricalCandidateGovernance.Status.CLOSED -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
                 Text(
-                    "LOCKED HOLDOUT: ${when { !r.lockedHoldoutOpened -> "CLOSED"; r.lockedHoldoutPassed -> "PASS"; else -> "FAIL" }}",
+                    "LOCKED HOLDOUT: ${governance.label}",
                     fontWeight = FontWeight.Bold,
-                    color = if (r.lockedHoldoutPassed) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                    color = governanceColor,
                 )
                 if (r.lockedHoldoutOpened) {
                     val c = r.holdoutCandidate
                     val p = r.holdoutProduction
                     if (c != null && p != null) {
-                        Text("Holdout Candidate acc ${pct(c.accuracy)} · Brier ${"%.4f".format(c.brier)} · TAKE ${pct(c.takePrecision)} · REJECT ${pct(c.rejectPrecision)}", style = MaterialTheme.typography.labelSmall)
+                        Text("Holdout Candidate acc ${pct(c.accuracy)} · Brier ${"%.4f".format(c.brier)}", style = MaterialTheme.typography.labelSmall)
+                        Text("TAKE ${pct(c.takePrecision)} (${c.takeSamples}) · TAKE avg net ${pctSigned(c.takeAverageNetReturn)}", style = MaterialTheme.typography.labelSmall)
+                        Text("REJECT ${pct(c.rejectPrecision)} (${c.rejectSamples}) · Holdout labels ${c.labels}", style = MaterialTheme.typography.labelSmall)
                         Text("Holdout Production acc ${pct(p.accuracy)} · Brier ${"%.4f".format(p.brier)}", style = MaterialTheme.typography.labelSmall)
                     }
+                    Text("Engine gate · min ${governance.requiredEngineSamples}/engine · dominant ${pct(governance.dominantEngineShare)} (max ${pct(HistoricalCandidateGovernance.MAX_DOMINANT_ENGINE_SHARE)})", style = MaterialTheme.typography.labelSmall)
+                    governance.reasons.take(5).forEach { reason ->
+                        Text(if (governance.passed) "✓ $reason" else "• $reason", color = governanceColor, style = MaterialTheme.typography.labelSmall)
+                    }
                 }
-                Text(if (state.installedCandidate) "✓ HISTORICAL CHAMPION INSTALLED AS CANDIDATE · LIVE VALIDATION RESET TO 0" else "Production unchanged", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                Text(if (state.installedCandidate) "✓ HISTORICAL CHAMPION INSTALLED AS CANDIDATE · LIVE VALIDATION RESET TO 0" else "Production unchanged · historical Candidate not installed unless governance PASS", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 Text(r.note, style = MaterialTheme.typography.labelSmall)
             }
         }

@@ -1,5 +1,6 @@
 package com.parmod.ema.training
 
+import com.parmod.ema.engine.AdaptiveCandidateSearch
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.engine.NumericalMetaBrain
 import com.parmod.ema.model.EngineId
@@ -15,14 +16,12 @@ import kotlin.math.min
 import kotlin.math.pow
 
 /**
- * Candidate research over the existing leakage-resistant pre-labelled option corpus.
+ * Candidate research over the leakage-resistant pre-labelled option corpus.
  *
- * The corpus itself already has expiry-ordered train / validation / test splits and
- * future-only 1/3/5/15 minute option labels. Candidate search uses train + validation;
- * test remains locked until a candidate is validation-robust. Historical governance
- * then requires adequate TAKE/REJECT evidence, positive cost-adjusted TAKE return,
- * Production improvement and non-degenerate engine-proxy coverage. A passing state is
- * returned as Candidate only and must still pass fresh live unseen validation.
+ * Seed + adaptive generations are trained only on the original train split and are
+ * selected only on the original validation split. The original test split remains
+ * locked until one Candidate clears walk-forward + strict development governance.
+ * Test results are never fed back into subsequent mutations.
  */
 class AimlHistoricalOptionCorpusV1Trainer(
     private val store: AimlHistoricalOptionCorpusV1Store,
@@ -96,111 +95,232 @@ class AimlHistoricalOptionCorpusV1Trainer(
             return emptyResult(index, monthsLabel, "Imported pre-labelled corpus contains $corpusMarket, not ${index.name}")
         }
 
-        val hypers = candidateHyperParameters()
-        val brains = hypers.map { brainFromBaseline(it) }
-        val production = brainFromBaseline(productionBaseline.hyperParameters)
+        val coverage = coverage(meta)
+        val corpusSamples = corpusSamples(meta)
         val trainStride = ceil(trainRows.toDouble() / MAX_SEARCH_TRAIN_ROWS).toInt().coerceAtLeast(1)
         val validationStride = ceil(validationRows.toDouble() / MAX_SEARCH_VALIDATION_ROWS).toInt().coerceAtLeast(1)
+        val seedHypers = candidateHyperParameters()
+        val seen = seedHypers.mapTo(linkedSetOf()) { AdaptiveCandidateSearch.signature(it) }
+        val evaluations = ArrayList<HistoricalCorpusTrainer.CandidateEvaluation>()
 
-        onProgress(HistoricalCorpusTrainer.Progress("PRELABELLED_SEARCH_TRAIN", 0, hypers.size, "Training ${hypers.size} candidates on chronological train split · stride $trainStride"))
-        var searchTrainUsed = 0L
-        store.forEach(
-            split = AimlHistoricalOptionCorpusV1Store.Split.TRAIN,
-            stride = trainStride,
-            shouldCancel = shouldCancel,
-        ) { record ->
-            if (record.index != index) return@forEach
-            val sample = sample(record)
-            brains.forEach { it.learn(sample.features, sample.success, sample.weight) }
-            searchTrainUsed++
-            if (searchTrainUsed % 25_000L == 0L) {
-                onProgress(HistoricalCorpusTrainer.Progress("PRELABELLED_SEARCH_TRAIN", (searchTrainUsed / 25_000L).toInt(), max(1, (MAX_SEARCH_TRAIN_ROWS / 25_000L).toInt()), "$searchTrainUsed sampled train rows · ${hypers.size} candidates"))
-            }
-        }
-
-        val candidateAcc = Array(hypers.size) { Acc() }
-        val productionAcc = Acc()
-        val foldCandidate = Array(hypers.size) { Array(FOLDS) { Acc() } }
-        val foldProduction = Array(FOLDS) { Acc() }
-        var validationUsed = 0L
-        val validationTarget = max(1L, min(validationRows, MAX_SEARCH_VALIDATION_ROWS))
-        onProgress(HistoricalCorpusTrainer.Progress("PRELABELLED_VALIDATION", 0, FOLDS, "Scoring unseen validation split; test remains locked"))
-        store.forEach(
-            split = AimlHistoricalOptionCorpusV1Store.Split.VALIDATION,
-            stride = validationStride,
-            shouldCancel = shouldCancel,
-        ) { record ->
-            if (record.index != index) return@forEach
-            val sample = sample(record)
-            val p = production.predict(sample.features)
-            productionAcc.add(p, sample)
-            val fold = ((validationUsed * FOLDS) / validationTarget).toInt().coerceIn(0, FOLDS - 1)
-            foldProduction[fold].add(p, sample)
-            brains.forEachIndexed { i, brain ->
-                val prediction = brain.predict(sample.features)
-                candidateAcc[i].add(prediction, sample)
-                foldCandidate[i][fold].add(prediction, sample)
-            }
-            validationUsed++
-        }
-
-        val prodValidation = productionAcc.metrics()
-        val evaluations = hypers.indices.map { i ->
-            val cm = candidateAcc[i].metrics()
-            var foldsWon = 0
-            var foldsRun = 0
-            repeat(FOLDS) { fold ->
-                val c = foldCandidate[i][fold].metrics()
-                val p = foldProduction[fold].metrics()
-                if (c.labels > 0 && p.labels > 0) {
-                    foldsRun++
-                    if (score(c, p) > 0.0) foldsWon++
+        fun trainAndEvaluateBatch(
+            hypers: List<NumericalMetaBrain.HyperParameters>,
+            generation: Int,
+        ): List<HistoricalCorpusTrainer.CandidateEvaluation> {
+            val brains = hypers.map { brainFromBaseline(it) }
+            val stagePrefix = if (generation == 0) "PRELABELLED_SEED" else "PRELABELLED_ADAPT_G$generation"
+            var searchTrainUsed = 0L
+            onProgress(
+                HistoricalCorpusTrainer.Progress(
+                    "${stagePrefix}_TRAIN",
+                    0,
+                    hypers.size,
+                    if (generation == 0) {
+                        "Training ${hypers.size} seed Candidates on original train split · stride $trainStride"
+                    } else {
+                        "Training Adaptive G$generation · ${hypers.size} Candidates on original train split · locked test untouched"
+                    },
+                ),
+            )
+            store.forEach(
+                split = AimlHistoricalOptionCorpusV1Store.Split.TRAIN,
+                stride = trainStride,
+                shouldCancel = shouldCancel,
+            ) { record ->
+                if (record.index != index) return@forEach
+                val s = sample(record)
+                brains.forEach { it.learn(s.features, s.success, s.weight) }
+                searchTrainUsed++
+                if (searchTrainUsed % 25_000L == 0L) {
+                    onProgress(
+                        HistoricalCorpusTrainer.Progress(
+                            "${stagePrefix}_TRAIN",
+                            (searchTrainUsed / 25_000L).toInt(),
+                            max(1, (MAX_SEARCH_TRAIN_ROWS / 25_000L).toInt()),
+                            "G$generation · $searchTrainUsed sampled train rows · ${hypers.size} Candidates",
+                        ),
+                    )
                 }
             }
-            val s = score(cm, prodValidation) + 0.08 * ((if (foldsRun == 0) 0.0 else foldsWon.toDouble() / foldsRun) - 0.50)
-            HistoricalCorpusTrainer.CandidateEvaluation(
-                hyperParameters = hypers[i],
-                foldsRun = foldsRun,
-                foldsWon = foldsWon,
-                candidate = cm,
-                production = prodValidation,
-                score = s,
-                robust = foldsRun >= 3 && foldsWon >= ceil(foldsRun * 0.75).toInt() && s > 0.0,
+
+            val candidateAcc = Array(hypers.size) { Acc() }
+            val productionAcc = Acc()
+            val foldCandidate = Array(hypers.size) { Array(FOLDS) { Acc() } }
+            val foldProduction = Array(FOLDS) { Acc() }
+            val production = brainFromBaseline(productionBaseline.hyperParameters)
+            var validationUsed = 0L
+            val validationTarget = max(1L, min(validationRows, MAX_SEARCH_VALIDATION_ROWS))
+            onProgress(
+                HistoricalCorpusTrainer.Progress(
+                    "${stagePrefix}_VALIDATION",
+                    0,
+                    FOLDS,
+                    "Scoring G$generation on original validation split · test remains locked",
+                ),
             )
-        }
-        val best = evaluations.maxByOrNull { it.score }
-        if (best == null || !best.robust) {
-            onProgress(HistoricalCorpusTrainer.Progress("COMPLETE", hypers.size, hypers.size, "No validation-robust candidate · locked test stayed closed"))
-            return result(index, monthsLabel, meta, hypers.size, best, false, false, null, null, null, "Pre-labelled corpus validation did not produce a robust candidate; locked test remained closed.")
+            store.forEach(
+                split = AimlHistoricalOptionCorpusV1Store.Split.VALIDATION,
+                stride = validationStride,
+                shouldCancel = shouldCancel,
+            ) { record ->
+                if (record.index != index) return@forEach
+                val s = sample(record)
+                val p = production.predict(s.features)
+                productionAcc.add(p, s)
+                val fold = ((validationUsed * FOLDS) / validationTarget).toInt().coerceIn(0, FOLDS - 1)
+                foldProduction[fold].add(p, s)
+                brains.forEachIndexed { i, brain ->
+                    val prediction = brain.predict(s.features)
+                    candidateAcc[i].add(prediction, s)
+                    foldCandidate[i][fold].add(prediction, s)
+                }
+                validationUsed++
+            }
+
+            val prodValidation = productionAcc.metrics()
+            return hypers.indices.map { i ->
+                val cm = candidateAcc[i].metrics()
+                var foldsWon = 0
+                var foldsRun = 0
+                repeat(FOLDS) { fold ->
+                    val c = foldCandidate[i][fold].metrics()
+                    val p = foldProduction[fold].metrics()
+                    if (c.labels > 0 && p.labels > 0) {
+                        foldsRun++
+                        if (score(c, p) > 0.0) foldsWon++
+                    }
+                }
+                val s = score(cm, prodValidation) + 0.08 * ((if (foldsRun == 0) 0.0 else foldsWon.toDouble() / foldsRun) - 0.50)
+                HistoricalCorpusTrainer.CandidateEvaluation(
+                    hyperParameters = hypers[i],
+                    foldsRun = foldsRun,
+                    foldsWon = foldsWon,
+                    candidate = cm,
+                    production = prodValidation,
+                    score = s,
+                    robust = foldsRun >= 3 && foldsWon >= ceil(foldsRun * 0.75).toInt() && s > 0.0,
+                )
+            }
         }
 
+        evaluations += trainAndEvaluateBatch(seedHypers, 0)
+        var best = evaluations.maxByOrNull { it.score }
+        var developmentGovernance = best?.let {
+            HistoricalCandidateGovernance.evaluateDevelopment(it.candidate, it.production, coverage, corpusSamples)
+        } ?: HistoricalCandidateGovernance.Decision(HistoricalCandidateGovernance.Status.CLOSED, listOf("No validation Candidate"))
+        var adaptiveGenerations = 0
+
+        while (
+            (best?.robust != true || !developmentGovernance.passed) &&
+            adaptiveGenerations < HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS
+        ) {
+            val parent = best ?: break
+            adaptiveGenerations++
+            val batch = HistoricalAdaptiveCandidateSearch.nextBatch(
+                parent = parent.hyperParameters,
+                generation = adaptiveGenerations,
+                seenSignatures = seen,
+            )
+            onProgress(
+                HistoricalCorpusTrainer.Progress(
+                    "PRELABELLED_EVOLVE",
+                    adaptiveGenerations,
+                    HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
+                    "Evolving historical G$adaptiveGenerations around validation score ${"%.4f".format(parent.score)} · Production and locked test unchanged",
+                ),
+            )
+            evaluations += trainAndEvaluateBatch(batch.candidates, adaptiveGenerations)
+            best = evaluations.maxByOrNull { it.score }
+            developmentGovernance = best?.let {
+                HistoricalCandidateGovernance.evaluateDevelopment(it.candidate, it.production, coverage, corpusSamples)
+            } ?: developmentGovernance
+        }
+
+        val developmentQualified = best?.robust == true && developmentGovernance.passed
+        if (!developmentQualified || best == null) {
+            onProgress(
+                HistoricalCorpusTrainer.Progress(
+                    "COMPLETE",
+                    evaluations.size,
+                    evaluations.size,
+                    "Adaptive historical search exhausted G$adaptiveGenerations · ${developmentGovernance.label} · original test stayed locked",
+                ),
+            )
+            return result(
+                index = index,
+                months = monthsLabel,
+                p = meta,
+                candidates = evaluations.size,
+                best = best,
+                opened = false,
+                passed = false,
+                candidateHoldout = null,
+                productionHoldout = null,
+                champion = null,
+                note = "aiml-historical-option-row-v1 · ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations · development-only evolution · test never opened · Development ${developmentGovernance.label}: ${developmentGovernance.reasons.joinToString("; ")}.",
+            )
+        }
+
+        // Refit the development-qualified winner on the full original TRAIN split only.
         val champion = brainFromBaseline(best.hyperParameters)
         var fullTrain = 0L
-        onProgress(HistoricalCorpusTrainer.Progress("PRELABELLED_REFIT", 0, 1, "Best candidate selected · refitting once on all $trainRows train rows"))
+        onProgress(
+            HistoricalCorpusTrainer.Progress(
+                "PRELABELLED_REFIT",
+                0,
+                1,
+                "Development-qualified after G$adaptiveGenerations · refitting winner on all $trainRows train rows",
+            ),
+        )
         store.forEach(AimlHistoricalOptionCorpusV1Store.Split.TRAIN, shouldCancel = shouldCancel) { record ->
             if (record.index != index) return@forEach
             val s = sample(record)
             champion.learn(s.features, s.success, s.weight)
             fullTrain++
-            if (fullTrain % 100_000L == 0L) onProgress(HistoricalCorpusTrainer.Progress("PRELABELLED_REFIT", fullTrain.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), trainRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), "Full-train refit · $fullTrain/$trainRows"))
+            if (fullTrain % 100_000L == 0L) {
+                onProgress(
+                    HistoricalCorpusTrainer.Progress(
+                        "PRELABELLED_REFIT",
+                        fullTrain.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        trainRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        "Full-train refit · $fullTrain/$trainRows",
+                    ),
+                )
+            }
         }
 
+        // Open the original TEST split once. No result from here can trigger another mutation.
         val candidateTest = Acc()
         val productionTest = Acc()
+        val production = brainFromBaseline(productionBaseline.hyperParameters)
         var testUsed = 0L
-        onProgress(HistoricalCorpusTrainer.Progress("LOCKED_HOLDOUT", 0, 1, "Validation robust · opening original test split once"))
+        onProgress(
+            HistoricalCorpusTrainer.Progress(
+                "LOCKED_HOLDOUT",
+                0,
+                1,
+                "Development-qualified · opening original test split ONCE; failure will stop this research cycle",
+            ),
+        )
         store.forEach(AimlHistoricalOptionCorpusV1Store.Split.TEST, shouldCancel = shouldCancel) { record ->
             if (record.index != index) return@forEach
             val s = sample(record)
             candidateTest.add(champion.predict(s.features), s)
             productionTest.add(production.predict(s.features), s)
             testUsed++
-            if (testUsed % 100_000L == 0L) onProgress(HistoricalCorpusTrainer.Progress("LOCKED_HOLDOUT", testUsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), testRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), "Locked test · $testUsed/$testRows"))
+            if (testUsed % 100_000L == 0L) {
+                onProgress(
+                    HistoricalCorpusTrainer.Progress(
+                        "LOCKED_HOLDOUT",
+                        testUsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        testRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        "Locked test · $testUsed/$testRows",
+                    ),
+                )
+            }
         }
         val candidateMetrics = candidateTest.metrics()
         val productionMetrics = productionTest.metrics()
-        val coverage = coverage(meta)
-        val corpusSamples = corpusSamples(meta)
         val governance = HistoricalCandidateGovernance.evaluate(
             candidate = candidateMetrics,
             production = productionMetrics,
@@ -213,28 +333,28 @@ class AimlHistoricalOptionCorpusV1Trainer(
         onProgress(
             HistoricalCorpusTrainer.Progress(
                 "COMPLETE",
-                hypers.size,
-                hypers.size,
+                evaluations.size,
+                evaluations.size,
                 when (governance.status) {
                     HistoricalCandidateGovernance.Status.PASS -> "Original locked test + governance PASS · champion ready as Candidate only"
-                    HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "Original locked test governance INSUFFICIENT DATA · ${governance.reasons.firstOrNull().orEmpty()}"
-                    HistoricalCandidateGovernance.Status.FAIL -> "Original locked test governance FAIL · ${governance.reasons.firstOrNull().orEmpty()}"
+                    HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "Original locked test INSUFFICIENT DATA · research stops; test will not be used for tuning"
+                    HistoricalCandidateGovernance.Status.FAIL -> "Original locked test FAIL · research stops; test will not be used for tuning"
                     HistoricalCandidateGovernance.Status.CLOSED -> "Original locked test stayed closed"
                 },
             ),
         )
         return result(
-            index,
-            monthsLabel,
-            meta,
-            hypers.size,
-            best,
-            true,
-            passed,
-            candidateMetrics,
-            productionMetrics,
-            state,
-            "aiml-historical-option-row-v1 · original expiry-ordered train/validation/test preserved · 5m option future-return/MFE/MAE labels · conservative stop-first · costs included · historical native D30 unavailable · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}.",
+            index = index,
+            months = monthsLabel,
+            p = meta,
+            candidates = evaluations.size,
+            best = best,
+            opened = true,
+            passed = passed,
+            candidateHoldout = candidateMetrics,
+            productionHoldout = productionMetrics,
+            champion = state,
+            note = "aiml-historical-option-row-v1 · ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations · original expiry-ordered train/validation/test preserved · locked test opened once only · 5m option future-return/MFE/MAE labels · conservative stop-first · costs included · historical native D30 unavailable · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}.",
         )
     }
 
@@ -308,10 +428,20 @@ class AimlHistoricalOptionCorpusV1Trainer(
         val all = ArrayList<NumericalMetaBrain.HyperParameters>()
         MetaBrainRuntime.CandidateProfile.entries.map { it.hyper.sanitized() }.forEach { base ->
             all += base
-            all += base.copy(learningRate = base.learningRate * 0.80, l2 = base.l2 * 0.70, takeThreshold = base.takeThreshold + 0.015, rejectThreshold = base.rejectThreshold - 0.015).sanitized()
-            all += base.copy(learningRate = base.learningRate * 1.20, l2 = base.l2 * 1.35, takeThreshold = base.takeThreshold - 0.015, rejectThreshold = base.rejectThreshold + 0.015).sanitized()
+            all += base.copy(
+                learningRate = base.learningRate * 0.80,
+                l2 = base.l2 * 0.70,
+                takeThreshold = base.takeThreshold + 0.015,
+                rejectThreshold = base.rejectThreshold - 0.015,
+            ).sanitized()
+            all += base.copy(
+                learningRate = base.learningRate * 1.20,
+                l2 = base.l2 * 1.35,
+                takeThreshold = base.takeThreshold - 0.015,
+                rejectThreshold = base.rejectThreshold + 0.015,
+            ).sanitized()
         }
-        return all.distinctBy { "%.6f|%.7f|%.4f|%.4f".format(it.learningRate, it.l2, it.takeThreshold, it.rejectThreshold) }
+        return all.distinctBy { AdaptiveCandidateSearch.signature(it) }
     }
 
     private fun coverage(p: java.util.Properties) = HistoricalCorpusTrainer.Coverage(

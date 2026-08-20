@@ -18,8 +18,10 @@ import kotlin.math.pow
  * Candidate research over the existing leakage-resistant pre-labelled option corpus.
  *
  * The corpus itself already has expiry-ordered train / validation / test splits and
- * future-only 1/3/5/15 minute option labels.  Candidate search uses train + validation;
- * test remains locked until a candidate is validation-robust.  A passing state is
+ * future-only 1/3/5/15 minute option labels. Candidate search uses train + validation;
+ * test remains locked until a candidate is validation-robust. Historical governance
+ * then requires adequate TAKE/REJECT evidence, positive cost-adjusted TAKE return,
+ * Production improvement and non-degenerate engine-proxy coverage. A passing state is
  * returned as Candidate only and must still pass fresh live unseen validation.
  */
 class AimlHistoricalOptionCorpusV1Trainer(
@@ -172,7 +174,6 @@ class AimlHistoricalOptionCorpusV1Trainer(
             return result(index, monthsLabel, meta, hypers.size, best, false, false, null, null, null, "Pre-labelled corpus validation did not produce a robust candidate; locked test remained closed.")
         }
 
-        // Refit only the selected hyperparameters on the full original train split.
         val champion = brainFromBaseline(best.hyperParameters)
         var fullTrain = 0L
         onProgress(HistoricalCorpusTrainer.Progress("PRELABELLED_REFIT", 0, 1, "Best candidate selected · refitting once on all $trainRows train rows"))
@@ -184,7 +185,6 @@ class AimlHistoricalOptionCorpusV1Trainer(
             if (fullTrain % 100_000L == 0L) onProgress(HistoricalCorpusTrainer.Progress("PRELABELLED_REFIT", fullTrain.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), trainRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), "Full-train refit · $fullTrain/$trainRows"))
         }
 
-        // Locked final test: first time the selected champion sees these outcomes.
         val candidateTest = Acc()
         val productionTest = Acc()
         var testUsed = 0L
@@ -199,11 +199,43 @@ class AimlHistoricalOptionCorpusV1Trainer(
         }
         val candidateMetrics = candidateTest.metrics()
         val productionMetrics = productionTest.metrics()
-        val passed = holdoutPass(candidateMetrics, productionMetrics)
+        val coverage = coverage(meta)
+        val corpusSamples = corpusSamples(meta)
+        val governance = HistoricalCandidateGovernance.evaluate(
+            candidate = candidateMetrics,
+            production = productionMetrics,
+            coverage = coverage,
+            corpusSamples = corpusSamples,
+            holdoutOpened = true,
+        )
+        val passed = governance.passed
         val state = if (passed) champion.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW) else null
-        onProgress(HistoricalCorpusTrainer.Progress("COMPLETE", hypers.size, hypers.size, if (passed) "Original locked test PASS · champion ready as Candidate only" else "Original locked test FAIL · Production unchanged"))
-        return result(index, monthsLabel, meta, hypers.size, best, true, passed, candidateMetrics, productionMetrics, state,
-            "aiml-historical-option-row-v1 · original expiry-ordered train/validation/test preserved · 5m option future-return/MFE/MAE labels · conservative stop-first · costs included · historical native D30 unavailable.")
+        onProgress(
+            HistoricalCorpusTrainer.Progress(
+                "COMPLETE",
+                hypers.size,
+                hypers.size,
+                when (governance.status) {
+                    HistoricalCandidateGovernance.Status.PASS -> "Original locked test + governance PASS · champion ready as Candidate only"
+                    HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "Original locked test governance INSUFFICIENT DATA · ${governance.reasons.firstOrNull().orEmpty()}"
+                    HistoricalCandidateGovernance.Status.FAIL -> "Original locked test governance FAIL · ${governance.reasons.firstOrNull().orEmpty()}"
+                    HistoricalCandidateGovernance.Status.CLOSED -> "Original locked test stayed closed"
+                },
+            ),
+        )
+        return result(
+            index,
+            monthsLabel,
+            meta,
+            hypers.size,
+            best,
+            true,
+            passed,
+            candidateMetrics,
+            productionMetrics,
+            state,
+            "aiml-historical-option-row-v1 · original expiry-ordered train/validation/test preserved · 5m option future-return/MFE/MAE labels · conservative stop-first · costs included · historical native D30 unavailable · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}.",
+        )
     }
 
     private fun sample(r: AimlHistoricalOptionCorpusV1Store.Record): Sample {
@@ -268,15 +300,6 @@ class AimlHistoricalOptionCorpusV1Trainer(
         return accuracyGain + brierGain + 0.18 * takeBonus + 0.10 * rejectBonus + 0.20 * candidate.takeAverageNetReturn
     }
 
-    private fun holdoutPass(candidate: HistoricalCorpusTrainer.Metrics, production: HistoricalCorpusTrainer.Metrics): Boolean {
-        if (candidate.labels < 1_000) return false
-        val qualityGain = candidate.accuracy - production.accuracy >= 0.005 || production.brier - candidate.brier >= 0.002
-        if (!qualityGain) return false
-        if (candidate.takeSamples >= 100 && candidate.takePrecision < 0.52) return false
-        if (candidate.rejectSamples >= 100 && candidate.rejectPrecision < 0.52) return false
-        return true
-    }
-
     private fun brainFromBaseline(hyper: NumericalMetaBrain.HyperParameters): NumericalMetaBrain = NumericalMetaBrain().apply {
         restore(productionBaseline.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = hyper.sanitized()))
     }
@@ -290,6 +313,21 @@ class AimlHistoricalOptionCorpusV1Trainer(
         }
         return all.distinctBy { "%.6f|%.7f|%.4f|%.4f".format(it.learningRate, it.l2, it.takeThreshold, it.rejectThreshold) }
     }
+
+    private fun coverage(p: java.util.Properties) = HistoricalCorpusTrainer.Coverage(
+        ceSamples = p.longToInt("ceRows"),
+        peSamples = p.longToInt("peRows"),
+        engine1Samples = p.longToInt("e1Rows"),
+        engine2Samples = p.longToInt("e2Rows"),
+        engine3Samples = p.longToInt("e3Rows"),
+        nativeDepthSamples = 0,
+    )
+
+    private fun corpusSamples(p: java.util.Properties): Int =
+        (p.getProperty("accepted")?.toLongOrNull() ?: 0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+
+    private fun java.util.Properties.longToInt(key: String): Int =
+        (getProperty(key)?.toLongOrNull() ?: 0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
     private fun result(
         index: MarketIndex,
@@ -313,15 +351,8 @@ class AimlHistoricalOptionCorpusV1Trainer(
             toDate = to,
             expiries = p.getProperty("expiries")?.toIntOrNull() ?: 0,
             contractsDownloaded = p.getProperty("contracts")?.toIntOrNull() ?: 0,
-            corpusSamples = (p.getProperty("accepted")?.toLongOrNull() ?: 0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-            coverage = HistoricalCorpusTrainer.Coverage(
-                ceSamples = (p.getProperty("ceRows")?.toLongOrNull() ?: 0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                peSamples = (p.getProperty("peRows")?.toLongOrNull() ?: 0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                engine1Samples = (p.getProperty("e1Rows")?.toLongOrNull() ?: 0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                engine2Samples = (p.getProperty("e2Rows")?.toLongOrNull() ?: 0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                engine3Samples = (p.getProperty("e3Rows")?.toLongOrNull() ?: 0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                nativeDepthSamples = 0,
-            ),
+            corpusSamples = corpusSamples(p),
+            coverage = coverage(p),
             averageMfeReturn = p.getProperty("avgMfe5")?.toDoubleOrNull() ?: 0.0,
             averageMaeReturn = p.getProperty("avgMae5")?.toDoubleOrNull() ?: 0.0,
             averageNetReturn = p.getProperty("avgNet5")?.toDoubleOrNull() ?: 0.0,

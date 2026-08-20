@@ -1,7 +1,6 @@
 package com.parmod.ema.training
 
 import com.parmod.ema.backtest.UpstoxPlusHistoricalClient
-import com.parmod.ema.engine.AdaptiveCandidateSearch
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.engine.NumericalMetaBrain
 import com.parmod.ema.engine.SignalEngineV2
@@ -160,9 +159,9 @@ class HistoricalSeriesTrainer(
         val holdout = corpus.subList(developmentEnd, corpus.size)
         val seedHypers = candidateHyperParameters()
         val evaluations = ArrayList<HistoricalCorpusTrainer.CandidateEvaluation>()
-        val seen = seedHypers.mapTo(linkedSetOf()) { AdaptiveCandidateSearch.signature(it) }
+        val seen = seedHypers.mapTo(linkedSetOf()) { HistoricalAdaptiveCandidateSearch.signature(it) }
 
-        fun evaluateBatch(hypers: List<NumericalMetaBrain.HyperParameters>, generation: Int) {
+        fun evaluateBatch(hypers: List<NumericalMetaBrain.HyperParameters>, generation: Int, guidance: HistoricalAdaptiveCandidateSearch.Guidance?) {
             hypers.forEachIndexed { i, hyper ->
                 if (shouldCancel()) error("Training cancelled")
                 val stage = if (generation == 0) "WALK_FORWARD" else "HISTORICAL_ADAPT_G$generation"
@@ -174,7 +173,7 @@ class HistoricalSeriesTrainer(
                         if (generation == 0) {
                             "$sourceLabel · seed Candidate ${i + 1}/${hypers.size} · chronological folds"
                         } else {
-                            "$sourceLabel · Adaptive G$generation Candidate ${i + 1}/${hypers.size} · development only · locked holdout untouched"
+                            "$sourceLabel · Adaptive G$generation ${guidance?.name ?: "BALANCED"} · Candidate ${i + 1}/${hypers.size} · development only · holdout untouched"
                         },
                     ),
                 )
@@ -182,8 +181,8 @@ class HistoricalSeriesTrainer(
             }
         }
 
-        evaluateBatch(seedHypers, 0)
-        var best = evaluations.maxByOrNull { it.score }
+        evaluateBatch(seedHypers, 0, null)
+        var best = HistoricalAdaptiveCandidateSearch.selectBest(evaluations)
         var developmentGovernance = best?.let {
             HistoricalCandidateGovernance.evaluateDevelopment(it.candidate, it.production, coverage, corpus.size)
         } ?: HistoricalCandidateGovernance.Decision(HistoricalCandidateGovernance.Status.CLOSED, listOf("No development Candidate"))
@@ -195,21 +194,23 @@ class HistoricalSeriesTrainer(
         ) {
             val parent = best ?: break
             adaptiveGenerations++
+            val guidance = HistoricalAdaptiveCandidateSearch.guidance(parent)
             val batch = HistoricalAdaptiveCandidateSearch.nextBatch(
                 parent = parent.hyperParameters,
                 generation = adaptiveGenerations,
                 seenSignatures = seen,
+                guidance = guidance,
             )
             onProgress(
                 HistoricalCorpusTrainer.Progress(
                     "HISTORICAL_EVOLVE",
                     adaptiveGenerations,
                     HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
-                    "$sourceLabel · evolving G$adaptiveGenerations around best development score ${"%.4f".format(parent.score)} · Production frozen",
+                    "$sourceLabel · G$adaptiveGenerations guidance ${guidance.name} · parent TAKE ${parent.candidate.takeSamples}/${HistoricalCandidateGovernance.requiredActionSamples(parent.candidate.labels)} · TAKE net ${"%+.2f%%".format(parent.candidate.takeAverageNetReturn * 100.0)} · Production frozen",
                 ),
             )
-            evaluateBatch(batch.candidates, adaptiveGenerations)
-            best = evaluations.maxByOrNull { it.score }
+            evaluateBatch(batch.candidates, adaptiveGenerations, guidance)
+            best = HistoricalAdaptiveCandidateSearch.selectBest(evaluations)
             developmentGovernance = best?.let {
                 HistoricalCandidateGovernance.evaluateDevelopment(it.candidate, it.production, coverage, corpus.size)
             } ?: developmentGovernance
@@ -261,13 +262,13 @@ class HistoricalSeriesTrainer(
                     championState != null -> "$sourceLabel historical adaptive search PASS after G$adaptiveGenerations · ready for fresh live validation"
                     governance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel locked holdout INSUFFICIENT DATA · search stopped; holdout is not reused"
                     holdoutOpened -> "$sourceLabel locked holdout FAIL · search stopped; holdout is not reused for tuning"
-                    developmentGovernance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel adaptive historical search exhausted G$adaptiveGenerations · development evidence insufficient · holdout stayed closed"
+                    developmentGovernance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel adaptive search exhausted G$adaptiveGenerations · action/evidence target not reached · holdout stayed closed"
                     else -> "$sourceLabel adaptive historical search exhausted G$adaptiveGenerations · no development-qualified Candidate · holdout stayed closed"
                 },
             ),
         )
 
-        val devNote = "Historical adaptive search: ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations; evolution used development/walk-forward only"
+        val devNote = "Historical adaptive search: ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations; action-aware parent ranking; evolution used development/walk-forward only"
         val governanceNote = when {
             holdoutOpened -> "Locked governance ${governance.label}: ${governance.reasons.joinToString("; ")}"
             else -> "Development gate ${developmentGovernance.label}: ${developmentGovernance.reasons.joinToString("; ")}"
@@ -398,9 +399,15 @@ class HistoricalSeriesTrainer(
     private fun foldScore(candidate: HistoricalCorpusTrainer.Metrics, production: HistoricalCorpusTrainer.Metrics): Double {
         val accuracyGain = candidate.accuracy - production.accuracy
         val brierGain = production.brier - candidate.brier
-        val takeBonus = if (candidate.takeSamples >= 10) candidate.takePrecision - 0.50 else -0.03
-        val rejectBonus = if (candidate.rejectSamples >= 10) candidate.rejectPrecision - 0.50 else -0.02
-        return accuracyGain + brierGain + 0.18 * takeBonus + 0.10 * rejectBonus + 0.20 * candidate.takeAverageNetReturn
+        val requiredTake = HistoricalCandidateGovernance.requiredActionSamples(candidate.labels).coerceAtLeast(1L)
+        val requiredReject = HistoricalCandidateGovernance.requiredActionSamples(candidate.labels).coerceAtLeast(1L)
+        val takeCoverage = (candidate.takeSamples.toDouble() / requiredTake).coerceIn(0.0, 1.0)
+        val rejectCoverage = (candidate.rejectSamples.toDouble() / requiredReject).coerceIn(0.0, 1.0)
+        val takeBonus = if (candidate.takeSamples > 0) candidate.takePrecision - 0.50 else -0.50
+        val rejectBonus = if (candidate.rejectSamples > 0) candidate.rejectPrecision - 0.50 else -0.25
+        val actionCoverage = 0.18 * takeCoverage + 0.05 * rejectCoverage
+        val starvationPenalty = 0.45 * (1.0 - takeCoverage) + 0.10 * (1.0 - rejectCoverage)
+        return accuracyGain + brierGain + 0.22 * takeBonus + 0.10 * rejectBonus + 0.35 * candidate.takeAverageNetReturn + actionCoverage - starvationPenalty
     }
 
     private fun learn(brain: NumericalMetaBrain, samples: List<Sample>) = samples.forEach { brain.learn(it.features, it.success, it.weight) }
@@ -409,27 +416,27 @@ class HistoricalSeriesTrainer(
         Accumulator().also { stats -> samples.forEach { stats.add(brain.predict(it.features), it) } }
 
     private fun brainFromBaseline(hyper: NumericalMetaBrain.HyperParameters): NumericalMetaBrain = NumericalMetaBrain().apply {
-        restore(productionBaseline.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = hyper.sanitized()))
+        restore(productionBaseline.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = HistoricalAdaptiveCandidateSearch.bounded(hyper)))
     }
 
     private fun candidateHyperParameters(): List<NumericalMetaBrain.HyperParameters> {
         val all = ArrayList<NumericalMetaBrain.HyperParameters>()
-        MetaBrainRuntime.CandidateProfile.entries.map { it.hyper.sanitized() }.forEach { base ->
+        MetaBrainRuntime.CandidateProfile.entries.map { HistoricalAdaptiveCandidateSearch.bounded(it.hyper) }.forEach { base ->
             all += base
-            all += base.copy(
+            all += HistoricalAdaptiveCandidateSearch.bounded(base.copy(
                 learningRate = base.learningRate * 0.80,
                 l2 = base.l2 * 0.70,
                 takeThreshold = base.takeThreshold + 0.015,
                 rejectThreshold = base.rejectThreshold - 0.015,
-            ).sanitized()
-            all += base.copy(
+            ))
+            all += HistoricalAdaptiveCandidateSearch.bounded(base.copy(
                 learningRate = base.learningRate * 1.20,
                 l2 = base.l2 * 1.35,
                 takeThreshold = base.takeThreshold - 0.015,
                 rejectThreshold = base.rejectThreshold + 0.015,
-            ).sanitized()
+            ))
         }
-        return all.distinctBy { AdaptiveCandidateSearch.signature(it) }
+        return all.distinctBy { HistoricalAdaptiveCandidateSearch.signature(it) }
     }
 
     private fun historicalEngineProxy(e: SignalEngineV2.Evaluation, oiImpulse: Double): EngineId = when {

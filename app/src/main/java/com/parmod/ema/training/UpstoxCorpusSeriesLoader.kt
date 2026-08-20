@@ -77,13 +77,20 @@ class UpstoxCorpusSeriesLoader(private val client: UpstoxPlusHistoricalClient) {
 object HistoricalSeriesMerger {
     fun merge(series: List<HistoricalOptionSeries>): List<HistoricalOptionSeries> =
         series.groupBy { it.key }.map { (_, group) ->
-            val preferred = group.maxByOrNull { if (it.source == "UPSTOX_PLUS") 2 else 1 } ?: group.first()
-            val candles = group.flatMap { it.candles }
+            val ordered = group.sortedByDescending { sourcePriority(it.source) }
+            val preferred = ordered.first()
+            val candles = ordered.flatMap { it.candles }
                 .sortedBy { it.time.toInstant().toEpochMilli() }
                 .distinctBy { it.time.toInstant().toEpochMilli() }
             preferred.copy(
-                source = group.map { it.source }.distinct().joinToString("+"),
+                source = ordered.map { it.source }.distinct().joinToString("+"),
                 candles = candles,
             )
         }.sortedWith(compareBy<HistoricalOptionSeries> { it.expiry }.thenBy { it.strike }.thenBy { it.optionType })
+
+    private fun sourcePriority(source: String): Int = when {
+        source.contains("UPSTOX_PLUS") -> 3
+        source.contains("LOCAL_IMPORT") -> 2
+        else -> 1
+    }
 }

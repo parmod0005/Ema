@@ -171,6 +171,10 @@ class HistoricalSeriesTrainer(
         var holdoutCandidate: HistoricalCorpusTrainer.Metrics? = null
         var holdoutProduction: HistoricalCorpusTrainer.Metrics? = null
         var championState: NumericalMetaBrain.ModelState? = null
+        var governance = HistoricalCandidateGovernance.Decision(
+            HistoricalCandidateGovernance.Status.CLOSED,
+            listOf("Locked holdout was not opened"),
+        )
 
         if (robust && best != null) {
             holdoutOpened = true
@@ -180,16 +184,29 @@ class HistoricalSeriesTrainer(
             val production = brainFromBaseline(productionBaseline.hyperParameters)
             holdoutCandidate = evaluate(champion, holdout).metrics()
             holdoutProduction = evaluate(production, holdout).metrics()
-            holdoutPassed = holdoutPass(holdoutCandidate, holdoutProduction)
+            governance = HistoricalCandidateGovernance.evaluate(
+                candidate = holdoutCandidate,
+                production = holdoutProduction,
+                coverage = coverage,
+                corpusSamples = corpus.size,
+                holdoutOpened = true,
+            )
+            holdoutPassed = governance.passed
             if (holdoutPassed) championState = champion.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW)
         }
 
         onProgress(HistoricalCorpusTrainer.Progress("COMPLETE", hypers.size, hypers.size, when {
-            championState != null -> "$sourceLabel champion passed locked holdout · ready for fresh live validation"
-            holdoutOpened -> "$sourceLabel locked holdout failed · Production unchanged"
+            championState != null -> "$sourceLabel historical governance PASS · ready for fresh live validation"
+            governance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel historical governance INSUFFICIENT DATA · ${governance.reasons.firstOrNull().orEmpty()}"
+            holdoutOpened -> "$sourceLabel historical governance FAIL · ${governance.reasons.firstOrNull().orEmpty()}"
             else -> "$sourceLabel produced no robust candidate · locked holdout stayed closed"
         }))
 
+        val governanceNote = if (holdoutOpened) {
+            " · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}"
+        } else {
+            ""
+        }
         return HistoricalCorpusTrainer.Result(
             index = index,
             months = config.months,
@@ -210,7 +227,7 @@ class HistoricalSeriesTrainer(
             holdoutProduction = holdoutProduction,
             championState = championState,
             errors = errors,
-            note = "$sourceLabel · actual option-premium MFE/MAE · next-bar entry · chronological walk-forward · locked holdout · unavailable historical D30/depth stays zero.",
+            note = "$sourceLabel · actual option-premium MFE/MAE · next-bar entry · chronological walk-forward · locked holdout · unavailable historical D30/depth stays zero$governanceNote.",
         )
     }
 
@@ -315,15 +332,6 @@ class HistoricalSeriesTrainer(
         val takeBonus = if (candidate.takeSamples >= 10) candidate.takePrecision - 0.50 else -0.03
         val rejectBonus = if (candidate.rejectSamples >= 10) candidate.rejectPrecision - 0.50 else -0.02
         return accuracyGain + brierGain + 0.18 * takeBonus + 0.10 * rejectBonus + 0.20 * candidate.takeAverageNetReturn
-    }
-
-    private fun holdoutPass(candidate: HistoricalCorpusTrainer.Metrics, production: HistoricalCorpusTrainer.Metrics): Boolean {
-        if (candidate.labels < 30) return false
-        val qualityGain = candidate.accuracy - production.accuracy >= 0.005 || production.brier - candidate.brier >= 0.002
-        if (!qualityGain) return false
-        if (candidate.takeSamples >= 10 && candidate.takePrecision < 0.52) return false
-        if (candidate.rejectSamples >= 10 && candidate.rejectPrecision < 0.52) return false
-        return true
     }
 
     private fun learn(brain: NumericalMetaBrain, samples: List<Sample>) = samples.forEach { brain.learn(it.features, it.success, it.weight) }

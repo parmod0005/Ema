@@ -30,12 +30,7 @@
         <activity
             android:name=".MetaBrainLabActivity"
             android:exported="true"
-            android:label="VARDHANI AI LAB">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:label="VARDHANI AI LAB" />
         <activity
             android:name=".MainActivity"
             android:exported="true">

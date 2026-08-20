@@ -6,11 +6,13 @@ import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
 import android.graphics.drawable.Icon
 import android.os.Build
+import com.parmod.ema.engine.MetaBrainPrefsMigration
 import com.parmod.ema.engine.MetaBrainRuntime
 
 class VardhaniApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        MetaBrainPrefsMigration.migrateV2ToV3IfNeeded(this)
         MetaBrainRuntime.initialize(this)
         publishAiLabShortcut()
     }

@@ -10,7 +10,7 @@ import com.parmod.ema.model.TrendDirection
 import kotlin.math.max
 import kotlin.math.pow
 
-/** Persistent on-device Numerical Meta Brain runtime with adaptive candidate experimentation. */
+/** Persistent on-device Numerical Meta Brain runtime with historical + live adaptive Candidate research. */
 object MetaBrainRuntime {
     private const val HISTORICAL_PRIOR_SAMPLES = 71L
     private const val HISTORICAL_PRIOR_BIAS = 0.2001902471
@@ -102,6 +102,7 @@ object MetaBrainRuntime {
         val candidateAdaptive: Boolean,
         val candidateGeneration: Int,
         val bestArchivedScore: Double?,
+        val candidateOrigin: String,
     )
 
     private data class Pending(
@@ -128,6 +129,7 @@ object MetaBrainRuntime {
     private var activeAdaptive = false
     private var activeAdaptiveGeneration = 0
     private var nextMutationIndex = 0
+    private var candidateOrigin = ""
     private var autoSearchEnabled = false
     private var appContext: Context? = null
     private var initialized = false
@@ -165,10 +167,9 @@ object MetaBrainRuntime {
         activeAdaptive = prefs.getBoolean(KEY_ACTIVE_ADAPTIVE, false)
         activeAdaptiveGeneration = prefs.getInt(KEY_ACTIVE_GENERATION, 0).coerceAtLeast(0)
         nextMutationIndex = prefs.getInt(KEY_MUTATION_CURSOR, 0).coerceAtLeast(0)
-        activeHyper = readHyper(prefs.getString(KEY_ACTIVE_HYPER, null))
-            ?: candidate.snapshot().hyperParameters
-            ?: activeProfile.hyper
+        activeHyper = readHyper(prefs.getString(KEY_ACTIVE_HYPER, null)) ?: candidate.snapshot().hyperParameters
         activeHyper = AdaptiveCandidateSearch.bounded(activeHyper)
+        candidateOrigin = prefs.getString(KEY_CANDIDATE_ORIGIN, "").orEmpty()
         autoSearchEnabled = prefs.getBoolean(KEY_AUTO_SEARCH, false)
         candidateHistory.clear()
         candidateHistory.addAll(readHistory(prefs.getString(KEY_HISTORY, null)))
@@ -207,8 +208,7 @@ object MetaBrainRuntime {
                     else -> directional >= TIMEOUT_SUCCESS_RETURN
                 }
                 scoreUnseenLabel(p.productionPrediction, p.candidatePrediction, success)
-                val weight = if (successBarrier || failureBarrier) 1.25 else 0.75
-                candidate.learn(p.features, success, weight)
+                candidate.learn(p.features, success, if (successBarrier || failureBarrier) 1.25 else 0.75)
                 labelsSinceSave++
                 iterator.remove()
                 if (labelsSinceSave >= AUTO_SAVE_EVERY_LABELS) saveLocked()
@@ -274,12 +274,8 @@ object MetaBrainRuntime {
         val prodPrediction = production.predict(features)
         val candPrediction = candidate.predict(features)
         statusByEngine[engine] = Status(
-            engine,
-            candPrediction.confidence,
-            candPrediction.decision,
-            candPrediction.samplesLearned,
-            candPrediction.modelVersion,
-            timestamp,
+            engine, candPrediction.confidence, candPrediction.decision,
+            candPrediction.samplesLearned, candPrediction.modelVersion, timestamp,
         )
 
         if (raw.confidence >= CANDIDATE_CONFIDENCE && spot > 0.0) {
@@ -287,14 +283,7 @@ object MetaBrainRuntime {
             val last = lastRegistered[dedupeKey] ?: 0L
             if (timestamp - last >= CANDIDATE_DEDUPE_MS) {
                 lastRegistered[dedupeKey] = timestamp
-                pending["$dedupeKey:$timestamp"] = Pending(
-                    features,
-                    prodPrediction,
-                    candPrediction,
-                    side,
-                    spot,
-                    timestamp,
-                )
+                pending["$dedupeKey:$timestamp"] = Pending(features, prodPrediction, candPrediction, side, spot, timestamp)
                 while (pending.size > MAX_PENDING) pending.remove(pending.keys.first())
             }
         }
@@ -304,9 +293,7 @@ object MetaBrainRuntime {
             reasons = (raw.reasons + metaReason).takeLast(10),
             setup = "${raw.setup} · AI ${candPrediction.confidence}%",
         )
-        val productionReject = gateEnabled &&
-            raw.confidence >= CANDIDATE_CONFIDENCE &&
-            prodPrediction.decision == NumericalMetaBrain.Decision.REJECT
+        val productionReject = gateEnabled && raw.confidence >= CANDIDATE_CONFIDENCE && prodPrediction.decision == NumericalMetaBrain.Decision.REJECT
         if (productionReject) {
             decorated = decorated.copy(
                 action = SignalAction.WAIT,
@@ -324,36 +311,54 @@ object MetaBrainRuntime {
 
     @Synchronized fun status(engine: EngineId): Status? = statusByEngine[engine]
     @Synchronized fun availableProfiles(): List<CandidateProfile> = CandidateProfile.entries.toList()
+    @Synchronized fun productionSnapshotForResearch(): NumericalMetaBrain.ModelState = production.snapshot()
+
+    @Synchronized
+    fun installHistoricalCandidate(state: NumericalMetaBrain.ModelState, label: String): Pair<Boolean, String> {
+        if (state.weights.size != NumericalMetaBrain.FEATURE_COUNT) return false to "Historical model feature count mismatch"
+        activeHyper = AdaptiveCandidateSearch.bounded(state.hyperParameters)
+        activeAdaptive = false
+        activeAdaptiveGeneration = 0
+        candidateOrigin = label.trim().take(96).ifBlank { "Historical WF Champion" }
+        candidate.restore(state.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = activeHyper))
+        validation = ValidationStats()
+        pending.clear()
+        lastRegistered.clear()
+        labelsSinceSave = 0
+        autoSearchEnabled = false
+        saveLocked()
+        return true to "$candidateOrigin installed as Candidate only · collect fresh live unseen labels before promotion"
+    }
 
     @Synchronized
     fun report(): LabReport {
         val (eligible, reason) = promotionEligibility()
         val ps = production.snapshot()
         val cs = candidate.snapshot()
-        val bestScore = robustParent()?.score
         return LabReport(
-            initialized,
-            appContext != null,
-            gateEnabled,
-            autoSearchEnabled,
-            ps.modelVersion,
-            cs.modelVersion,
-            ps.samplesLearned,
-            cs.samplesLearned,
-            activeProfile,
-            cs.hyperParameters,
-            pending.size,
-            validation,
-            eligible,
-            reason,
-            lastSavedAt,
-            lastPromotedAt,
-            rollbackState != null,
-            candidateHistory.sortedByDescending { it.score }.take(MAX_HISTORY),
-            candidateName(),
-            activeAdaptive,
-            activeAdaptiveGeneration,
-            bestScore,
+            initialized = initialized,
+            persistent = appContext != null,
+            gateEnabled = gateEnabled,
+            autoSearchEnabled = autoSearchEnabled,
+            productionVersion = ps.modelVersion,
+            candidateVersion = cs.modelVersion,
+            productionSamples = ps.samplesLearned,
+            candidateSamples = cs.samplesLearned,
+            candidateProfile = activeProfile,
+            candidateHyperParameters = cs.hyperParameters,
+            pendingLabels = pending.size,
+            validation = validation,
+            eligibleForPromotion = eligible,
+            promotionReason = reason,
+            lastSavedAt = lastSavedAt,
+            lastPromotedAt = lastPromotedAt,
+            rollbackAvailable = rollbackState != null,
+            candidateHistory = candidateHistory.sortedByDescending { it.score }.take(MAX_HISTORY),
+            candidateName = candidateName(),
+            candidateAdaptive = activeAdaptive,
+            candidateGeneration = activeAdaptiveGeneration,
+            bestArchivedScore = robustParent()?.score,
+            candidateOrigin = candidateOrigin,
         )
     }
 
@@ -377,6 +382,7 @@ object MetaBrainRuntime {
         activeHyper = AdaptiveCandidateSearch.bounded(profile.hyper)
         activeAdaptive = false
         activeAdaptiveGeneration = 0
+        candidateOrigin = ""
         resetCandidateFromProduction(activeHyper)
         saveLocked()
         return true to "Started ${profile.title} seed candidate from frozen production baseline"
@@ -389,11 +395,11 @@ object MetaBrainRuntime {
         return startCandidate(next, archiveCurrent = true)
     }
 
-    @Synchronized
-    fun evolveBestCandidate(): Pair<Boolean, String> = startAdaptiveCandidate(archiveCurrent = true)
+    @Synchronized fun evolveBestCandidate(): Pair<Boolean, String> = startAdaptiveCandidate(archiveCurrent = true)
 
     @Synchronized
     fun resetCandidateLearning() {
+        candidateOrigin = ""
         resetCandidateFromProduction(activeHyper)
         saveLocked()
     }
@@ -406,11 +412,12 @@ object MetaBrainRuntime {
 
     private fun resetCandidateFromProduction(hyper: NumericalMetaBrain.HyperParameters) {
         activeHyper = AdaptiveCandidateSearch.bounded(hyper)
-        val base = production.snapshot().copy(
-            mode = NumericalMetaBrain.Mode.SHADOW,
-            hyperParameters = activeHyper,
+        candidate.restore(
+            production.snapshot().copy(
+                mode = NumericalMetaBrain.Mode.SHADOW,
+                hyperParameters = activeHyper,
+            ),
         )
-        candidate.restore(base)
         validation = ValidationStats()
         pending.clear()
         lastRegistered.clear()
@@ -419,27 +426,20 @@ object MetaBrainRuntime {
 
     private fun startAdaptiveCandidate(archiveCurrent: Boolean): Pair<Boolean, String> {
         if (archiveCurrent && validation.labels > 0) archiveCurrentCandidate()
-
         val parent = robustParent()
         val parentHyper = parent?.hyperParameters ?: activeHyper
         val parentProfile = parent?.profile ?: activeProfile
         val nextGeneration = ((parent?.adaptiveGeneration ?: activeAdaptiveGeneration) + 1).coerceAtLeast(1)
         val seen = candidateHistory.map { AdaptiveCandidateSearch.signature(it.hyperParameters) }.toSet()
-        val generated = AdaptiveCandidateSearch.next(
-            parent = parentHyper,
-            generation = nextGeneration,
-            startMutationIndex = nextMutationIndex,
-            seenSignatures = seen,
-        )
-
+        val generated = AdaptiveCandidateSearch.next(parentHyper, nextGeneration, nextMutationIndex, seen)
         activeProfile = parentProfile
         activeHyper = generated.hyperParameters
         activeAdaptive = true
         activeAdaptiveGeneration = generated.generation
         nextMutationIndex = generated.mutationIndex + 1
+        candidateOrigin = ""
         resetCandidateFromProduction(activeHyper)
         saveLocked()
-
         val source = parent?.displayName ?: "${parentProfile.title} seed"
         return true to "Started ${candidateName()} around best parent $source · Production remains frozen"
     }
@@ -449,8 +449,11 @@ object MetaBrainRuntime {
         return (validated.ifEmpty { candidateHistory }).maxByOrNull { it.score }
     }
 
-    private fun candidateName(): String =
-        if (activeAdaptive) "Adaptive G$activeAdaptiveGeneration · ${activeProfile.title}" else activeProfile.title
+    private fun candidateName(): String = when {
+        candidateOrigin.isNotBlank() -> candidateOrigin
+        activeAdaptive -> "Adaptive G$activeAdaptiveGeneration · ${activeProfile.title}"
+        else -> activeProfile.title
+    }
 
     private fun archiveCurrentCandidate() {
         if (validation.labels <= 0) return
@@ -484,9 +487,9 @@ object MetaBrainRuntime {
         if (eligible) {
             autoSearchEnabled = false
             saveLocked()
-            return
+        } else {
+            startAdaptiveCandidate(archiveCurrent = true)
         }
-        startAdaptiveCandidate(archiveCurrent = true)
     }
 
     @Synchronized
@@ -495,11 +498,7 @@ object MetaBrainRuntime {
         if (!eligible) return false to reason
         archiveCurrentCandidate()
         rollbackState = production.snapshot()
-        production.restore(
-            candidate.snapshot().copy(
-                mode = if (gateEnabled) NumericalMetaBrain.Mode.GATE else NumericalMetaBrain.Mode.SHADOW,
-            ),
-        )
+        production.restore(candidate.snapshot().copy(mode = if (gateEnabled) NumericalMetaBrain.Mode.GATE else NumericalMetaBrain.Mode.SHADOW))
         lastPromotedAt = System.currentTimeMillis()
         validation = ValidationStats()
         pending.clear()
@@ -513,14 +512,9 @@ object MetaBrainRuntime {
     fun rollbackProduction(): Boolean {
         val rollback = rollbackState ?: return false
         production.restore(rollback.copy(mode = NumericalMetaBrain.Mode.SHADOW))
-        candidate.restore(
-            production.snapshot().copy(
-                mode = NumericalMetaBrain.Mode.SHADOW,
-                hyperParameters = activeHyper,
-            ),
-        )
+        candidateOrigin = ""
+        resetCandidateFromProduction(activeHyper)
         rollbackState = null
-        validation = ValidationStats()
         gateEnabled = false
         production.setMode(NumericalMetaBrain.Mode.SHADOW)
         saveLocked()
@@ -542,9 +536,7 @@ object MetaBrainRuntime {
     }
 
     private fun promotionEligibility(): Pair<Boolean, String> {
-        if (validation.labels < MIN_VALIDATION_LABELS) {
-            return false to "Need ${MIN_VALIDATION_LABELS - validation.labels} more unseen labels"
-        }
+        if (validation.labels < MIN_VALIDATION_LABELS) return false to "Need ${MIN_VALIDATION_LABELS - validation.labels} more unseen labels"
         val accuracyGain = validation.candidateAccuracy - validation.productionAccuracy
         val brierGain = validation.productionBrier - validation.candidateBrier
         if (accuracyGain < MIN_ACCURACY_GAIN && brierGain < MIN_BRIER_GAIN) {
@@ -571,6 +563,7 @@ object MetaBrainRuntime {
             .putBoolean(KEY_ACTIVE_ADAPTIVE, activeAdaptive)
             .putInt(KEY_ACTIVE_GENERATION, activeAdaptiveGeneration)
             .putInt(KEY_MUTATION_CURSOR, nextMutationIndex)
+            .putString(KEY_CANDIDATE_ORIGIN, candidateOrigin)
             .putString(KEY_HISTORY, writeHistory(candidateHistory))
             .putBoolean(KEY_AUTO_SEARCH, autoSearchEnabled)
             .putBoolean(KEY_GATE, gateEnabled)
@@ -594,14 +587,9 @@ object MetaBrainRuntime {
     private fun prefs() = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     private fun writeModel(s: NumericalMetaBrain.ModelState): String = listOf(
-        s.bias,
-        s.samplesLearned,
-        s.modelVersion,
-        s.mode.name,
-        s.hyperParameters.learningRate,
-        s.hyperParameters.l2,
-        s.hyperParameters.takeThreshold,
-        s.hyperParameters.rejectThreshold,
+        s.bias, s.samplesLearned, s.modelVersion, s.mode.name,
+        s.hyperParameters.learningRate, s.hyperParameters.l2,
+        s.hyperParameters.takeThreshold, s.hyperParameters.rejectThreshold,
         s.weights.joinToString(","),
     ).joinToString("|")
 
@@ -613,16 +601,13 @@ object MetaBrainRuntime {
                 val weights = p[8].split(',').map(String::toDouble).toDoubleArray()
                 if (weights.size != NumericalMetaBrain.FEATURE_COUNT) return null
                 NumericalMetaBrain.ModelState(
-                    weights,
-                    p[0].toDouble(),
-                    p[1].toLong(),
-                    p[2].toLong(),
-                    NumericalMetaBrain.Mode.valueOf(p[3]),
-                    NumericalMetaBrain.HyperParameters(
-                        p[4].toDouble(),
-                        p[5].toDouble(),
-                        p[6].toDouble(),
-                        p[7].toDouble(),
+                    weights = weights,
+                    bias = p[0].toDouble(),
+                    samplesLearned = p[1].toLong(),
+                    modelVersion = p[2].toLong(),
+                    mode = NumericalMetaBrain.Mode.valueOf(p[3]),
+                    hyperParameters = NumericalMetaBrain.HyperParameters(
+                        p[4].toDouble(), p[5].toDouble(), p[6].toDouble(), p[7].toDouble(),
                     ),
                 )
             } else {
@@ -630,22 +615,15 @@ object MetaBrainRuntime {
                 val weights = old[4].split(',').map(String::toDouble).toDoubleArray()
                 if (weights.size != NumericalMetaBrain.FEATURE_COUNT) return null
                 NumericalMetaBrain.ModelState(
-                    weights,
-                    old[0].toDouble(),
-                    old[1].toLong(),
-                    old[2].toLong(),
+                    weights, old[0].toDouble(), old[1].toLong(), old[2].toLong(),
                     NumericalMetaBrain.Mode.valueOf(old[3]),
                 )
             }
         }.getOrNull()
     }
 
-    private fun writeHyper(h: NumericalMetaBrain.HyperParameters): String = listOf(
-        h.learningRate,
-        h.l2,
-        h.takeThreshold,
-        h.rejectThreshold,
-    ).joinToString(",")
+    private fun writeHyper(h: NumericalMetaBrain.HyperParameters): String =
+        listOf(h.learningRate, h.l2, h.takeThreshold, h.rejectThreshold).joinToString(",")
 
     private fun readHyper(raw: String?): NumericalMetaBrain.HyperParameters? {
         if (raw.isNullOrBlank()) return null
@@ -653,12 +631,7 @@ object MetaBrainRuntime {
             val p = raw.split(',')
             if (p.size != 4) return null
             AdaptiveCandidateSearch.bounded(
-                NumericalMetaBrain.HyperParameters(
-                    p[0].toDouble(),
-                    p[1].toDouble(),
-                    p[2].toDouble(),
-                    p[3].toDouble(),
-                ),
+                NumericalMetaBrain.HyperParameters(p[0].toDouble(), p[1].toDouble(), p[2].toDouble(), p[3].toDouble()),
             )
         }.getOrNull()
     }
@@ -666,23 +639,12 @@ object MetaBrainRuntime {
     private fun writeHistory(items: List<CandidateResult>): String =
         items.takeLast(MAX_HISTORY).joinToString(";") { r ->
             listOf(
-                r.finishedAt,
-                r.profile.name,
-                r.labels,
-                r.candidateAccuracy,
-                r.productionAccuracy,
-                r.candidateBrier,
-                r.productionBrier,
-                r.takePrecision,
-                r.rejectPrecision,
-                r.passed,
-                r.score,
-                r.hyperParameters.learningRate,
-                r.hyperParameters.l2,
-                r.hyperParameters.takeThreshold,
-                r.hyperParameters.rejectThreshold,
-                r.adaptiveGeneration,
-                r.adaptive,
+                r.finishedAt, r.profile.name, r.labels,
+                r.candidateAccuracy, r.productionAccuracy, r.candidateBrier, r.productionBrier,
+                r.takePrecision, r.rejectPrecision, r.passed, r.score,
+                r.hyperParameters.learningRate, r.hyperParameters.l2,
+                r.hyperParameters.takeThreshold, r.hyperParameters.rejectThreshold,
+                r.adaptiveGeneration, r.adaptive,
             ).joinToString(",")
         }
 
@@ -695,15 +657,10 @@ object MetaBrainRuntime {
                 val hyper = if (p.size >= 17) {
                     AdaptiveCandidateSearch.bounded(
                         NumericalMetaBrain.HyperParameters(
-                            p[11].toDouble(),
-                            p[12].toDouble(),
-                            p[13].toDouble(),
-                            p[14].toDouble(),
+                            p[11].toDouble(), p[12].toDouble(), p[13].toDouble(), p[14].toDouble(),
                         ),
                     )
-                } else {
-                    profile.hyper
-                }
+                } else profile.hyper
                 CandidateResult(
                     finishedAt = p[0].toLong(),
                     profile = profile,
@@ -742,6 +699,7 @@ object MetaBrainRuntime {
     private const val KEY_ACTIVE_ADAPTIVE = "active_candidate_adaptive"
     private const val KEY_ACTIVE_GENERATION = "active_candidate_generation"
     private const val KEY_MUTATION_CURSOR = "adaptive_mutation_cursor"
+    private const val KEY_CANDIDATE_ORIGIN = "candidate_origin"
     private const val KEY_HISTORY = "candidate_history"
     private const val KEY_AUTO_SEARCH = "auto_candidate_search"
     private const val KEY_LAST_SAVE = "last_save"

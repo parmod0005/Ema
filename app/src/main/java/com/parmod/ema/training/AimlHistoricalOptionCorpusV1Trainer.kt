@@ -1,6 +1,5 @@
 package com.parmod.ema.training
 
-import com.parmod.ema.engine.AdaptiveCandidateSearch
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.engine.NumericalMetaBrain
 import com.parmod.ema.model.EngineId
@@ -21,7 +20,9 @@ import kotlin.math.pow
  * Seed + adaptive generations are trained only on the original train split and are
  * selected only on the original validation split. The original test split remains
  * locked until one Candidate clears walk-forward + strict development governance.
- * Test results are never fed back into subsequent mutations.
+ * Historical evolution is action-aware: reject-only models cannot remain parents
+ * simply because their accuracy/Brier score is high. Test results are never fed
+ * back into subsequent mutations.
  */
 class AimlHistoricalOptionCorpusV1Trainer(
     private val store: AimlHistoricalOptionCorpusV1Store,
@@ -100,12 +101,13 @@ class AimlHistoricalOptionCorpusV1Trainer(
         val trainStride = ceil(trainRows.toDouble() / MAX_SEARCH_TRAIN_ROWS).toInt().coerceAtLeast(1)
         val validationStride = ceil(validationRows.toDouble() / MAX_SEARCH_VALIDATION_ROWS).toInt().coerceAtLeast(1)
         val seedHypers = candidateHyperParameters()
-        val seen = seedHypers.mapTo(linkedSetOf()) { AdaptiveCandidateSearch.signature(it) }
+        val seen = seedHypers.mapTo(linkedSetOf()) { HistoricalAdaptiveCandidateSearch.signature(it) }
         val evaluations = ArrayList<HistoricalCorpusTrainer.CandidateEvaluation>()
 
         fun trainAndEvaluateBatch(
             hypers: List<NumericalMetaBrain.HyperParameters>,
             generation: Int,
+            guidance: HistoricalAdaptiveCandidateSearch.Guidance?,
         ): List<HistoricalCorpusTrainer.CandidateEvaluation> {
             val brains = hypers.map { brainFromBaseline(it) }
             val stagePrefix = if (generation == 0) "PRELABELLED_SEED" else "PRELABELLED_ADAPT_G$generation"
@@ -118,7 +120,7 @@ class AimlHistoricalOptionCorpusV1Trainer(
                     if (generation == 0) {
                         "Training ${hypers.size} seed Candidates on original train split · stride $trainStride"
                     } else {
-                        "Training Adaptive G$generation · ${hypers.size} Candidates on original train split · locked test untouched"
+                        "Training Adaptive G$generation ${guidance?.name ?: "BALANCED"} · ${hypers.size} Candidates · original train only · locked test untouched"
                     },
                 ),
             )
@@ -203,8 +205,8 @@ class AimlHistoricalOptionCorpusV1Trainer(
             }
         }
 
-        evaluations += trainAndEvaluateBatch(seedHypers, 0)
-        var best = evaluations.maxByOrNull { it.score }
+        evaluations += trainAndEvaluateBatch(seedHypers, 0, null)
+        var best = HistoricalAdaptiveCandidateSearch.selectBest(evaluations)
         var developmentGovernance = best?.let {
             HistoricalCandidateGovernance.evaluateDevelopment(it.candidate, it.production, coverage, corpusSamples)
         } ?: HistoricalCandidateGovernance.Decision(HistoricalCandidateGovernance.Status.CLOSED, listOf("No validation Candidate"))
@@ -216,21 +218,23 @@ class AimlHistoricalOptionCorpusV1Trainer(
         ) {
             val parent = best ?: break
             adaptiveGenerations++
+            val guidance = HistoricalAdaptiveCandidateSearch.guidance(parent)
             val batch = HistoricalAdaptiveCandidateSearch.nextBatch(
                 parent = parent.hyperParameters,
                 generation = adaptiveGenerations,
                 seenSignatures = seen,
+                guidance = guidance,
             )
             onProgress(
                 HistoricalCorpusTrainer.Progress(
                     "PRELABELLED_EVOLVE",
                     adaptiveGenerations,
                     HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
-                    "Evolving historical G$adaptiveGenerations around validation score ${"%.4f".format(parent.score)} · Production and locked test unchanged",
+                    "G$adaptiveGenerations guidance ${guidance.name} · parent TAKE ${parent.candidate.takeSamples}/${HistoricalCandidateGovernance.requiredActionSamples(parent.candidate.labels)} · TAKE net ${"%+.2f%%".format(parent.candidate.takeAverageNetReturn * 100.0)} · Production/test unchanged",
                 ),
             )
-            evaluations += trainAndEvaluateBatch(batch.candidates, adaptiveGenerations)
-            best = evaluations.maxByOrNull { it.score }
+            evaluations += trainAndEvaluateBatch(batch.candidates, adaptiveGenerations, guidance)
+            best = HistoricalAdaptiveCandidateSearch.selectBest(evaluations)
             developmentGovernance = best?.let {
                 HistoricalCandidateGovernance.evaluateDevelopment(it.candidate, it.production, coverage, corpusSamples)
             } ?: developmentGovernance
@@ -243,7 +247,7 @@ class AimlHistoricalOptionCorpusV1Trainer(
                     "COMPLETE",
                     evaluations.size,
                     evaluations.size,
-                    "Adaptive historical search exhausted G$adaptiveGenerations · ${developmentGovernance.label} · original test stayed locked",
+                    "Action-aware adaptive search exhausted G$adaptiveGenerations · ${developmentGovernance.label} · original test stayed locked",
                 ),
             )
             return result(
@@ -257,11 +261,10 @@ class AimlHistoricalOptionCorpusV1Trainer(
                 candidateHoldout = null,
                 productionHoldout = null,
                 champion = null,
-                note = "aiml-historical-option-row-v1 · ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations · development-only evolution · test never opened · Development ${developmentGovernance.label}: ${developmentGovernance.reasons.joinToString("; ")}.",
+                note = "aiml-historical-option-row-v1 · ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations · action-aware parent ranking · TAKE-starvation recovery can lower historical TAKE threshold to 51% · development-only evolution · test never opened · Development ${developmentGovernance.label}: ${developmentGovernance.reasons.joinToString("; ")}.",
             )
         }
 
-        // Refit the development-qualified winner on the full original TRAIN split only.
         val champion = brainFromBaseline(best.hyperParameters)
         var fullTrain = 0L
         onProgress(
@@ -289,7 +292,6 @@ class AimlHistoricalOptionCorpusV1Trainer(
             }
         }
 
-        // Open the original TEST split once. No result from here can trigger another mutation.
         val candidateTest = Acc()
         val productionTest = Acc()
         val production = brainFromBaseline(productionBaseline.hyperParameters)
@@ -299,7 +301,7 @@ class AimlHistoricalOptionCorpusV1Trainer(
                 "LOCKED_HOLDOUT",
                 0,
                 1,
-                "Development-qualified · opening original test split ONCE; failure will stop this research cycle",
+                "Development-qualified · opening original test split ONCE; failure stops this research cycle",
             ),
         )
         store.forEach(AimlHistoricalOptionCorpusV1Store.Split.TEST, shouldCancel = shouldCancel) { record ->
@@ -354,7 +356,7 @@ class AimlHistoricalOptionCorpusV1Trainer(
             candidateHoldout = candidateMetrics,
             productionHoldout = productionMetrics,
             champion = state,
-            note = "aiml-historical-option-row-v1 · ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations · original expiry-ordered train/validation/test preserved · locked test opened once only · 5m option future-return/MFE/MAE labels · conservative stop-first · costs included · historical native D30 unavailable · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}.",
+            note = "aiml-historical-option-row-v1 · ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations · action-aware historical evolution · original expiry-ordered train/validation/test preserved · locked test opened once only · 5m option future-return/MFE/MAE labels · conservative stop-first · costs included · historical native D30 unavailable · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}.",
         )
     }
 
@@ -415,33 +417,39 @@ class AimlHistoricalOptionCorpusV1Trainer(
     private fun score(candidate: HistoricalCorpusTrainer.Metrics, production: HistoricalCorpusTrainer.Metrics): Double {
         val accuracyGain = candidate.accuracy - production.accuracy
         val brierGain = production.brier - candidate.brier
-        val takeBonus = if (candidate.takeSamples >= 50) candidate.takePrecision - 0.50 else -0.03
-        val rejectBonus = if (candidate.rejectSamples >= 50) candidate.rejectPrecision - 0.50 else -0.02
-        return accuracyGain + brierGain + 0.18 * takeBonus + 0.10 * rejectBonus + 0.20 * candidate.takeAverageNetReturn
+        val requiredTake = HistoricalCandidateGovernance.requiredActionSamples(candidate.labels).coerceAtLeast(1L)
+        val requiredReject = HistoricalCandidateGovernance.requiredActionSamples(candidate.labels).coerceAtLeast(1L)
+        val takeCoverage = (candidate.takeSamples.toDouble() / requiredTake).coerceIn(0.0, 1.0)
+        val rejectCoverage = (candidate.rejectSamples.toDouble() / requiredReject).coerceIn(0.0, 1.0)
+        val takeBonus = if (candidate.takeSamples > 0) candidate.takePrecision - 0.50 else -0.50
+        val rejectBonus = if (candidate.rejectSamples > 0) candidate.rejectPrecision - 0.50 else -0.25
+        val actionCoverage = 0.18 * takeCoverage + 0.05 * rejectCoverage
+        val starvationPenalty = 0.45 * (1.0 - takeCoverage) + 0.10 * (1.0 - rejectCoverage)
+        return accuracyGain + brierGain + 0.22 * takeBonus + 0.10 * rejectBonus + 0.35 * candidate.takeAverageNetReturn + actionCoverage - starvationPenalty
     }
 
     private fun brainFromBaseline(hyper: NumericalMetaBrain.HyperParameters): NumericalMetaBrain = NumericalMetaBrain().apply {
-        restore(productionBaseline.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = hyper.sanitized()))
+        restore(productionBaseline.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = HistoricalAdaptiveCandidateSearch.bounded(hyper)))
     }
 
     private fun candidateHyperParameters(): List<NumericalMetaBrain.HyperParameters> {
         val all = ArrayList<NumericalMetaBrain.HyperParameters>()
-        MetaBrainRuntime.CandidateProfile.entries.map { it.hyper.sanitized() }.forEach { base ->
+        MetaBrainRuntime.CandidateProfile.entries.map { HistoricalAdaptiveCandidateSearch.bounded(it.hyper) }.forEach { base ->
             all += base
-            all += base.copy(
+            all += HistoricalAdaptiveCandidateSearch.bounded(base.copy(
                 learningRate = base.learningRate * 0.80,
                 l2 = base.l2 * 0.70,
                 takeThreshold = base.takeThreshold + 0.015,
                 rejectThreshold = base.rejectThreshold - 0.015,
-            ).sanitized()
-            all += base.copy(
+            ))
+            all += HistoricalAdaptiveCandidateSearch.bounded(base.copy(
                 learningRate = base.learningRate * 1.20,
                 l2 = base.l2 * 1.35,
                 takeThreshold = base.takeThreshold - 0.015,
                 rejectThreshold = base.rejectThreshold + 0.015,
-            ).sanitized()
+            ))
         }
-        return all.distinctBy { AdaptiveCandidateSearch.signature(it) }
+        return all.distinctBy { HistoricalAdaptiveCandidateSearch.signature(it) }
     }
 
     private fun coverage(p: java.util.Properties) = HistoricalCorpusTrainer.Coverage(

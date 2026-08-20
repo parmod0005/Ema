@@ -10,17 +10,7 @@ import com.parmod.ema.model.TrendDirection
 import kotlin.math.max
 import kotlin.math.pow
 
-/**
- * Persistent on-device Numerical Meta Brain runtime.
- *
- * Architecture:
- *  - PRODUCTION: frozen model used for reference and, only after explicit validated promotion,
- *    optionally as an execution gate.
- *  - CANDIDATE: learns continuously from delayed live outcomes.
- *  - VALIDATOR: scores both models on the exact same unseen labels BEFORE candidate learning.
- *
- * All weights, model versions and validation statistics are persisted in SharedPreferences.
- */
+/** Persistent on-device Numerical Meta Brain runtime with dynamic candidate experimentation. */
 object MetaBrainRuntime {
     private const val HISTORICAL_PRIOR_SAMPLES = 71L
     private const val HISTORICAL_PRIOR_BIAS = 0.2001902471
@@ -31,6 +21,15 @@ object MetaBrainRuntime {
         0.0, 0.0, 0.0, -0.2276839730, -0.0000679447,
         -0.0000452964,
     )
+
+    enum class CandidateProfile(val title: String, val hyper: NumericalMetaBrain.HyperParameters) {
+        BALANCED("Balanced", NumericalMetaBrain.HyperParameters(0.015, 0.0005, 0.66, 0.42)),
+        FAST_ADAPT("Fast Adapt", NumericalMetaBrain.HyperParameters(0.030, 0.0004, 0.64, 0.43)),
+        CONSERVATIVE("Conservative", NumericalMetaBrain.HyperParameters(0.010, 0.0010, 0.70, 0.38)),
+        STRICT_FILTER("Strict Filter", NumericalMetaBrain.HyperParameters(0.012, 0.0008, 0.74, 0.36)),
+        LOW_REG("Low Regularization", NumericalMetaBrain.HyperParameters(0.020, 0.00015, 0.67, 0.41)),
+        HIGH_REG("High Regularization", NumericalMetaBrain.HyperParameters(0.018, 0.0020, 0.68, 0.40)),
+    }
 
     data class Status(
         val engine: EngineId,
@@ -60,14 +59,31 @@ object MetaBrainRuntime {
         val rejectPrecision: Double get() = if (candidateReject == 0L) 0.0 else candidateRejectLosses.toDouble() / candidateReject
     }
 
+    data class CandidateResult(
+        val finishedAt: Long,
+        val profile: CandidateProfile,
+        val labels: Long,
+        val candidateAccuracy: Double,
+        val productionAccuracy: Double,
+        val candidateBrier: Double,
+        val productionBrier: Double,
+        val takePrecision: Double,
+        val rejectPrecision: Double,
+        val passed: Boolean,
+        val score: Double,
+    )
+
     data class LabReport(
         val initialized: Boolean,
         val persistent: Boolean,
         val gateEnabled: Boolean,
+        val autoSearchEnabled: Boolean,
         val productionVersion: Long,
         val candidateVersion: Long,
         val productionSamples: Long,
         val candidateSamples: Long,
+        val candidateProfile: CandidateProfile,
+        val candidateHyperParameters: NumericalMetaBrain.HyperParameters,
         val pendingLabels: Int,
         val validation: ValidationStats,
         val eligibleForPromotion: Boolean,
@@ -75,6 +91,7 @@ object MetaBrainRuntime {
         val lastSavedAt: Long,
         val lastPromotedAt: Long,
         val rollbackAvailable: Boolean,
+        val candidateHistory: List<CandidateResult>,
     )
 
     private data class Pending(
@@ -95,6 +112,9 @@ object MetaBrainRuntime {
     private val pending = linkedMapOf<String, Pending>()
     private val lastRegistered = mutableMapOf<String, Long>()
     private val statusByEngine = mutableMapOf<EngineId, Status>()
+    private val candidateHistory = mutableListOf<CandidateResult>()
+    private var activeProfile = CandidateProfile.BALANCED
+    private var autoSearchEnabled = false
     private var appContext: Context? = null
     private var initialized = false
     private var gateEnabled = false
@@ -126,6 +146,10 @@ object MetaBrainRuntime {
             candidateReject = prefs.getLong("v_reject", 0L),
             candidateRejectLosses = prefs.getLong("v_reject_l", 0L),
         )
+        activeProfile = runCatching { CandidateProfile.valueOf(prefs.getString(KEY_PROFILE, null) ?: "BALANCED") }.getOrDefault(CandidateProfile.BALANCED)
+        autoSearchEnabled = prefs.getBoolean(KEY_AUTO_SEARCH, false)
+        candidateHistory.clear()
+        candidateHistory.addAll(readHistory(prefs.getString(KEY_HISTORY, null)))
         gateEnabled = prefs.getBoolean(KEY_GATE, false)
         lastSavedAt = prefs.getLong(KEY_LAST_SAVE, 0L)
         lastPromotedAt = prefs.getLong(KEY_LAST_PROMOTE, 0L)
@@ -168,24 +192,21 @@ object MetaBrainRuntime {
                 if (labelsSinceSave >= AUTO_SAVE_EVERY_LABELS) saveLocked()
             }
         }
+        maybeAutoRotateCandidate()
     }
 
-    private fun scoreUnseenLabel(
-        productionPrediction: NumericalMetaBrain.Prediction,
-        candidatePrediction: NumericalMetaBrain.Prediction,
-        success: Boolean,
-    ) {
+    private fun scoreUnseenLabel(prod: NumericalMetaBrain.Prediction, cand: NumericalMetaBrain.Prediction, success: Boolean) {
         val y = if (success) 1.0 else 0.0
-        val pc = predictedClass(productionPrediction.probabilitySuccess) == success
-        val cc = predictedClass(candidatePrediction.probabilitySuccess) == success
-        val candTake = candidatePrediction.decision == NumericalMetaBrain.Decision.TAKE
-        val candReject = candidatePrediction.decision == NumericalMetaBrain.Decision.REJECT
+        val pc = predictedClass(prod.probabilitySuccess) == success
+        val cc = predictedClass(cand.probabilitySuccess) == success
+        val candTake = cand.decision == NumericalMetaBrain.Decision.TAKE
+        val candReject = cand.decision == NumericalMetaBrain.Decision.REJECT
         validation = validation.copy(
             labels = validation.labels + 1,
             productionCorrect = validation.productionCorrect + if (pc) 1 else 0,
             candidateCorrect = validation.candidateCorrect + if (cc) 1 else 0,
-            productionBrierSum = validation.productionBrierSum + (productionPrediction.probabilitySuccess - y).pow(2),
-            candidateBrierSum = validation.candidateBrierSum + (candidatePrediction.probabilitySuccess - y).pow(2),
+            productionBrierSum = validation.productionBrierSum + (prod.probabilitySuccess - y).pow(2),
+            candidateBrierSum = validation.candidateBrierSum + (cand.probabilitySuccess - y).pow(2),
             candidateTake = validation.candidateTake + if (candTake) 1 else 0,
             candidateTakeWins = validation.candidateTakeWins + if (candTake && success) 1 else 0,
             candidateReject = validation.candidateReject + if (candReject) 1 else 0,
@@ -222,37 +243,15 @@ object MetaBrainRuntime {
         }
         val index = if (spot >= SENSEX_SPOT_CUTOFF) MarketIndex.SENSEX else MarketIndex.NIFTY
         val features = NumericalMetaBrain.Features(
-            engine = engine,
-            index = index,
-            side = side,
-            engineConfidence = raw.confidence.toDouble(),
-            directionScore = directionScore.coerceIn(0.0, 60.0),
-            entryQualityScore = entryQualityScore.coerceIn(0.0, 40.0),
-            orderFlow = orderFlow,
-            relativeActivity = relativeActivity,
-            oiImpulse = oiImpulse,
-            optionFlow = optionFlow,
-            acceleration = acceleration,
-            extensionAtr = extensionAtr,
-            depthImbalance = depthImbalance,
-            micropricePressure = micropricePressure,
-            totalBookPressure = totalBookPressure,
-            wallPressure = wallPressure,
-            depthLevels = depthLevels,
-            minutesFromOpen = minutesFromOpen(timestamp),
-            recentEngineWinRate = 50.0,
-            recentEngineProfitFactor = 1.0,
+            engine, index, side, raw.confidence.toDouble(),
+            directionScore.coerceIn(0.0, 60.0), entryQualityScore.coerceIn(0.0, 40.0),
+            orderFlow, relativeActivity, oiImpulse, optionFlow, acceleration, extensionAtr,
+            depthImbalance, micropricePressure, totalBookPressure, wallPressure, depthLevels,
+            minutesFromOpen(timestamp), 50.0, 1.0,
         )
         val prodPrediction = production.predict(features)
         val candPrediction = candidate.predict(features)
-        statusByEngine[engine] = Status(
-            engine = engine,
-            probability = candPrediction.confidence,
-            decision = candPrediction.decision,
-            samples = candPrediction.samplesLearned,
-            modelVersion = candPrediction.modelVersion,
-            lastUpdated = timestamp,
-        )
+        statusByEngine[engine] = Status(engine, candPrediction.confidence, candPrediction.decision, candPrediction.samplesLearned, candPrediction.modelVersion, timestamp)
 
         if (raw.confidence >= CANDIDATE_CONFIDENCE && spot > 0.0) {
             val dedupeKey = "${engine.name}:${side.name}"
@@ -264,28 +263,16 @@ object MetaBrainRuntime {
             }
         }
 
-        val decisionText = candPrediction.decision.name
-        val metaReason = "META ${if (gateEnabled) "GATE" else "SHADOW"} ${candPrediction.confidence}% $decisionText · learned ${candPrediction.samplesLearned} · v${candPrediction.modelVersion}"
+        val metaReason = "META ${if (gateEnabled) "GATE" else "SHADOW"} ${candPrediction.confidence}% ${candPrediction.decision.name} · ${activeProfile.title} · learned ${candPrediction.samplesLearned}"
         var decorated = raw.copy(
             reasons = (raw.reasons + metaReason).takeLast(10),
             setup = "${raw.setup} · AI ${candPrediction.confidence}%",
         )
-
-        // Gate uses only the frozen PRODUCTION model. Candidate never directly controls orders.
-        // A production REJECT also neutralizes a high-confidence WAIT candidate. This is essential
-        // for Engine 2: its 3-factor spot state is intentionally WAIT until D30 confirms it, and
-        // must not be allowed to re-arm after the validated production model rejected the setup.
-        val productionReject = gateEnabled &&
-            raw.confidence >= CANDIDATE_CONFIDENCE &&
-            prodPrediction.decision == NumericalMetaBrain.Decision.REJECT
+        val productionReject = gateEnabled && raw.confidence >= CANDIDATE_CONFIDENCE && prodPrediction.decision == NumericalMetaBrain.Decision.REJECT
         if (productionReject) {
             decorated = decorated.copy(
-                action = SignalAction.WAIT,
-                confidence = 0,
-                trend = TrendDirection.NEUTRAL,
-                entry = null,
-                stopLoss = null,
-                target = null,
+                action = SignalAction.WAIT, confidence = 0, trend = TrendDirection.NEUTRAL,
+                entry = null, stopLoss = null, target = null,
                 setup = "${raw.setup} · AI GATE REJECT ${prodPrediction.confidence}%",
                 reasons = (decorated.reasons + "Production meta-model rejected candidate; downstream re-arm blocked").takeLast(10),
             )
@@ -294,51 +281,95 @@ object MetaBrainRuntime {
     }
 
     @Synchronized fun status(engine: EngineId): Status? = statusByEngine[engine]
+    @Synchronized fun availableProfiles(): List<CandidateProfile> = CandidateProfile.entries.toList()
 
     @Synchronized
     fun report(): LabReport {
         val (eligible, reason) = promotionEligibility()
-        val ps = production.snapshot()
-        val cs = candidate.snapshot()
+        val ps = production.snapshot(); val cs = candidate.snapshot()
         return LabReport(
-            initialized = initialized,
-            persistent = appContext != null,
-            gateEnabled = gateEnabled,
-            productionVersion = ps.modelVersion,
-            candidateVersion = cs.modelVersion,
-            productionSamples = ps.samplesLearned,
-            candidateSamples = cs.samplesLearned,
-            pendingLabels = pending.size,
-            validation = validation,
-            eligibleForPromotion = eligible,
-            promotionReason = reason,
-            lastSavedAt = lastSavedAt,
-            lastPromotedAt = lastPromotedAt,
-            rollbackAvailable = rollbackState != null,
+            initialized, appContext != null, gateEnabled, autoSearchEnabled,
+            ps.modelVersion, cs.modelVersion, ps.samplesLearned, cs.samplesLearned,
+            activeProfile, cs.hyperParameters, pending.size, validation,
+            eligible, reason, lastSavedAt, lastPromotedAt, rollbackState != null,
+            candidateHistory.sortedByDescending { it.score }.take(MAX_HISTORY),
         )
     }
 
     @Synchronized fun forceSave(): Boolean = saveLocked()
 
     @Synchronized
-    fun resetCandidateLearning() {
-        candidate.restore(production.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW))
-        validation = ValidationStats()
-        pending.clear()
-        lastRegistered.clear()
+    fun setAutoSearchEnabled(enabled: Boolean): Pair<Boolean, String> {
+        autoSearchEnabled = enabled
         saveLocked()
+        return true to if (enabled) "Auto candidate search enabled" else "Auto candidate search disabled"
+    }
+
+    @Synchronized
+    fun startCandidate(profile: CandidateProfile, archiveCurrent: Boolean = true): Pair<Boolean, String> {
+        if (archiveCurrent && validation.labels > 0) archiveCurrentCandidate()
+        activeProfile = profile
+        val base = production.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = profile.hyper)
+        candidate.restore(base)
+        validation = ValidationStats()
+        pending.clear(); lastRegistered.clear(); labelsSinceSave = 0
+        saveLocked()
+        return true to "Started ${profile.title} candidate from frozen production baseline"
+    }
+
+    @Synchronized
+    fun startNextCandidate(): Pair<Boolean, String> {
+        val profiles = CandidateProfile.entries
+        val next = profiles[(activeProfile.ordinal + 1) % profiles.size]
+        return startCandidate(next, archiveCurrent = true)
+    }
+
+    @Synchronized
+    fun resetCandidateLearning() {
+        startCandidate(activeProfile, archiveCurrent = false)
+    }
+
+    @Synchronized
+    fun clearCandidateHistory() {
+        candidateHistory.clear(); saveLocked()
+    }
+
+    private fun archiveCurrentCandidate() {
+        if (validation.labels <= 0) return
+        val (passed, _) = promotionEligibility()
+        val score = (validation.candidateAccuracy - validation.productionAccuracy) +
+            (validation.productionBrier - validation.candidateBrier) +
+            0.20 * (validation.takePrecision - 0.50) +
+            0.10 * (validation.rejectPrecision - 0.50)
+        candidateHistory += CandidateResult(
+            System.currentTimeMillis(), activeProfile, validation.labels,
+            validation.candidateAccuracy, validation.productionAccuracy,
+            validation.candidateBrier, validation.productionBrier,
+            validation.takePrecision, validation.rejectPrecision, passed, score,
+        )
+        while (candidateHistory.size > MAX_HISTORY) candidateHistory.removeAt(0)
+    }
+
+    private fun maybeAutoRotateCandidate() {
+        if (!autoSearchEnabled || validation.labels < AUTO_EVALUATE_LABELS) return
+        val (eligible, _) = promotionEligibility()
+        if (eligible) {
+            autoSearchEnabled = false
+            saveLocked()
+            return
+        }
+        startNextCandidate()
     }
 
     @Synchronized
     fun promoteCandidate(): Pair<Boolean, String> {
         val (eligible, reason) = promotionEligibility()
         if (!eligible) return false to reason
+        archiveCurrentCandidate()
         rollbackState = production.snapshot()
         production.restore(candidate.snapshot().copy(mode = if (gateEnabled) NumericalMetaBrain.Mode.GATE else NumericalMetaBrain.Mode.SHADOW))
         lastPromotedAt = System.currentTimeMillis()
-        validation = ValidationStats()
-        pending.clear()
-        lastRegistered.clear()
+        validation = ValidationStats(); pending.clear(); lastRegistered.clear(); autoSearchEnabled = false
         saveLocked()
         return true to "Candidate promoted to frozen production model"
     }
@@ -346,25 +377,19 @@ object MetaBrainRuntime {
     @Synchronized
     fun rollbackProduction(): Boolean {
         val rollback = rollbackState ?: return false
-        production.restore(rollback.copy(mode = if (gateEnabled) NumericalMetaBrain.Mode.GATE else NumericalMetaBrain.Mode.SHADOW))
-        candidate.restore(production.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW))
-        rollbackState = null
-        validation = ValidationStats()
-        gateEnabled = false
-        production.setMode(NumericalMetaBrain.Mode.SHADOW)
-        saveLocked()
-        return true
+        production.restore(rollback.copy(mode = NumericalMetaBrain.Mode.SHADOW))
+        candidate.restore(production.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = activeProfile.hyper))
+        rollbackState = null; validation = ValidationStats(); gateEnabled = false
+        production.setMode(NumericalMetaBrain.Mode.SHADOW); saveLocked(); return true
     }
 
     @Synchronized
     fun setGateEnabled(enabled: Boolean): Pair<Boolean, String> {
         if (enabled) {
             if (lastPromotedAt <= 0L) return false to "Promote a validated candidate before enabling AI gate"
-            gateEnabled = true
-            production.setMode(NumericalMetaBrain.Mode.GATE)
+            gateEnabled = true; production.setMode(NumericalMetaBrain.Mode.GATE)
         } else {
-            gateEnabled = false
-            production.setMode(NumericalMetaBrain.Mode.SHADOW)
+            gateEnabled = false; production.setMode(NumericalMetaBrain.Mode.SHADOW)
         }
         saveLocked()
         return true to if (gateEnabled) "Validated production AI gate enabled" else "AI returned to shadow mode"
@@ -374,15 +399,9 @@ object MetaBrainRuntime {
         if (validation.labels < MIN_VALIDATION_LABELS) return false to "Need ${MIN_VALIDATION_LABELS - validation.labels} more unseen labels"
         val accuracyGain = validation.candidateAccuracy - validation.productionAccuracy
         val brierGain = validation.productionBrier - validation.candidateBrier
-        if (accuracyGain < MIN_ACCURACY_GAIN && brierGain < MIN_BRIER_GAIN) {
-            return false to "Candidate has not beaten production accuracy/calibration"
-        }
-        if (validation.candidateTake >= MIN_ACTION_SAMPLES && validation.takePrecision < MIN_TAKE_PRECISION) {
-            return false to "TAKE precision ${pct(validation.takePrecision)} below ${pct(MIN_TAKE_PRECISION)}"
-        }
-        if (validation.candidateReject >= MIN_ACTION_SAMPLES && validation.rejectPrecision < MIN_REJECT_PRECISION) {
-            return false to "REJECT precision ${pct(validation.rejectPrecision)} below ${pct(MIN_REJECT_PRECISION)}"
-        }
+        if (accuracyGain < MIN_ACCURACY_GAIN && brierGain < MIN_BRIER_GAIN) return false to "Candidate has not beaten production accuracy/calibration"
+        if (validation.candidateTake >= MIN_ACTION_SAMPLES && validation.takePrecision < MIN_TAKE_PRECISION) return false to "TAKE precision ${pct(validation.takePrecision)} below ${pct(MIN_TAKE_PRECISION)}"
+        if (validation.candidateReject >= MIN_ACTION_SAMPLES && validation.rejectPrecision < MIN_REJECT_PRECISION) return false to "REJECT precision ${pct(validation.rejectPrecision)} below ${pct(MIN_REJECT_PRECISION)}"
         return true to "PASS · candidate beats frozen production on unseen live labels"
     }
 
@@ -393,48 +412,59 @@ object MetaBrainRuntime {
             .putString(KEY_PRODUCTION, writeModel(production.snapshot()))
             .putString(KEY_CANDIDATE, writeModel(candidate.snapshot()))
             .putString(KEY_ROLLBACK, rollbackState?.let(::writeModel))
+            .putString(KEY_PROFILE, activeProfile.name)
+            .putString(KEY_HISTORY, writeHistory(candidateHistory))
+            .putBoolean(KEY_AUTO_SEARCH, autoSearchEnabled)
             .putBoolean(KEY_GATE, gateEnabled)
-            .putLong(KEY_LAST_SAVE, now)
-            .putLong(KEY_LAST_PROMOTE, lastPromotedAt)
-            .putLong("v_labels", validation.labels)
-            .putLong("v_pc", validation.productionCorrect)
-            .putLong("v_cc", validation.candidateCorrect)
-            .putString("v_pb", validation.productionBrierSum.toString())
-            .putString("v_cb", validation.candidateBrierSum.toString())
-            .putLong("v_take", validation.candidateTake)
-            .putLong("v_take_w", validation.candidateTakeWins)
-            .putLong("v_reject", validation.candidateReject)
-            .putLong("v_reject_l", validation.candidateRejectLosses)
+            .putLong(KEY_LAST_SAVE, now).putLong(KEY_LAST_PROMOTE, lastPromotedAt)
+            .putLong("v_labels", validation.labels).putLong("v_pc", validation.productionCorrect).putLong("v_cc", validation.candidateCorrect)
+            .putString("v_pb", validation.productionBrierSum.toString()).putString("v_cb", validation.candidateBrierSum.toString())
+            .putLong("v_take", validation.candidateTake).putLong("v_take_w", validation.candidateTakeWins)
+            .putLong("v_reject", validation.candidateReject).putLong("v_reject_l", validation.candidateRejectLosses)
             .apply()
-        lastSavedAt = now
-        labelsSinceSave = 0
-        return true
+        lastSavedAt = now; labelsSinceSave = 0; return true
     }
 
     private fun prefs() = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    private fun writeModel(state: NumericalMetaBrain.ModelState): String = listOf(
-        state.bias.toString(),
-        state.samplesLearned.toString(),
-        state.modelVersion.toString(),
-        state.mode.name,
-        state.weights.joinToString(","),
+    private fun writeModel(s: NumericalMetaBrain.ModelState): String = listOf(
+        s.bias, s.samplesLearned, s.modelVersion, s.mode.name,
+        s.hyperParameters.learningRate, s.hyperParameters.l2, s.hyperParameters.takeThreshold, s.hyperParameters.rejectThreshold,
+        s.weights.joinToString(","),
     ).joinToString("|")
 
     private fun readModel(raw: String?): NumericalMetaBrain.ModelState? {
         if (raw.isNullOrBlank()) return null
         return runCatching {
-            val p = raw.split("|", limit = 5)
-            val weights = p[4].split(',').map(String::toDouble).toDoubleArray()
-            if (weights.size != NumericalMetaBrain.FEATURE_COUNT) return null
-            NumericalMetaBrain.ModelState(
-                weights = weights,
-                bias = p[0].toDouble(),
-                samplesLearned = p[1].toLong(),
-                modelVersion = p[2].toLong(),
-                mode = NumericalMetaBrain.Mode.valueOf(p[3]),
-            )
+            val p = raw.split("|")
+            if (p.size >= 9) {
+                val weights = p[8].split(',').map(String::toDouble).toDoubleArray()
+                if (weights.size != NumericalMetaBrain.FEATURE_COUNT) return null
+                NumericalMetaBrain.ModelState(
+                    weights, p[0].toDouble(), p[1].toLong(), p[2].toLong(), NumericalMetaBrain.Mode.valueOf(p[3]),
+                    NumericalMetaBrain.HyperParameters(p[4].toDouble(), p[5].toDouble(), p[6].toDouble(), p[7].toDouble()),
+                )
+            } else {
+                val old = raw.split("|", limit = 5)
+                val weights = old[4].split(',').map(String::toDouble).toDoubleArray()
+                if (weights.size != NumericalMetaBrain.FEATURE_COUNT) return null
+                NumericalMetaBrain.ModelState(weights, old[0].toDouble(), old[1].toLong(), old[2].toLong(), NumericalMetaBrain.Mode.valueOf(old[3]))
+            }
         }.getOrNull()
+    }
+
+    private fun writeHistory(items: List<CandidateResult>): String = items.takeLast(MAX_HISTORY).joinToString(";") { r ->
+        listOf(r.finishedAt, r.profile.name, r.labels, r.candidateAccuracy, r.productionAccuracy, r.candidateBrier, r.productionBrier, r.takePrecision, r.rejectPrecision, r.passed, r.score).joinToString(",")
+    }
+
+    private fun readHistory(raw: String?): List<CandidateResult> {
+        if (raw.isNullOrBlank()) return emptyList()
+        return raw.split(';').mapNotNull { row ->
+            runCatching {
+                val p = row.split(',')
+                CandidateResult(p[0].toLong(), CandidateProfile.valueOf(p[1]), p[2].toLong(), p[3].toDouble(), p[4].toDouble(), p[5].toDouble(), p[6].toDouble(), p[7].toDouble(), p[8].toDouble(), p[9].toBoolean(), p[10].toDouble())
+            }.getOrNull()
+        }
     }
 
     private fun minutesFromOpen(timestamp: Long): Double {
@@ -450,6 +480,9 @@ object MetaBrainRuntime {
     private const val KEY_CANDIDATE = "candidate"
     private const val KEY_ROLLBACK = "rollback"
     private const val KEY_GATE = "gate"
+    private const val KEY_PROFILE = "candidate_profile"
+    private const val KEY_HISTORY = "candidate_history"
+    private const val KEY_AUTO_SEARCH = "auto_candidate_search"
     private const val KEY_LAST_SAVE = "last_save"
     private const val KEY_LAST_PROMOTE = "last_promote"
     private const val SENSEX_SPOT_CUTOFF = 50_000.0
@@ -461,6 +494,8 @@ object MetaBrainRuntime {
     private const val TIMEOUT_SUCCESS_RETURN = 0.00045
     private const val MAX_PENDING = 256
     private const val AUTO_SAVE_EVERY_LABELS = 5
+    private const val AUTO_EVALUATE_LABELS = 150L
+    private const val MAX_HISTORY = 12
     private const val MIN_VALIDATION_LABELS = 100L
     private const val MIN_ACTION_SAMPLES = 15L
     private const val MIN_ACCURACY_GAIN = 0.015

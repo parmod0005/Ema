@@ -43,10 +43,8 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         val prelabelledTestRows: Long = 0,
     ) {
         val progress: Float get() = if (total <= 0) 0f else (completed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
-        val importProgress: Float get() = if (importTotal <= 0) 0f else (completedFraction(importCompleted, importTotal))
-
-        private fun completedFraction(done: Int, all: Int): Float =
-            if (all <= 0) 0f else (done.toFloat() / all.toFloat()).coerceIn(0f, 1f)
+        val importProgress: Float get() = if (importTotal <= 0) 0f else completedFraction(importCompleted, importTotal)
+        private fun completedFraction(done: Int, all: Int): Float = if (all <= 0) 0f else (done.toFloat() / all.toFloat()).coerceIn(0f, 1f)
     }
 
     private val vault = LocalCredentialVault(application)
@@ -85,13 +83,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
 
     fun selectIndex(index: MarketIndex) {
         if (busy()) return
-        _state.value = _state.value.copy(
-            selectedIndex = index,
-            result = null,
-            installedCandidate = false,
-            error = null,
-            message = "${index.name} historical AI corpus selected",
-        )
+        _state.value = _state.value.copy(selectedIndex = index, result = null, installedCandidate = false, error = null, message = "${index.name} historical AI corpus selected")
     }
 
     fun selectSource(source: HistoricalCorpusSource) {
@@ -103,16 +95,8 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
             error = null,
             message = when (source) {
                 HistoricalCorpusSource.UPSTOX -> "Upstox Plus expired-option corpus selected"
-                HistoricalCorpusSource.LOCAL -> if (prelabelledStore.ready()) {
-                    "Pre-labelled LOCAL corpus selected · original train/validation/test split will be preserved"
-                } else {
-                    "Local imported corpus selected · no Upstox token required"
-                }
-                HistoricalCorpusSource.COMBINED -> if (prelabelledStore.ready()) {
-                    "COMBINED selected · pre-labelled champion first, then recent Upstox refinement if available"
-                } else {
-                    "Combined corpus selected · local + Upstox data will be deduplicated"
-                }
+                HistoricalCorpusSource.LOCAL -> if (prelabelledStore.ready()) "Pre-labelled LOCAL corpus selected · original train/validation/test split will be preserved" else "Local imported corpus selected · no Upstox token required"
+                HistoricalCorpusSource.COMBINED -> if (prelabelledStore.ready()) "COMBINED selected · pre-labelled champion first, then recent Upstox refinement if available" else "Combined corpus selected · local + Upstox data will be deduplicated"
             },
         )
     }
@@ -120,14 +104,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
     fun importLocalCorpus(uris: List<Uri>) {
         if (busy() || uris.isEmpty()) return
         cancelRequested = false
-        _state.value = _state.value.copy(
-            isImporting = true,
-            stage = "IMPORT",
-            importCompleted = 0,
-            importTotal = uris.size,
-            importMessage = "Detecting corpus format · memory-safe streaming enabled…",
-            error = null,
-        )
+        _state.value = _state.value.copy(isImporting = true, stage = "IMPORT", importCompleted = 0, importTotal = uris.size, importMessage = "Detecting corpus format · memory-safe streaming enabled…", error = null)
         job = viewModelScope.launch {
             try {
                 val specialized = prelabelledStore.likelyPrelabelledCorpus(uris)
@@ -136,14 +113,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                         prelabelledStore.importUris(
                             uris = uris,
                             onProgress = { p ->
-                                _state.value = _state.value.copy(
-                                    isImporting = true,
-                                    stage = "IMPORT_PRELABELLED",
-                                    importCompleted = p.completedFiles,
-                                    importTotal = p.totalFiles,
-                                    importMessage = p.message,
-                                    error = null,
-                                )
+                                _state.value = _state.value.copy(isImporting = true, stage = "IMPORT_PRELABELLED", importCompleted = p.completedFiles, importTotal = p.totalFiles, importMessage = p.message, error = null)
                             },
                             shouldCancel = { cancelRequested },
                         )
@@ -160,11 +130,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                             importCompleted = uris.size,
                             importTotal = uris.size,
                             importMessage = imported.message,
-                            message = if (ready) {
-                                "Pre-labelled historical corpus ready · original train/validation/test split locked for research"
-                            } else {
-                                imported.message
-                            },
+                            message = if (ready) "Pre-labelled historical corpus ready · original train/validation/test split locked for research" else imported.message,
                             error = imported.summary.errors.lastOrNull(),
                             prelabelledCorpusReady = ready,
                             prelabelledTrainRows = imported.trainRows,
@@ -179,14 +145,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                     localStore.importUris(
                         uris = uris,
                         onProgress = { p ->
-                            _state.value = _state.value.copy(
-                                isImporting = true,
-                                stage = "IMPORT_RAW",
-                                importCompleted = p.completedFiles,
-                                importTotal = p.totalFiles,
-                                importMessage = p.message,
-                                error = null,
-                            )
+                            _state.value = _state.value.copy(isImporting = true, stage = "IMPORT_RAW", importCompleted = p.completedFiles, importTotal = p.totalFiles, importMessage = p.message, error = null)
                         },
                         shouldCancel = { cancelRequested },
                     )
@@ -262,15 +221,10 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                             val historical = runPrelabelled(index, months)
                             val champion = historical.championState
                             if (champion == null) {
-                                historical.copy(note = historical.note + " · COMBINED refinement skipped because the pre-labelled candidate did not pass its locked test.")
+                                historical.copy(note = historical.note + " · COMBINED refinement skipped because the pre-labelled candidate did not pass strict historical governance.")
                             } else {
                                 client = UpstoxPlusHistoricalClient(accessToken = token, cacheDirectory = upstoxCacheDirectory)
-                                val loaded = UpstoxCorpusSeriesLoader(client!!).load(
-                                    index = index,
-                                    months = months.toLong(),
-                                    onProgress = { p -> publishProgress(p, client) },
-                                    shouldCancel = { cancelRequested },
-                                )
+                                val loaded = UpstoxCorpusSeriesLoader(client!!).load(index = index, months = months.toLong(), onProgress = { p -> publishProgress(p, client) }, shouldCancel = { cancelRequested })
                                 val merged = HistoricalSeriesMerger.merge(loaded.series)
                                 if (merged.isEmpty()) {
                                     historical.copy(errors = historical.errors + loaded.errors, note = historical.note + " · No recent Upstox refinement series were available; pre-labelled champion retained as Candidate result.")
@@ -284,15 +238,9 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                                         shouldCancel = { cancelRequested },
                                     )
                                     if (refined.championState != null) {
-                                        refined.copy(
-                                            errors = refined.errors + loaded.errors,
-                                            note = historical.note + " · Then recent Upstox causal refinement passed its own walk-forward/holdout. " + refined.note,
-                                        )
+                                        refined.copy(errors = refined.errors + loaded.errors, note = historical.note + " · Then recent Upstox causal refinement passed strict historical governance. " + refined.note)
                                     } else {
-                                        historical.copy(
-                                            errors = historical.errors + loaded.errors + refined.errors,
-                                            note = historical.note + " · Recent Upstox refinement did not beat the pre-labelled champion, so the original pre-labelled champion was retained.",
-                                        )
+                                        historical.copy(errors = historical.errors + loaded.errors + refined.errors, note = historical.note + " · Recent Upstox refinement did not clear strict governance, so the original pre-labelled champion was retained.")
                                     }
                                 }
                             }
@@ -309,9 +257,17 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                 val install = result.championState?.let { champion -> MetaBrainRuntime.installHistoricalCandidate(champion, origin) }
                 val installed = install?.first == true
                 val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
+                val governance = HistoricalCandidateGovernance.evaluate(
+                    candidate = result.holdoutCandidate,
+                    production = result.holdoutProduction,
+                    coverage = result.coverage,
+                    corpusSamples = result.corpusSamples,
+                    holdoutOpened = result.lockedHoldoutOpened,
+                )
                 val finalMessage = when {
-                    installed -> "Historical champion installed as Candidate only · now collect fresh live unseen labels"
-                    result.lockedHoldoutOpened && !result.lockedHoldoutPassed -> "Locked holdout failed · Production and current Candidate were not replaced"
+                    installed -> "Historical governance PASS · champion installed as Candidate only · now collect fresh live unseen labels"
+                    governance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "Historical governance INSUFFICIENT DATA · ${governance.reasons.firstOrNull().orEmpty()}"
+                    governance.status == HistoricalCandidateGovernance.Status.FAIL -> "Historical governance FAIL · ${governance.reasons.firstOrNull().orEmpty()}"
                     !result.lockedHoldoutOpened -> "Validation robustness not reached · locked holdout remained closed"
                     else -> "Historical training complete"
                 }
@@ -353,12 +309,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         AimlHistoricalOptionCorpusV1Trainer(
             store = prelabelledStore,
             productionBaseline = MetaBrainRuntime.productionSnapshotForResearch(),
-        ).run(
-            index = index,
-            monthsLabel = months.toLong(),
-            onProgress = { p -> publishProgress(p, null) },
-            shouldCancel = { cancelRequested },
-        )
+        ).run(index = index, monthsLabel = months.toLong(), onProgress = { p -> publishProgress(p, null) }, shouldCancel = { cancelRequested })
 
     private fun runRawOrUpstox(
         source: HistoricalCorpusSource,
@@ -376,19 +327,13 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         if (source == HistoricalCorpusSource.UPSTOX || source == HistoricalCorpusSource.COMBINED) {
             val token = vault.read().upstoxAccessToken.trim()
             client = UpstoxPlusHistoricalClient(accessToken = token, cacheDirectory = upstoxCacheDirectory)
-            val loaded = UpstoxCorpusSeriesLoader(client).load(
-                index = index,
-                months = months.toLong(),
-                onProgress = { p -> publishProgress(p, client) },
-                shouldCancel = { cancelRequested },
-            )
+            val loaded = UpstoxCorpusSeriesLoader(client).load(index = index, months = months.toLong(), onProgress = { p -> publishProgress(p, client) }, shouldCancel = { cancelRequested })
             series = series + loaded.series
             sourceErrors = sourceErrors + loaded.errors
         }
         val merged = HistoricalSeriesMerger.merge(series)
         if (merged.isEmpty()) error("No trainable ${index.name} option series available from ${source.label}")
-        val trainer = HistoricalSeriesTrainer(productionBaseline = MetaBrainRuntime.productionSnapshotForResearch())
-        val trained = trainer.run(
+        val trained = HistoricalSeriesTrainer(productionBaseline = MetaBrainRuntime.productionSnapshotForResearch()).run(
             index = index,
             series = merged,
             config = HistoricalCorpusTrainer.Config(months = months.toLong()),
@@ -459,9 +404,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         )
     }
 
-    private fun effectiveLocalSummary(): LocalCorpusSummary =
-        if (prelabelledStore.ready()) prelabelledStore.summary() else localStore.summary()
-
+    private fun effectiveLocalSummary(): LocalCorpusSummary = if (prelabelledStore.ready()) prelabelledStore.summary() else localStore.summary()
     private fun busy(): Boolean = job?.isActive == true || _state.value.isRunning || _state.value.isImporting
 
     private fun saveSummary(state: UiState) {
@@ -485,7 +428,6 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
 
     companion object {
         private const val PREFS = "vardhani_historical_ai_training_summary"
-
         private fun loadLastSummary(application: Application): UiState {
             val p = application.getSharedPreferences(PREFS, 0)
             if (!p.contains("samples")) return UiState()

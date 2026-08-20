@@ -6,6 +6,7 @@ import com.parmod.ema.data.UpstoxIntradayCandleClient
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
 import com.parmod.ema.engine.ExecutionEngineV2
+import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.engine.OptionSelector
 import com.parmod.ema.engine.TickNativeDualEngine
 import com.parmod.ema.engine.V76ExecutionQualityEngine
@@ -54,6 +55,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private var lastSignalPublishMillis = 0L
 
     init {
+        MetaBrainRuntime.initialize(application.applicationContext)
         synchronized(TradingViewModel::class.java) {
             if (runtimeOwner == null) runtimeOwner = this
         }
@@ -138,7 +140,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
                         override fun onOpen() {
                             _state.value = _state.value.copy(
                                 isConnected = true,
-                                message = "${selectedIndex.name} live · persistent process runtime · 3 PAPER engines",
+                                message = "${selectedIndex.name} live · META SHADOW learning · 3 PAPER engines",
                             )
                             runParallelAuto()
                         }
@@ -168,7 +170,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         val active = owner(); if (active !== this) { active.connectDemo(); return }
         disconnectInternal()
         resetMarketStructure()
-        _state.value = _state.value.copy(connectionMode = ConnectionMode.DEMO, isConnected = true, executionMode = ExecutionMode.PAPER, message = "Demo feed · persistent process runtime · 3 PAPER engines")
+        _state.value = _state.value.copy(connectionMode = ConnectionMode.DEMO, isConnected = true, executionMode = ExecutionMode.PAPER, message = "Demo feed · META SHADOW learning · 3 PAPER engines")
         feedJob = ProcessTradingScope.scope.launch {
             var n = 0
             while (true) {
@@ -189,7 +191,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
 
     fun disconnect() {
         val active = owner(); if (active !== this) { active.disconnect(); return }
-        disconnectInternal(); _state.value = _state.value.copy(isConnected = false, message = "Disconnected")
+        disconnectInternal(); MetaBrainRuntime.forceSave(); _state.value = _state.value.copy(isConnected = false, message = "Disconnected · AI state saved")
     }
     private fun disconnectInternal() { feedJob?.cancel(); feedJob = null; tickStream?.disconnect(); tickStream = null }
 
@@ -277,26 +279,61 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
             ticksReceived = current.ticksReceived + 1,
             marketDepthMode = depthMode,
             marketDepthLevels = depthLevels,
-            message = "${current.index.name} · ${current.ticksReceived + 1} ticks · $depthMode D$depthLevels · 3 PAPER engines",
+            message = "${current.index.name} · ${current.ticksReceived + 1} ticks · $depthMode D$depthLevels · META ${if (MetaBrainRuntime.report().gateEnabled) "GATE" else "SHADOW"}",
         )
         updatePositions(chain); managePositions()
     }
 
     private fun onSpotTick(price: Double, timestamp: Long) {
         if (price <= 0.0) return
+        MetaBrainRuntime.observeSpot(price, timestamp)
         tickCore.ingest(price, timestamp)
         ingestV76Minute(price, timestamp)
         _state.value = _state.value.copy(spotPrice = price, lastTickMillis = timestamp)
         if (timestamp - lastSignalPublishMillis >= 250L) {
             lastSignalPublishMillis = timestamp
             val result = tickCore.evaluate()
+            val e1Meta = decorateWithMeta(EngineId.ENGINE_1_TREND, result.engine1, timestamp)
             val e2Confirmed = confirmEngine2(result.engine2)
+            val e2Meta = decorateWithMeta(EngineId.ENGINE_2_AVWAP_LIQUIDITY, e2Confirmed, timestamp)
             _state.value = _state.value.copy(
-                engine1 = _state.value.engine1.copy(signal = result.engine1, message = result.engine1.setup),
-                engine2 = _state.value.engine2.copy(signal = e2Confirmed, message = e2Confirmed.setup),
+                engine1 = _state.value.engine1.copy(signal = e1Meta, message = e1Meta.setup),
+                engine2 = _state.value.engine2.copy(signal = e2Meta, message = e2Meta.setup),
             )
             runParallelAuto()
         }
+    }
+
+    private fun decorateWithMeta(engine: EngineId, raw: SignalSnapshot, timestamp: Long): SignalSnapshot {
+        val side = when {
+            raw.action == SignalAction.BUY_CE -> PositionSide.CE
+            raw.action == SignalAction.BUY_PE -> PositionSide.PE
+            raw.trend == TrendDirection.BULLISH -> PositionSide.CE
+            raw.trend == TrendDirection.BEARISH -> PositionSide.PE
+            else -> return raw
+        }
+        val spot = _state.value.spotPrice
+        if (spot <= 0.0) return raw
+        val quality = if (_state.value.connectionMode == ConnectionMode.DEMO) null else V76ExecutionQualityEngine.evaluate(side, _state.value.optionChain, spot)
+        return MetaBrainRuntime.decorate(
+            engine = engine,
+            raw = raw,
+            spot = spot,
+            timestamp = timestamp,
+            directionScore = quality?.directionScore?.toDouble() ?: raw.confidence * 0.60,
+            entryQualityScore = quality?.entryQualityScore?.toDouble() ?: raw.confidence * 0.40,
+            orderFlow = quality?.orderFlowProxy ?: 0.0,
+            relativeActivity = quality?.relativeActivity ?: 1.0,
+            oiImpulse = quality?.optionOiImpulse ?: 0.0,
+            optionFlow = quality?.optionFlowProxy ?: 0.0,
+            acceleration = quality?.acceleration ?: 0.0,
+            extensionAtr = quality?.extensionAtr ?: 0.0,
+            depthImbalance = quality?.depthImbalance ?: 0.0,
+            micropricePressure = quality?.micropricePressure ?: 0.0,
+            totalBookPressure = quality?.totalBookPressure ?: 0.0,
+            wallPressure = quality?.wallPressure ?: 0.0,
+            depthLevels = quality?.depthLevels?.toDouble() ?: 0.0,
+        )
     }
 
     private fun confirmEngine2(raw: SignalSnapshot): SignalSnapshot {
@@ -364,8 +401,9 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private fun evaluateV76() {
         if (v76Bars.isEmpty()) return
         val eval = v76Core.evaluate(v76Bars.toList(), _state.value.optionChain, _state.value.spotPrice, vixLtp)
-        lastV76Evaluation = eval
-        _state.value = _state.value.copy(engine3 = _state.value.engine3.copy(signal = eval.signal, message = eval.signal.setup))
+        val decorated = decorateWithMeta(EngineId.ENGINE_3_V76_SCALPER, eval.signal, System.currentTimeMillis())
+        lastV76Evaluation = eval.copy(signal = decorated)
+        _state.value = _state.value.copy(engine3 = _state.value.engine3.copy(signal = decorated, message = decorated.setup))
         runParallelAuto()
     }
 

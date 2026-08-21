@@ -9,7 +9,9 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
 import java.io.FileInputStream
+import java.io.InputStream
 import java.io.InputStreamReader
+import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneId
 import java.util.zip.GZIPInputStream
@@ -111,7 +113,7 @@ class LiveArchiveTrainingStore(context: Context) {
         sessions.forEachIndexed { i, dir ->
             if (shouldCancel()) error("Training cancelled")
             val compact = File(dir, COMPACT_FILE)
-            if (compact.isFile) {
+            if (compactIsFresh(dir, compact)) {
                 readLines(compact) { line ->
                     val record = runCatching { parseCompact(JSONObject(line)) }.getOrNull()
                     if (record == null) incompatibleRows++
@@ -124,7 +126,10 @@ class LiveArchiveTrainingStore(context: Context) {
                 observationFiles(dir).forEach { file ->
                     readLines(file) { line ->
                         if (shouldCancel()) error("Training cancelled")
-                        val o = runCatching { JSONObject(line) }.getOrNull() ?: run { incompatibleRows++; return@readLines }
+                        val o = runCatching { JSONObject(line) }.getOrNull() ?: run {
+                            incompatibleRows++
+                            return@readLines
+                        }
                         val id = o.optString("id")
                         val outcome = outcomes[id] ?: return@readLines
                         val record = runCatching { parseObservation(o, outcome) }.getOrNull()
@@ -165,7 +170,11 @@ class LiveArchiveTrainingStore(context: Context) {
 
     fun allCompletedForSession(sessionDir: File): List<Record> {
         val outcomes = LinkedHashMap<String, Outcome>()
-        outcomeFiles(sessionDir).forEach { file -> readLines(file) { line -> runCatching { parseOutcome(JSONObject(line)) }.getOrNull()?.let { outcomes.putIfAbsent(it.id, it) } } }
+        outcomeFiles(sessionDir).forEach { file ->
+            readLines(file) { line ->
+                runCatching { parseOutcome(JSONObject(line)) }.getOrNull()?.let { outcomes.putIfAbsent(it.id, it) }
+            }
+        }
         val records = ArrayList<Record>()
         val ids = HashSet<String>()
         val canonical = HashSet<String>()
@@ -174,7 +183,7 @@ class LiveArchiveTrainingStore(context: Context) {
                 val o = runCatching { JSONObject(line) }.getOrNull() ?: return@readLines
                 val outcome = outcomes[o.optString("id")] ?: return@readLines
                 val record = runCatching { parseObservation(o, outcome) }.getOrNull() ?: return@readLines
-                if (addDeduplicated(record, ids, canonical, records) == 0) Unit
+                addDeduplicated(record, ids, canonical, records)
             }
         }
         return records.sortedBy { it.observationTimestamp }
@@ -182,12 +191,25 @@ class LiveArchiveTrainingStore(context: Context) {
 
     internal fun sessionsRoot(): File = File(appContext.filesDir, "vardhani_live_research_archive/v1/sessions").apply { mkdirs() }
 
+    private fun compactIsFresh(dir: File, compact: File): Boolean {
+        if (!compact.isFile) return false
+        val manifestFile = File(dir, COMPACTION_MANIFEST)
+        val manifest = runCatching { JSONObject(manifestFile.readText(Charsets.UTF_8)) }.getOrNull() ?: return false
+        if (!manifest.optBoolean("verified", false)) return false
+        if (manifest.optInt("feature_schema", 0) > NumericalMetaBrain.FEATURE_SCHEMA_VERSION) return false
+        if (manifest.optString("compact_sha256") != sha256(compact)) return false
+        if (manifest.optString("observation_sources_sha256") != sourceSetHash(dir, "observations")) return false
+        if (manifest.optString("outcome_sources_sha256") != sourceSetHash(dir, "outcomes")) return false
+        return true
+    }
+
     private fun parseObservation(o: JSONObject, outcome: Outcome): Record? {
         if (!o.optString("schema").startsWith("vardhani-live-observation-v")) return null
         val archiveSchema = o.optInt("archive_schema", 0)
         val featureSchema = o.optInt("feature_schema", 0)
         if (archiveSchema <= 0 || featureSchema <= 0 || featureSchema > NumericalMetaBrain.FEATURE_SCHEMA_VERSION) return null
-        val id = o.optString("id"); if (id.isBlank() || id != outcome.id) return null
+        val id = o.optString("id")
+        if (id.isBlank() || id != outcome.id) return null
         val index = enumValue<MarketIndex>(o.optString("market")) ?: return null
         if (outcome.index != index) return null
         val engine = enumValue<EngineId>(o.optString("engine")) ?: return null
@@ -197,7 +219,6 @@ class LiveArchiveTrainingStore(context: Context) {
         val raw = DoubleArray(a.length()) { a.optDouble(it, Double.NaN) }
         if (raw.any { !it.isFinite() }) return null
         val vector = ArchivedFeatureVectorAdapter.normalizeLegacy(raw)
-        // Adapter validation catches malformed engine/market/side/intercept vectors.
         val reconstructed = ArchivedFeatureVectorAdapter.toFeatures(vector)
         if (reconstructed.index != index || reconstructed.engine != engine || reconstructed.side != side) return null
         return Record(
@@ -223,9 +244,11 @@ class LiveArchiveTrainingStore(context: Context) {
 
     private fun parseOutcome(o: JSONObject): Outcome? {
         if (!o.optString("schema").startsWith("vardhani-live-outcome-v")) return null
-        val id = o.optString("id"); if (id.isBlank()) return null
+        val id = o.optString("id")
+        if (id.isBlank()) return null
         val index = enumValue<MarketIndex>(o.optString("market")) ?: return null
-        val ts = o.optLong("timestamp", 0L); if (ts <= 0L) return null
+        val ts = o.optLong("timestamp", 0L)
+        if (ts <= 0L) return null
         val exit = o.optDouble("exit_premium", Double.NaN)
         val mfe = o.optDouble("mfe_return", Double.NaN)
         val mae = o.optDouble("mae_return", Double.NaN)
@@ -240,7 +263,8 @@ class LiveArchiveTrainingStore(context: Context) {
         if (featureSchema <= 0 || featureSchema > NumericalMetaBrain.FEATURE_SCHEMA_VERSION) return null
         val a = o.optJSONArray("features") ?: return null
         if (a.length() !in NumericalMetaBrain.LEGACY_FEATURE_COUNT..NumericalMetaBrain.FEATURE_COUNT) return null
-        val raw = DoubleArray(a.length()) { a.optDouble(it, Double.NaN) }; if (raw.any { !it.isFinite() }) return null
+        val raw = DoubleArray(a.length()) { a.optDouble(it, Double.NaN) }
+        if (raw.any { !it.isFinite() }) return null
         val vector = ArchivedFeatureVectorAdapter.normalizeLegacy(raw)
         val index = enumValue<MarketIndex>(o.optString("market")) ?: return null
         val engine = enumValue<EngineId>(o.optString("engine")) ?: return null
@@ -248,31 +272,78 @@ class LiveArchiveTrainingStore(context: Context) {
         val f = ArchivedFeatureVectorAdapter.toFeatures(vector)
         if (f.index != index || f.engine != engine || f.side != side) return null
         return Record(
-            id = o.optString("id"), index = index, engine = engine, side = side,
-            observationTimestamp = o.optLong("observation_timestamp"), outcomeTimestamp = o.optLong("outcome_timestamp"),
-            instrumentKey = o.optString("instrument_key"), entryPremium = o.optDouble("entry_premium"), lotSize = o.optInt("lot_size"),
-            vector = vector, success = o.optBoolean("success"), exitPremium = o.optDouble("exit_premium"),
-            mfeReturn = o.optDouble("mfe_return"), maeReturn = o.optDouble("mae_return"), netReturn = o.optDouble("net_return"),
-            exitReason = o.optString("exit_reason"), migratedLegacyVector = raw.size < NumericalMetaBrain.FEATURE_COUNT,
-        ).takeIf { it.id.isNotBlank() && it.observationTimestamp > 0 && it.outcomeTimestamp >= it.observationTimestamp && it.vector.all(Double::isFinite) }
+            id = o.optString("id"),
+            index = index,
+            engine = engine,
+            side = side,
+            observationTimestamp = o.optLong("observation_timestamp"),
+            outcomeTimestamp = o.optLong("outcome_timestamp"),
+            instrumentKey = o.optString("instrument_key"),
+            entryPremium = o.optDouble("entry_premium"),
+            lotSize = o.optInt("lot_size"),
+            vector = vector,
+            success = o.optBoolean("success"),
+            exitPremium = o.optDouble("exit_premium"),
+            mfeReturn = o.optDouble("mfe_return"),
+            maeReturn = o.optDouble("mae_return"),
+            netReturn = o.optDouble("net_return"),
+            exitReason = o.optString("exit_reason"),
+            migratedLegacyVector = raw.size < NumericalMetaBrain.FEATURE_COUNT,
+        ).takeIf {
+            it.id.isNotBlank() && it.observationTimestamp > 0 && it.outcomeTimestamp >= it.observationTimestamp &&
+                it.entryPremium > 0.0 && it.lotSize > 0 && it.exitPremium.isFinite() && it.mfeReturn.isFinite() &&
+                it.maeReturn.isFinite() && it.netReturn.isFinite() && it.vector.all(Double::isFinite)
+        }
     }
 
     private fun addDeduplicated(record: Record, ids: MutableSet<String>, canonical: MutableSet<String>, output: MutableList<Record>): Int {
         if (!ids.add(record.id)) return 1
-        if (!canonical.add(record.canonicalKey)) { ids.remove(record.id); return 2 }
+        if (!canonical.add(record.canonicalKey)) {
+            ids.remove(record.id)
+            return 2
+        }
         output += record
         return 0
     }
 
     private inline fun <reified T : Enum<T>> enumValue(value: String): T? = runCatching { enumValueOf<T>(value) }.getOrNull()
 
-    private fun observationFiles(dir: File): List<File> = dir.listFiles()?.filter { it.isFile && it.name.startsWith("observations") && it.name.endsWith(".ndjson") }.orEmpty()
-    private fun outcomeFiles(dir: File): List<File> = dir.listFiles()?.filter { it.isFile && it.name.startsWith("outcomes") && it.name.endsWith(".ndjson") }.orEmpty()
+    private fun observationFiles(dir: File): List<File> =
+        dir.listFiles()?.filter { it.isFile && it.name.startsWith("observations") && it.name.endsWith(".ndjson") }.orEmpty()
+
+    private fun outcomeFiles(dir: File): List<File> =
+        dir.listFiles()?.filter { it.isFile && it.name.startsWith("outcomes") && it.name.endsWith(".ndjson") }.orEmpty()
 
     private fun readLines(file: File, action: (String) -> Unit) {
         val input = if (file.name.endsWith(".gz")) GZIPInputStream(FileInputStream(file), BUFFER) else FileInputStream(file)
-        BufferedReader(InputStreamReader(input, Charsets.UTF_8), BUFFER).useLines { lines -> lines.filter(String::isNotBlank).forEach(action) }
+        BufferedReader(InputStreamReader(input, Charsets.UTF_8), BUFFER).useLines { lines ->
+            lines.filter(String::isNotBlank).forEach(action)
+        }
     }
+
+    private fun sourceSetHash(session: File, prefix: String): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        session.listFiles()?.filter { it.isFile && it.name.startsWith(prefix) && it.name.endsWith(".ndjson") }?.sortedBy { it.name }?.forEach { file ->
+            md.update(file.name.toByteArray(Charsets.UTF_8))
+            md.update(sha256(file).toByteArray(Charsets.UTF_8))
+        }
+        return md.digest().hex()
+    }
+
+    private fun sha256(file: File): String = FileInputStream(file).use(::sha256)
+
+    private fun sha256(input: InputStream): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(BUFFER)
+        while (true) {
+            val n = input.read(buffer)
+            if (n <= 0) break
+            md.update(buffer, 0, n)
+        }
+        return md.digest().hex()
+    }
+
+    private fun ByteArray.hex(): String = joinToString("") { "%02x".format(it) }
 
     private fun emptyResult() = LoadResult(emptyList(), Summary(0, 0, 0, 0, 0, 0L, 0L, 0, 0))
 

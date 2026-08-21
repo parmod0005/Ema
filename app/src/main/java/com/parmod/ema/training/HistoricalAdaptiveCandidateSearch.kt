@@ -8,8 +8,11 @@ import kotlin.math.roundToInt
  * Bounded historical-only Candidate evolution.
  *
  * Historical search must not collapse into a model that wins only by REJECTing.
- * This helper therefore treats decision coverage and cost-adjusted TAKE quality as
- * first-class search signals. Locked holdout results are never fed back here.
+ * This helper treats decision coverage and cost-adjusted TAKE quality as first-class
+ * search signals. Historical TAKE thresholds are allowed below 50% because the
+ * +target/-stop payoff is asymmetric; strict positive-net/precision governance is
+ * what determines whether such a threshold is usable. Locked holdout results are
+ * never fed back here.
  */
 object HistoricalAdaptiveCandidateSearch {
     const val MAX_ADAPTIVE_GENERATIONS = 6
@@ -50,11 +53,6 @@ object HistoricalAdaptiveCandidateSearch {
         }
     }
 
-    /**
-     * Ranking used while the locked holdout is still closed.
-     * A zero-TAKE model receives a large penalty even if its raw accuracy/Brier score
-     * looks attractive, which prevents the search from repeatedly evolving a reject-only parent.
-     */
     fun developmentSelectionScore(e: HistoricalCorpusTrainer.CandidateEvaluation): Double {
         val c = e.candidate
         val requiredTake = HistoricalCandidateGovernance.requiredActionSamples(c.labels).coerceAtLeast(1L)
@@ -72,8 +70,6 @@ object HistoricalAdaptiveCandidateSearch {
 
     fun selectBest(evaluations: List<HistoricalCorpusTrainer.CandidateEvaluation>): HistoricalCorpusTrainer.CandidateEvaluation? {
         if (evaluations.isEmpty()) return null
-        // If any candidate already has enough action evidence and passes the numerical
-        // development checks, choose the strongest of those instead of a reject-only high scorer.
         val actionReady = evaluations.filter { e ->
             val c = e.candidate
             val required = HistoricalCandidateGovernance.requiredActionSamples(c.labels)
@@ -115,20 +111,19 @@ object HistoricalAdaptiveCandidateSearch {
             attempts++
         }
 
-        // Deterministic fallback grid. This is especially important when a parent is
-        // sitting on a boundary such as TAKE=80% and many ordinary mutations collapse
-        // to the same bounded signature.
+        // Deterministic policy grid ensures zero-TAKE models explore economically
+        // meaningful probability cutoffs instead of being trapped at a 51% floor.
         var fallbackStep = 0
-        while (candidates.size < CANDIDATES_PER_GENERATION && fallbackStep < 128) {
+        while (candidates.size < CANDIDATES_PER_GENERATION && fallbackStep < 192) {
             val take = when (guidance) {
-                Guidance.INCREASE_TAKES -> 0.51 + (fallbackStep % 12) * 0.025
-                Guidance.IMPROVE_TAKE_QUALITY -> 0.58 + (fallbackStep % 10) * 0.025
-                else -> HIST_MIN_TAKE + (fallbackStep % 12) * 0.025
+                Guidance.INCREASE_TAKES -> 0.25 + (fallbackStep % 14) * 0.025
+                Guidance.IMPROVE_TAKE_QUALITY -> 0.35 + (fallbackStep % 14) * 0.025
+                else -> HIST_MIN_TAKE + (fallbackStep % 18) * 0.025
             }
             val reject = when (guidance) {
                 Guidance.INCREASE_REJECTS -> safeParent.rejectThreshold + 0.015 * (1 + fallbackStep % 6)
                 Guidance.IMPROVE_REJECT_QUALITY -> safeParent.rejectThreshold - 0.015 * (1 + fallbackStep % 5)
-                else -> safeParent.rejectThreshold + ((fallbackStep % 5) - 2) * 0.01
+                else -> safeParent.rejectThreshold + ((fallbackStep % 7) - 3) * 0.01
             }
             val proposed = bounded(
                 safeParent.copy(
@@ -168,12 +163,12 @@ object HistoricalAdaptiveCandidateSearch {
 
     private fun mutationsFor(guidance: Guidance): List<Mutation> = when (guidance) {
         Guidance.INCREASE_TAKES -> listOf(
-            Mutation(0.85, 1.00, -0.030, 0.000), Mutation(1.15, 1.00, -0.050, 0.000),
-            Mutation(0.90, 0.70, -0.070, +0.005), Mutation(1.10, 1.30, -0.090, -0.005),
-            Mutation(0.75, 1.20, -0.120, 0.000), Mutation(1.25, 0.80, -0.150, +0.010),
-            Mutation(1.00, 0.55, -0.040, +0.015), Mutation(1.00, 1.60, -0.080, -0.010),
-            Mutation(0.82, 0.85, -0.110, +0.005), Mutation(1.18, 1.15, -0.140, -0.005),
-            Mutation(0.95, 1.40, -0.060, +0.010), Mutation(1.05, 0.65, -0.100, 0.000),
+            Mutation(0.85, 1.00, -0.030, 0.000), Mutation(1.15, 1.00, -0.060, 0.000),
+            Mutation(0.90, 0.70, -0.090, +0.005), Mutation(1.10, 1.30, -0.120, -0.005),
+            Mutation(0.75, 1.20, -0.150, 0.000), Mutation(1.25, 0.80, -0.180, +0.010),
+            Mutation(1.00, 0.55, -0.070, +0.015), Mutation(1.00, 1.60, -0.110, -0.010),
+            Mutation(0.82, 0.85, -0.140, +0.005), Mutation(1.18, 1.15, -0.200, -0.005),
+            Mutation(0.95, 1.40, -0.080, +0.010), Mutation(1.05, 0.65, -0.160, 0.000),
         )
         Guidance.IMPROVE_TAKE_QUALITY -> listOf(
             Mutation(0.85, 1.25, +0.010, -0.005), Mutation(1.15, 0.80, +0.020, 0.000),
@@ -213,9 +208,9 @@ object HistoricalAdaptiveCandidateSearch {
     private const val HIST_MAX_LR = 0.060
     private const val HIST_MIN_L2 = 0.00003
     private const val HIST_MAX_L2 = 0.00800
-    private const val HIST_MIN_TAKE = 0.51
-    private const val HIST_MAX_TAKE = 0.82
-    private const val HIST_MIN_REJECT = 0.20
-    private const val HIST_MAX_REJECT = 0.49
-    private const val HIST_MIN_GAP = 0.04
+    private const val HIST_MIN_TAKE = 0.25
+    private const val HIST_MAX_TAKE = 0.85
+    private const val HIST_MIN_REJECT = 0.05
+    private const val HIST_MAX_REJECT = 0.60
+    private const val HIST_MIN_GAP = 0.05
 }

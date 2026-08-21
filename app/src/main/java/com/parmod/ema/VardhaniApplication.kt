@@ -9,11 +9,13 @@ import android.os.Build
 import com.parmod.ema.engine.MetaBrainPrefsMigration
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.training.DualMarketLiveTrainingCoordinator
+import com.parmod.ema.training.LiveResearchArchive
 
 class VardhaniApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         MetaBrainPrefsMigration.migrateV2ToV3IfNeeded(this)
+        LiveResearchArchive.initialize(this)
         MetaBrainRuntime.initialize(this)
         DualMarketLiveTrainingCoordinator.initialize(this)
         publishAiLabShortcut()

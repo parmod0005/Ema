@@ -5,6 +5,7 @@ import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.PositionSide
 import kotlin.math.exp
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /** Local numerical meta-model used for fast on-device inference and online learning. */
 class NumericalMetaBrain(
@@ -23,10 +24,10 @@ class NumericalMetaBrain(
         val rejectThreshold: Double = DEFAULT_REJECT_THRESHOLD,
     ) {
         fun sanitized(): HyperParameters {
-            // Probability cutoffs are policy parameters, not a statement that profitable
-            // trades must have >50% win probability. Historical research calibrates these
-            // cutoffs on development-only cost-adjusted outcomes. Live/manual profiles can
-            // still remain conservative at their configured values.
+            // Probability cutoffs are policy parameters, not a claim that profitable
+            // trades must have >50% win probability. Historical research can calibrate
+            // lower cutoffs against cost-adjusted TAKE outcomes while live/manual seed
+            // profiles remain conservative at their configured thresholds.
             val take = takeThreshold.coerceIn(0.25, 0.90)
             val reject = rejectThreshold.coerceIn(0.05, 0.60).coerceAtMost(take - 0.05)
             return copy(
@@ -74,7 +75,7 @@ class NumericalMetaBrain(
             optionFlow.coerceIn(-1.0, 1.0),
             acceleration.coerceIn(-3.0, 3.0) / 3.0,
             (extensionAtr / 6.0).coerceIn(0.0, 2.0),
-            depthImalanceSafe(depthImbalance),
+            depthImbalance.coerceIn(-1.0, 1.0),
             micropricePressure.coerceIn(-1.0, 1.0),
             totalBookPressure.coerceIn(-1.0, 1.0),
             wallPressure.coerceIn(-1.0, 1.0),
@@ -83,8 +84,6 @@ class NumericalMetaBrain(
             (recentEngineWinRate / 100.0).coerceIn(0.0, 1.0),
             min(recentEngineProfitFactor, 3.0) / 3.0,
         )
-
-        private fun depthImalanceSafe(value: Double): Double = value.coerceIn(-1.0, 1.0)
     }
 
     data class Prediction(
@@ -110,6 +109,13 @@ class NumericalMetaBrain(
     private var learned = 0L
     private var version = 1L
     private var hyperParameters = HyperParameters(learningRate, l2, takeThreshold, rejectThreshold).sanitized()
+
+    // Ephemeral label-balance counters are deliberately reset when a model state is
+    // restored. They affect only subsequent gradient scaling; model weights remain the
+    // persistent source of truth. Laplace smoothing avoids unstable early-session jumps.
+    private var sessionSuccesses = 0L
+    private var sessionFailures = 0L
+
     var mode: Mode = Mode.SHADOW
         private set
 
@@ -128,6 +134,7 @@ class NumericalMetaBrain(
         bias = priorBias
         learned = priorSamples.coerceAtLeast(0L)
         version++
+        resetBalanceCounters()
     }
 
     fun restore(state: ModelState) {
@@ -138,6 +145,7 @@ class NumericalMetaBrain(
         version = state.modelVersion.coerceAtLeast(1L)
         mode = state.mode
         hyperParameters = state.hyperParameters.sanitized()
+        resetBalanceCounters()
     }
 
     fun snapshot(): ModelState = ModelState(weights.copyOf(), bias, learned, version, mode, hyperParameters)
@@ -159,14 +167,34 @@ class NumericalMetaBrain(
         val x = features.vector()
         val p = predict(features).probabilitySuccess
         val y = if (success) 1.0 else 0.0
-        val error = (y - p) * sampleWeight.coerceIn(0.1, 5.0)
+
+        // Square-root inverse-frequency weighting is intentionally milder than full
+        // inverse-frequency weighting. It counters majority-class collapse while
+        // preserving probability calibration far better than hard oversampling.
+        val classWeight = adaptiveClassWeight(success)
+        val effectiveWeight = (sampleWeight.coerceIn(0.1, 5.0) * classWeight).coerceIn(0.1, 5.0)
+        val error = (y - p) * effectiveWeight
         for (i in weights.indices) {
             weights[i] += hyperParameters.learningRate * (error * x[i] - hyperParameters.l2 * weights[i])
             weights[i] = weights[i].coerceIn(-8.0, 8.0)
         }
         bias = (bias + hyperParameters.learningRate * error).coerceIn(-8.0, 8.0)
+        if (success) sessionSuccesses++ else sessionFailures++
         learned++
         if (learned % 100L == 0L) version++
+    }
+
+    private fun adaptiveClassWeight(success: Boolean): Double {
+        val p = sessionSuccesses + BALANCE_SMOOTHING
+        val n = sessionFailures + BALANCE_SMOOTHING
+        val total = p + n
+        val inverse = if (success) total.toDouble() / (2.0 * p) else total.toDouble() / (2.0 * n)
+        return sqrt(inverse).coerceIn(MIN_CLASS_WEIGHT, MAX_CLASS_WEIGHT)
+    }
+
+    private fun resetBalanceCounters() {
+        sessionSuccesses = 0L
+        sessionFailures = 0L
     }
 
     companion object {
@@ -175,6 +203,10 @@ class NumericalMetaBrain(
         const val DEFAULT_L2 = 0.0005
         const val DEFAULT_TAKE_THRESHOLD = 0.66
         const val DEFAULT_REJECT_THRESHOLD = 0.42
+
+        private const val BALANCE_SMOOTHING = 12L
+        private const val MIN_CLASS_WEIGHT = 0.70
+        private const val MAX_CLASS_WEIGHT = 1.80
 
         private fun sigmoid(value: Double): Double = when {
             value >= 35.0 -> 1.0

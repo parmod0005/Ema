@@ -8,12 +8,14 @@ import android.graphics.drawable.Icon
 import android.os.Build
 import com.parmod.ema.engine.MetaBrainPrefsMigration
 import com.parmod.ema.engine.MetaBrainRuntime
+import com.parmod.ema.training.DualMarketLiveTrainingCoordinator
 
 class VardhaniApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         MetaBrainPrefsMigration.migrateV2ToV3IfNeeded(this)
         MetaBrainRuntime.initialize(this)
+        DualMarketLiveTrainingCoordinator.initialize(this)
         publishAiLabShortcut()
     }
 

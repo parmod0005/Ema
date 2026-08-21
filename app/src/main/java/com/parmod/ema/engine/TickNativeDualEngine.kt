@@ -1,6 +1,7 @@
 package com.parmod.ema.engine
 
 import com.parmod.ema.model.EngineId
+import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.SignalAction
 import com.parmod.ema.model.SignalSnapshot
 import com.parmod.ema.model.TrendDirection
@@ -9,12 +10,11 @@ import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
- * Tick-native signal core. Every underlying tick is ingested; no completed candle is required.
- * Engine 1: tick EMA trend + directional efficiency + breakout/anti-chop + late-chase protection.
- * Engine 2: tick AVWAP + tick-profile POC + liquidity sweep + uptick/downtick order-flow proxy.
+ * Tick-native signal core.
  *
- * Numerical Meta Brain runs in SHADOW mode: E1/E2 decisions are unchanged, but every meaningful
- * candidate is scored and automatically labelled from subsequent live spot movement.
+ * V4 rule: this class owns only market features/signals. Tick ingestion and reset do
+ * not mutate global AI training state. The caller explicitly supplies MarketIndex at
+ * evaluation time so NIFTY/SENSEX can run concurrently without inference by price.
  */
 class TickNativeDualEngine {
     data class Tick(val price: Double, val timestamp: Long)
@@ -28,24 +28,30 @@ class TickNativeDualEngine {
         ticks.clear()
         cumulativePv = 0.0
         cumulativeWeight = 0.0
-        MetaBrainRuntime.resetSession()
     }
 
     fun ingest(price: Double, timestamp: Long) {
-        if (price <= 0.0) return
+        if (price <= 0.0 || timestamp <= 0L) return
+        val last = ticks.lastOrNull()
+        if (last != null && timestamp < last.timestamp) return
         ticks.addLast(Tick(price, timestamp))
         cumulativePv += price
         cumulativeWeight += 1.0
         while (ticks.size > MAX_TICKS) ticks.removeFirst()
-        MetaBrainRuntime.observeSpot(price, timestamp)
     }
 
-    fun evaluate(): Result {
+    fun evaluate(index: MarketIndex): Result {
         val list = ticks.toList()
-        return Result(evaluateTrend(list), evaluateAvwap(list), list.size)
+        return Result(evaluateTrend(index, list), evaluateAvwap(index, list), list.size)
     }
 
-    private fun evaluateTrend(t: List<Tick>): SignalSnapshot {
+    /** Legacy compatibility; explicit [evaluate] with MarketIndex is preferred. */
+    fun evaluate(): Result {
+        val market = if ((ticks.lastOrNull()?.price ?: 0.0) >= 50_000.0) MarketIndex.SENSEX else MarketIndex.NIFTY
+        return evaluate(market)
+    }
+
+    private fun evaluateTrend(index: MarketIndex, t: List<Tick>): SignalSnapshot {
         if (t.size < TREND_MIN_TICKS) return wait("Fast warm-up ${t.size}/$TREND_MIN_TICKS ticks", "TICK TREND WARMING")
 
         val prices = t.map { it.price }
@@ -98,7 +104,9 @@ class TickNativeDualEngine {
 
         val trend = if (bullish) TrendDirection.BULLISH else if (bearish) TrendDirection.BEARISH else TrendDirection.NEUTRAL
         val signedFlow = orderFlowProxy(prices.takeLast(100)) * if (bearish) -1.0 else 1.0
-        val acceleration = if (microAtr > 0.0) ((fastSlope + slowSlope) / microAtr) * if (bearish) -1.0 else ((fastSlope + slowSlope) / microAtr) else 0.0
+        val acceleration = if (microAtr > 0.0) {
+            ((fastSlope + slowSlope) / microAtr) * if (bearish) -1.0 else ((fastSlope + slowSlope) / microAtr)
+        } else 0.0
         val qualityScore = when {
             overextended -> 8.0
             antiChop && breakout -> 36.0
@@ -110,13 +118,11 @@ class TickNativeDualEngine {
             reasons += "Blocked: OVEREXTENDED / WAIT FOR PULLBACK"
             reasons += "Extension ${fmt(extensionFromFastAtr)} ATR · impulse ${fmt(impulseAtr)} ATR · overshoot ${fmt(breakoutOvershootAtr)} ATR"
             val raw = SignalSnapshot(
-                SignalAction.WAIT,
-                score,
-                trend,
-                null, null, null, reasons,
+                SignalAction.WAIT, score, trend, null, null, null, reasons,
                 "OVEREXTENDED · WAIT FOR PULLBACK",
             )
             return if (trend == TrendDirection.NEUTRAL) raw else MetaBrainRuntime.decorate(
+                index = index,
                 engine = EngineId.ENGINE_1_TREND,
                 raw = raw,
                 spot = current,
@@ -142,6 +148,7 @@ class TickNativeDualEngine {
             }
         }
         return if (raw.trend == TrendDirection.NEUTRAL) raw else MetaBrainRuntime.decorate(
+            index = index,
             engine = EngineId.ENGINE_1_TREND,
             raw = raw,
             spot = current,
@@ -154,7 +161,7 @@ class TickNativeDualEngine {
         )
     }
 
-    private fun evaluateAvwap(t: List<Tick>): SignalSnapshot {
+    private fun evaluateAvwap(index: MarketIndex, t: List<Tick>): SignalSnapshot {
         if (t.size < AVWAP_MIN_TICKS) return wait("Fast warm-up ${t.size}/$AVWAP_MIN_TICKS ticks", "TICK AVWAP WARMING")
         val prices = t.map { it.price }
         val current = prices.last()
@@ -217,6 +224,7 @@ class TickNativeDualEngine {
         val extension = if (atr > 0.0) abs(current - avwap) / atr else 0.0
         val parts = max(bullParts, bearParts)
         return MetaBrainRuntime.decorate(
+            index = index,
             engine = EngineId.ENGINE_2_AVWAP_LIQUIDITY,
             raw = raw,
             spot = current,
@@ -284,12 +292,17 @@ class TickNativeDualEngine {
         if (values.isEmpty()) return 0.0
         val step = max(atr * 0.75, values.last() * 0.00003)
         val buckets = linkedMapOf<Long, Int>()
-        values.forEach { p -> val key = (p / step).toLong(); buckets[key] = (buckets[key] ?: 0) + 1 }
+        values.forEach { p ->
+            val key = (p / step).toLong()
+            buckets[key] = (buckets[key] ?: 0) + 1
+        }
         val key = buckets.maxByOrNull { it.value }?.key ?: return values.last()
         return (key + 0.5) * step
     }
 
-    private fun wait(reason: String, setup: String) = SignalSnapshot(SignalAction.WAIT, 0, TrendDirection.NEUTRAL, null, null, null, listOf(reason), setup)
+    private fun wait(reason: String, setup: String) =
+        SignalSnapshot(SignalAction.WAIT, 0, TrendDirection.NEUTRAL, null, null, null, listOf(reason), setup)
+
     private fun fmt(v: Double) = "%.2f".format(v)
 
     companion object {

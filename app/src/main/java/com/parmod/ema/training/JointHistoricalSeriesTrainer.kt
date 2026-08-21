@@ -15,10 +15,10 @@ import kotlin.math.min
 import kotlin.math.pow
 
 /**
- * Industrial-style joint historical research for the shared VARDHANI brain.
- * NIFTY and SENSEX samples are merged strictly by timestamp, one Candidate is fitted
- * on both markets, and development + locked-holdout governance is checked both
- * overall and per market. The holdout is opened once only.
+ * Joint historical research for the shared VARDHANI brain.
+ * NIFTY and SENSEX are merged chronologically; each walk-forward block fits weights,
+ * calibrates one shared cost-aware policy on an early forward slice, and scores it on
+ * a later forward slice. Locked holdout is opened once only after dual-market governance.
  */
 class JointHistoricalSeriesTrainer(
     private val productionBaseline: NumericalMetaBrain.ModelState,
@@ -175,7 +175,7 @@ class JointHistoricalSeriesTrainer(
                         if (generation == 0) "JOINT_WALK_FORWARD" else "JOINT_ADAPT_G$generation",
                         i,
                         hypers.size,
-                        if (generation == 0) "$sourceLabel BOTH · seed ${i + 1}/${hypers.size}" else "$sourceLabel BOTH · G$generation ${guidance?.name ?: "BALANCED"} · ${i + 1}/${hypers.size} · locked holdout untouched",
+                        if (generation == 0) "$sourceLabel BOTH · seed ${i + 1}/${hypers.size} · nested policy calibration" else "$sourceLabel BOTH · G$generation ${guidance?.name ?: "BALANCED"} · ${i + 1}/${hypers.size} · holdout untouched",
                     ),
                 )
                 evaluations += evaluateWalkForward(development, hyper, config.walkForwardFolds, coverage, corpus.size)
@@ -203,7 +203,7 @@ class JointHistoricalSeriesTrainer(
                     "JOINT_EVOLVE",
                     adaptiveGenerations,
                     HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
-                    "BOTH G$adaptiveGenerations ${guidance.name} · parent TAKE ${parent.summary.candidate.takeSamples}/${HistoricalCandidateGovernance.requiredActionSamples(parent.summary.candidate.labels)} · locked holdout untouched",
+                    "BOTH G$adaptiveGenerations ${guidance.name} · model evolves; shared policy recalibrates on both markets inside development · holdout untouched",
                 ),
             )
             evalBatch(batch.candidates, adaptiveGenerations, guidance)
@@ -214,11 +214,11 @@ class JointHistoricalSeriesTrainer(
             return result(
                 config, from, to, expiryCount, selected.size, corpus, coverage, evaluations.size, best?.summary,
                 false, false, null, null, null, errors,
-                "$sourceLabel · BOTH joint adaptive search exhausted G$adaptiveGenerations · ${best?.governance?.label ?: "CLOSED"}: ${best?.governance?.reasons?.joinToString("; ") ?: "no candidate"} · locked holdout never opened.",
+                "$sourceLabel · BOTH joint model + policy search exhausted G$adaptiveGenerations · ${best?.governance?.label ?: "CLOSED"}: ${best?.governance?.reasons?.joinToString("; ") ?: "no candidate"} · locked holdout never opened.",
             )
         }
 
-        onProgress(HistoricalCorpusTrainer.Progress("JOINT_LOCKED_HOLDOUT", 0, 1, "BOTH development-qualified after G$adaptiveGenerations · opening locked holdout ONCE"))
+        onProgress(HistoricalCorpusTrainer.Progress("JOINT_LOCKED_HOLDOUT", 0, 1, "BOTH model + shared policy development-qualified after G$adaptiveGenerations · opening locked holdout ONCE"))
         val champion = brainFromBaseline(best.summary.hyperParameters)
         learn(champion, development)
         val production = brainFromBaseline(productionBaseline.hyperParameters)
@@ -241,7 +241,8 @@ class JointHistoricalSeriesTrainer(
         val note = buildString {
             append("$sourceLabel · BOTH NIFTY+SENSEX joint chronological corpus · ")
             append("${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved across G$adaptiveGenerations · ")
-            append("locked holdout opened once · dual-market governance ${governance.label}: ${governance.reasons.joinToString("; ")} · ")
+            append("each development fold: fit → dual-market policy calibration → forward score · locked holdout opened once · ")
+            append("dual-market governance ${governance.label}: ${governance.reasons.joinToString("; ")} · ")
             append("NIFTY holdout labels ${candidateBy[MarketIndex.NIFTY]?.labels ?: 0} · SENSEX ${candidateBy[MarketIndex.SENSEX]?.labels ?: 0} · ")
             append("actual option-premium MFE/MAE · next-bar entry · historical D30 unavailable stays zero.")
         }
@@ -331,23 +332,49 @@ class JointHistoricalSeriesTrainer(
         val productionTotal = Acc()
         val candidateMarketAcc = MarketIndex.entries.associateWith { Acc() }.toMutableMap()
         val productionMarketAcc = MarketIndex.entries.associateWith { Acc() }.toMutableMap()
+        val takePolicies = ArrayList<Double>()
+        val rejectPolicies = ArrayList<Double>()
+        var calibrationScore = 0.0
         var foldsRun = 0
         var foldsWon = 0
+
         for (fold in 1..requestedFolds) {
             val trainEnd = development.size * fold / blocks
             val validateEnd = if (fold == requestedFolds) development.size else development.size * (fold + 1) / blocks
             if (trainEnd < 20 || validateEnd <= trainEnd) continue
             val train = development.subList(0, trainEnd)
             val validation = development.subList(trainEnd, validateEnd)
+            if (validation.size < MIN_FOLD_VALIDATION) continue
+            val calibrationSize = max(MIN_FOLD_CALIBRATION, (validation.size * CALIBRATION_FRACTION).toInt())
+                .coerceAtMost(validation.size - MIN_FOLD_SCORING)
+            if (calibrationSize <= 0 || validation.size - calibrationSize < MIN_FOLD_SCORING) continue
+            val calibrationSlice = validation.subList(0, calibrationSize)
+            val scoringSlice = validation.subList(calibrationSize, validation.size)
+            if (MarketIndex.entries.any { market -> calibrationSlice.count { it.index == market } < MIN_MARKET_CALIBRATION }) continue
+
             val candidate = brainFromBaseline(hyper)
             learn(candidate, train)
+            val overall = BinaryTrainingPolicy.StreamingCalibration()
+            val byMarket = MarketIndex.entries.associateWith { BinaryTrainingPolicy.StreamingCalibration() }
+            calibrationSlice.forEach { s ->
+                val p = candidate.predict(s.features)
+                overall.add(p.probabilitySuccess, s.success, s.netReturn)
+                byMarket.getValue(s.index).add(p.probabilitySuccess, s.success, s.netReturn)
+            }
+            val current = candidate.currentHyperParameters()
+            val policy = BinaryTrainingPolicy.calibrateJoint(overall, byMarket.values, current)
+            candidate.configure(current.copy(takeThreshold = policy.takeThreshold, rejectThreshold = policy.rejectThreshold), bumpVersion = false)
+            takePolicies += policy.takeThreshold
+            rejectPolicies += policy.rejectThreshold
+            calibrationScore += policy.score
+
             val production = brainFromBaseline(productionBaseline.hyperParameters)
-            val cm = evaluate(candidate, validation)
-            val pm = evaluate(production, validation)
+            val cm = evaluate(candidate, scoringSlice)
+            val pm = evaluate(production, scoringSlice)
             candidateTotal.merge(cm)
             productionTotal.merge(pm)
-            val cBy = evaluateAccByMarket(candidate, validation)
-            val pBy = evaluateAccByMarket(production, validation)
+            val cBy = evaluateAccByMarket(candidate, scoringSlice)
+            val pBy = evaluateAccByMarket(production, scoringSlice)
             MarketIndex.entries.forEach { m ->
                 candidateMarketAcc.getValue(m).merge(cBy.getValue(m))
                 productionMarketAcc.getValue(m).merge(pBy.getValue(m))
@@ -361,12 +388,17 @@ class JointHistoricalSeriesTrainer(
             }
             if (overallWin && marketSafe) foldsWon++
         }
+
         val cMetrics = candidateTotal.metrics()
         val pMetrics = productionTotal.metrics()
         val winRatio = if (foldsRun == 0) 0.0 else foldsWon.toDouble() / foldsRun
-        val score = foldScore(cMetrics, pMetrics) + 0.08 * (winRatio - 0.50)
+        val medianTake = median(takePolicies, hyper.takeThreshold)
+        val medianReject = median(rejectPolicies, hyper.rejectThreshold).coerceAtMost(medianTake - BinaryTrainingPolicy.MIN_THRESHOLD_GAP)
+        val calibratedHyper = HistoricalAdaptiveCandidateSearch.bounded(hyper.copy(takeThreshold = medianTake, rejectThreshold = medianReject))
+        val score = foldScore(cMetrics, pMetrics) + 0.08 * (winRatio - 0.50) +
+            if (foldsRun == 0) 0.0 else 0.10 * calibrationScore / foldsRun
         val robust = foldsRun >= 3 && foldsWon >= ceil(foldsRun * 0.75).toInt()
-        val summary = HistoricalCorpusTrainer.CandidateEvaluation(hyper, foldsRun, foldsWon, cMetrics, pMetrics, score, robust)
+        val summary = HistoricalCorpusTrainer.CandidateEvaluation(calibratedHyper, foldsRun, foldsWon, cMetrics, pMetrics, score, robust)
         val cByMetrics = candidateMarketAcc.mapValues { it.value.metrics() }
         val pByMetrics = productionMarketAcc.mapValues { it.value.metrics() }
         val governance = DualMarketHistoricalGovernance.evaluateDevelopment(cMetrics, pMetrics, cByMetrics, pByMetrics, coverage, corpusSamples)
@@ -469,6 +501,13 @@ class JointHistoricalSeriesTrainer(
         return ((((c - b) / b) - ((b - a) / a)) * 1_000.0).coerceIn(-3.0, 3.0)
     }
 
+    private fun median(values: List<Double>, fallback: Double): Double {
+        if (values.isEmpty()) return fallback
+        val sorted = values.sorted()
+        val mid = sorted.size / 2
+        return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2.0
+    }
+
     private fun result(
         config: HistoricalCorpusTrainer.Config,
         from: LocalDate,
@@ -487,7 +526,7 @@ class JointHistoricalSeriesTrainer(
         errors: List<String>,
         note: String,
     ) = HistoricalCorpusTrainer.Result(
-        index = MarketIndex.NIFTY, // Result schema is legacy single-index; note/UI marks BOTH explicitly.
+        index = MarketIndex.NIFTY,
         months = config.months,
         fromDate = from,
         toDate = to,
@@ -511,4 +550,12 @@ class JointHistoricalSeriesTrainer(
     )
 
     private fun List<Double>.averageOrZero(): Double = if (isEmpty()) 0.0 else average()
+
+    companion object {
+        private const val CALIBRATION_FRACTION = 0.35
+        private const val MIN_FOLD_CALIBRATION = 20
+        private const val MIN_FOLD_SCORING = 30
+        private const val MIN_FOLD_VALIDATION = MIN_FOLD_CALIBRATION + MIN_FOLD_SCORING
+        private const val MIN_MARKET_CALIBRATION = 5
+    }
 }

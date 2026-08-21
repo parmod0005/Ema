@@ -3,7 +3,9 @@ package com.parmod.ema.training
 import android.content.Context
 import com.parmod.ema.BuildConfig
 import com.parmod.ema.engine.NumericalMetaBrain
+import com.parmod.ema.model.EngineId
 import com.parmod.ema.model.MarketIndex
+import com.parmod.ema.model.PositionSide
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -25,9 +27,9 @@ import java.util.zip.ZipOutputStream
  * Append-only live research archive designed to survive normal APK upgrades and be
  * portable across uninstall/signature/device changes via explicit ZIP export/import.
  *
- * Raw transport is intentionally sampled to one row/second/instrument. This preserves
- * option/spot/D30/OI/volume microstructure for future feature revisions without turning
- * a phone into an unbounded tick recorder. Completed 1m bars are stored separately.
+ * Raw transport is intentionally sampled to one row/second/instrument. Completed 1m
+ * bars, every registered AI observation and every resolved premium outcome are stored
+ * separately. Schema + app + feature versions make later migration explicit.
  */
 object LiveResearchArchive {
     data class Summary(
@@ -36,6 +38,8 @@ object LiveResearchArchive {
         val bytes: Long = 0L,
         val tickRows: Long = 0L,
         val minuteRows: Long = 0L,
+        val observations: Long = 0L,
+        val outcomes: Long = 0L,
         val importedArchives: Int = 0,
         val schemaVersion: Int = ARCHIVE_SCHEMA,
         val featureSchemaVersion: Int = NumericalMetaBrain.FEATURE_SCHEMA_VERSION,
@@ -82,14 +86,10 @@ object LiveResearchArchive {
         val last = lastTickWrite[sampleKey] ?: 0L
         if (timestamp - last < TICK_SAMPLE_MS) return
         lastTickWrite[sampleKey] = timestamp
-        val row = JSONObject()
-            .put("schema", "vardhani-live-tick-v$ARCHIVE_SCHEMA")
-            .put("feature_schema", NumericalMetaBrain.FEATURE_SCHEMA_VERSION)
-            .put("app_version", BuildConfig.VERSION_NAME)
+        val row = base("vardhani-live-tick-v$ARCHIVE_SCHEMA", timestamp)
             .put("market", index.name)
             .put("kind", kind)
             .put("instrument_key", instrumentKey)
-            .put("timestamp", timestamp)
             .put("ltp", ltp ?: JSONObject.NULL)
             .put("oi", oi ?: JSONObject.NULL)
             .put("volume", volume ?: JSONObject.NULL)
@@ -120,12 +120,8 @@ object LiveResearchArchive {
         ticks: Long,
     ) {
         if (!initialized || timestamp <= 0L || close <= 0.0) return
-        val row = JSONObject()
-            .put("schema", "vardhani-live-minute-v$ARCHIVE_SCHEMA")
-            .put("feature_schema", NumericalMetaBrain.FEATURE_SCHEMA_VERSION)
-            .put("app_version", BuildConfig.VERSION_NAME)
+        val row = base("vardhani-live-minute-v$ARCHIVE_SCHEMA", timestamp)
             .put("market", index.name)
-            .put("timestamp", timestamp)
             .put("open", open)
             .put("high", high)
             .put("low", low)
@@ -133,6 +129,73 @@ object LiveResearchArchive {
             .put("ticks", ticks)
         append(sessionFile(timestamp, "underlying_1m.ndjson"), row.toString())
         increment(KEY_MINUTE_ROWS)
+    }
+
+    @Synchronized
+    fun captureObservation(
+        id: String,
+        index: MarketIndex,
+        engine: EngineId,
+        side: PositionSide,
+        timestamp: Long,
+        instrumentKey: String,
+        entrySpot: Double,
+        entryPremium: Double,
+        lotSize: Int,
+        features: NumericalMetaBrain.Features,
+        productionProbability: Double,
+        candidateProbability: Double,
+        candidateDecision: NumericalMetaBrain.Decision,
+        hyper: NumericalMetaBrain.HyperParameters,
+    ) {
+        if (!initialized || id.isBlank() || timestamp <= 0L) return
+        val vector = JSONArray()
+        features.vector().forEach { vector.put(it) }
+        val row = base("vardhani-live-observation-v$ARCHIVE_SCHEMA", timestamp)
+            .put("id", id)
+            .put("market", index.name)
+            .put("engine", engine.name)
+            .put("side", side.name)
+            .put("instrument_key", instrumentKey)
+            .put("entry_spot", entrySpot)
+            .put("entry_premium", entryPremium)
+            .put("lot_size", lotSize)
+            .put("production_probability", productionProbability)
+            .put("candidate_probability", candidateProbability)
+            .put("candidate_decision", candidateDecision.name)
+            .put("learning_rate", hyper.learningRate)
+            .put("l2", hyper.l2)
+            .put("take_threshold", hyper.takeThreshold)
+            .put("reject_threshold", hyper.rejectThreshold)
+            .put("features", vector)
+        append(sessionFile(timestamp, "observations.ndjson"), row.toString())
+        increment(KEY_OBSERVATIONS)
+    }
+
+    @Synchronized
+    fun captureOutcome(
+        id: String,
+        index: MarketIndex,
+        timestamp: Long,
+        success: Boolean,
+        exitPremium: Double,
+        mfeReturn: Double,
+        maeReturn: Double,
+        netReturn: Double,
+        exitReason: String,
+    ) {
+        if (!initialized || id.isBlank() || timestamp <= 0L) return
+        val row = base("vardhani-live-outcome-v$ARCHIVE_SCHEMA", timestamp)
+            .put("id", id)
+            .put("market", index.name)
+            .put("success", success)
+            .put("exit_premium", exitPremium)
+            .put("mfe_return", mfeReturn)
+            .put("mae_return", maeReturn)
+            .put("net_return", netReturn)
+            .put("exit_reason", exitReason)
+        append(sessionFile(timestamp, "outcomes.ndjson"), row.toString())
+        increment(KEY_OUTCOMES)
     }
 
     @Synchronized
@@ -147,6 +210,8 @@ object LiveResearchArchive {
             bytes = allFiles.sumOf { it.length() },
             tickRows = prefs.getLong(KEY_TICK_ROWS, 0L),
             minuteRows = prefs.getLong(KEY_MINUTE_ROWS, 0L),
+            observations = prefs.getLong(KEY_OBSERVATIONS, 0L),
+            outcomes = prefs.getLong(KEY_OUTCOMES, 0L),
             importedArchives = prefs.getInt(KEY_IMPORTED, 0),
         )
     }
@@ -156,15 +221,16 @@ object LiveResearchArchive {
     fun exportZip(output: OutputStream) {
         check(initialized) { "LiveResearchArchive is not initialized" }
         ZipOutputStream(BufferedOutputStream(output, BUFFER)).use { zip ->
+            val s = summary()
             val manifest = JSONObject()
                 .put("schema", "vardhani-live-archive-v$ARCHIVE_SCHEMA")
                 .put("feature_schema", NumericalMetaBrain.FEATURE_SCHEMA_VERSION)
                 .put("created_at", System.currentTimeMillis())
                 .put("app_version", BuildConfig.VERSION_NAME)
                 .put("summary", JSONObject().apply {
-                    val s = summary()
                     put("sessions", s.sessions); put("files", s.files); put("bytes", s.bytes)
                     put("tick_rows", s.tickRows); put("minute_rows", s.minuteRows)
+                    put("observations", s.observations); put("outcomes", s.outcomes)
                 })
             zip.putNextEntry(ZipEntry("manifest.json"))
             zip.write(manifest.toString(2).toByteArray())
@@ -214,7 +280,9 @@ object LiveResearchArchive {
                         !target.exists() -> { staged.copyTo(target); imported++ }
                         sha256(target) == sha256(staged) -> Unit
                         else -> {
-                            val alternate = File(target.parentFile, target.nameWithoutExtension + ".imported-${sha256(staged).take(10)}." + target.extension)
+                            val ext = target.extension
+                            val suffix = if (ext.isBlank()) ".imported-${sha256(staged).take(10)}" else ".imported-${sha256(staged).take(10)}.$ext"
+                            val alternate = File(target.parentFile, target.nameWithoutExtension + suffix)
                             if (!alternate.exists()) { staged.copyTo(alternate); imported++ }
                         }
                     }
@@ -227,6 +295,13 @@ object LiveResearchArchive {
         if (imported > 0) prefs().edit().putInt(KEY_IMPORTED, prefs().getInt(KEY_IMPORTED, 0) + 1).apply()
         return imported
     }
+
+    private fun base(schema: String, timestamp: Long) = JSONObject()
+        .put("schema", schema)
+        .put("archive_schema", ARCHIVE_SCHEMA)
+        .put("feature_schema", NumericalMetaBrain.FEATURE_SCHEMA_VERSION)
+        .put("app_version", BuildConfig.VERSION_NAME)
+        .put("timestamp", timestamp)
 
     private fun append(file: File, line: String) {
         file.parentFile?.mkdirs()
@@ -276,5 +351,7 @@ object LiveResearchArchive {
     private const val BUFFER = 64 * 1024
     private const val KEY_TICK_ROWS = "tick_rows"
     private const val KEY_MINUTE_ROWS = "minute_rows"
+    private const val KEY_OBSERVATIONS = "observations"
+    private const val KEY_OUTCOMES = "outcomes"
     private const val KEY_IMPORTED = "imported_archives"
 }

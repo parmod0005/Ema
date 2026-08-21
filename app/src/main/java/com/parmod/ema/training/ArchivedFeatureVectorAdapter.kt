@@ -66,7 +66,9 @@ object ArchivedFeatureVectorAdapter {
     }
 
     fun normalizeLegacy(vector: DoubleArray): DoubleArray {
-        require(vector.isNotEmpty() && vector.size <= NumericalMetaBrain.FEATURE_COUNT)
+        require(vector.size == NumericalMetaBrain.LEGACY_FEATURE_COUNT || vector.size == NumericalMetaBrain.FEATURE_COUNT) {
+            "Archived feature vector must be legacy-${NumericalMetaBrain.LEGACY_FEATURE_COUNT} or current-${NumericalMetaBrain.FEATURE_COUNT}"
+        }
         return if (vector.size == NumericalMetaBrain.FEATURE_COUNT) vector.copyOf()
         else DoubleArray(NumericalMetaBrain.FEATURE_COUNT).also { vector.copyInto(it) }
     }

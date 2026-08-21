@@ -18,18 +18,18 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.abs
 
 /**
- * Process-lifetime read-only AI research coordinator.
+ * Process-lifetime read-only dual-market AI research coordinator.
  *
- * NIFTY and SENSEX are bootstrapped, subscribed and evaluated concurrently even when
- * the visible trading dashboard is showing only one market. Every market owns its
- * tick core, D30 microstructure buffers, option chain and 1m/V7.6 state. Only the
- * shared Numerical Meta Brain is common, with MarketIndex encoded in every feature.
+ * NIFTY and SENSEX are bootstrapped/subscribed concurrently. Every market owns its
+ * tick/V7.6/D30 state. The coordinator is the only live-training registrar, which
+ * prevents the visible dashboard from duplicating observations. Each registered
+ * observation is bound to a fresh CE/PE instrument and is later labelled from that
+ * exact option's premium ticks through MetaBrainRuntime.observeOptionPremium().
  */
 object DualMarketLiveTrainingCoordinator {
     data class MarketReport(
@@ -64,10 +64,17 @@ object DualMarketLiveTrainingCoordinator {
         var ticks: Long = 1L,
     )
 
+    private data class TrainingContract(
+        val instrumentKey: String,
+        val premium: Double,
+        val lotSize: Int,
+    )
+
     private class MarketRuntime(
         val index: MarketIndex,
         val expiry: String,
         val underlyingKey: String,
+        val lotSizes: Map<String, Int>,
         initialSpot: Double,
         initialChain: List<OptionQuote>,
         warmBars: List<MarketV76ResearchCore.Bar>,
@@ -148,15 +155,9 @@ object DualMarketLiveTrainingCoordinator {
                 val today = LocalDate.now(zone)
                 val fingerprint = if (token.isBlank()) 0 else token.hashCode()
                 when {
-                    token.isBlank() -> {
-                        if (activeTokenFingerprint != 0) stopFeed("Upstox token unavailable · dual-market research paused")
-                    }
-                    fingerprint != activeTokenFingerprint || activeDate != today || runtimes.size != MarketIndex.entries.size -> {
-                        bootstrap(token, today, "token/day bootstrap")
-                    }
-                    needsUniverseRefresh() && System.currentTimeMillis() - lastBootstrapMillis >= MIN_REBOOT_INTERVAL_MS -> {
-                        bootstrap(token, today, "ATM universe refresh")
-                    }
+                    token.isBlank() -> if (activeTokenFingerprint != 0) stopFeed("Upstox token unavailable · dual-market research paused")
+                    fingerprint != activeTokenFingerprint || activeDate != today || runtimes.size != MarketIndex.entries.size -> bootstrap(token, today, "token/day bootstrap")
+                    needsUniverseRefresh() && System.currentTimeMillis() - lastBootstrapMillis >= MIN_REBOOT_INTERVAL_MS -> bootstrap(token, today, "ATM universe refresh")
                 }
             } catch (t: Throwable) {
                 synchronized(this) { message = "Dual-market AI research retrying: ${t.message?.take(140) ?: t::class.java.simpleName}" }
@@ -167,7 +168,7 @@ object DualMarketLiveTrainingCoordinator {
 
     private suspend fun bootstrap(token: String, today: LocalDate, reason: String) {
         synchronized(this) {
-            message = "Bootstrapping simultaneous NIFTY + SENSEX AI research · $reason"
+            message = "Bootstrapping simultaneous NIFTY + SENSEX premium research · $reason"
             connected = false
         }
         stream?.disconnect()
@@ -183,6 +184,8 @@ object DualMarketLiveTrainingCoordinator {
             val runtime = withContext(Dispatchers.IO) {
                 val discovery = UpstoxOptionDiscoveryClient(token).discover(index, today)
                 val expiry = discovery.nearestExpiry
+                val expiryContracts = discovery.contractsByExpiry[expiry].orEmpty()
+                val lotSizes = expiryContracts.associate { it.instrumentKey to it.lotSize }
                 val snapshot = client.fetchSnapshot(index, expiry)
                 val warm = candleClient.getWarmupOneMinuteCandles(snapshot.underlyingKey, 10)
                 val nowMinute = System.currentTimeMillis() / 60_000L
@@ -199,7 +202,7 @@ object DualMarketLiveTrainingCoordinator {
                         )
                     }
                     .toList()
-                MarketRuntime(index, expiry, snapshot.underlyingKey, snapshot.spot, snapshot.options, bars)
+                MarketRuntime(index, expiry, snapshot.underlyingKey, lotSizes, snapshot.spot, snapshot.options, bars)
             }
             runtime.micro.ingestSpot(runtime.spot, System.currentTimeMillis())
             built[index] = runtime
@@ -215,7 +218,7 @@ object DualMarketLiveTrainingCoordinator {
                 override fun onOpen() {
                     synchronized(this@DualMarketLiveTrainingCoordinator) {
                         connected = true
-                        message = "LIVE AI RESEARCH · NIFTY + SENSEX simultaneous · D30 requested"
+                        message = "LIVE AI RESEARCH · NIFTY + SENSEX simultaneous · OPTION_PREMIUM_V2 · D30 requested"
                     }
                 }
 
@@ -236,6 +239,9 @@ object DualMarketLiveTrainingCoordinator {
             },
         )
 
+        // Any pending label bound to the old option universe is intentionally discarded.
+        // Model weights/validation are preserved; only unresolved transient observations reset.
+        MarketIndex.entries.forEach(MetaBrainRuntime::resetSession)
         synchronized(this) {
             runtimes.clear()
             runtimes.putAll(built)
@@ -247,7 +253,7 @@ object DualMarketLiveTrainingCoordinator {
             activeDate = today
             lastBootstrapMillis = System.currentTimeMillis()
             connected = false
-            message = "Connecting dual-market D30 AI research feed…"
+            message = "Connecting dual-market D30 premium research feed…"
             stream = newStream
         }
         withContext(Dispatchers.IO) { newStream.connect() }
@@ -269,9 +275,13 @@ object DualMarketLiveTrainingCoordinator {
         }
         val optionMarket = optionToMarket[tick.instrumentKey] ?: return
         val runtime = runtimes[optionMarket] ?: return
+        val premium = tick.ltp
+        if (premium != null && premium > 0.0) {
+            MetaBrainRuntime.observeOptionPremium(optionMarket, tick.instrumentKey, premium, timestamp)
+        }
         runtime.chain = runtime.chain.map { q ->
             if (q.instrumentKey != tick.instrumentKey) q else q.copy(
-                ltp = tick.ltp ?: q.ltp,
+                ltp = premium ?: q.ltp,
                 openInterest = tick.oi ?: q.openInterest,
                 delta = tick.delta ?: q.delta,
                 gamma = tick.gamma ?: q.gamma,
@@ -284,7 +294,7 @@ object DualMarketLiveTrainingCoordinator {
         runtime.maxDepthLevels = maxOf(runtime.maxDepthLevels, tick.depth.size)
         runtime.micro.ingestOption(
             instrumentKey = tick.instrumentKey,
-            ltp = tick.ltp,
+            ltp = premium,
             oi = tick.oi,
             volume = tick.volume,
             bid = tick.bid,
@@ -292,9 +302,7 @@ object DualMarketLiveTrainingCoordinator {
             timestamp = timestamp,
             totalBuyQty = tick.totalBuyQty,
             totalSellQty = tick.totalSellQty,
-            depth = tick.depth.map {
-                MarketMicrostructureResearch.DepthLevel(it.bidPrice, it.bidQty, it.askPrice, it.askQty)
-            },
+            depth = tick.depth.map { MarketMicrostructureResearch.DepthLevel(it.bidPrice, it.bidQty, it.askPrice, it.askQty) },
         )
     }
 
@@ -305,6 +313,7 @@ object DualMarketLiveTrainingCoordinator {
         runtime.lastTickMillis = maxOf(runtime.lastTickMillis, timestamp)
         runtime.tickCore.ingest(price, timestamp)
         runtime.micro.ingestSpot(price, timestamp)
+        // Premium-bound pending observations ignore this; retained only as explicit fallback compatibility.
         MetaBrainRuntime.observeSpot(runtime.index, price, timestamp)
         ingestMinute(runtime, price, timestamp)
         if (timestamp - runtime.lastTickEvaluationMillis >= TICK_EVALUATION_INTERVAL_MS) {
@@ -326,6 +335,7 @@ object DualMarketLiveTrainingCoordinator {
             confidence = ((raw.confidence * 0.55) + (quality.score * 0.45)).toInt().coerceIn(0, 100),
             reasons = (raw.reasons + "DUAL-MARKET D30 research ${quality.score}/100").takeLast(10),
         )
+        val training = trainingContract(runtime, side, timestamp)
         MetaBrainRuntime.decorate(
             index = runtime.index,
             engine = engine,
@@ -345,6 +355,10 @@ object DualMarketLiveTrainingCoordinator {
             totalBookPressure = quality.totalBookPressure,
             wallPressure = quality.wallPressure,
             depthLevels = quality.depthLevels.toDouble(),
+            registerForTraining = training != null,
+            trainingInstrumentKey = training?.instrumentKey,
+            trainingPremium = training?.premium,
+            trainingLotSize = training?.lotSize ?: 0,
         )
         runtime.lastSignalMillis = maxOf(runtime.lastSignalMillis, timestamp)
     }
@@ -383,6 +397,7 @@ object DualMarketLiveTrainingCoordinator {
             confidence = ((raw.confidence * 0.55) + (quality.score * 0.45)).toInt().coerceIn(0, 100),
             reasons = (raw.reasons + "Market-scoped D30 ${quality.score}/100 · depth ${quality.depthLevels}").takeLast(10),
         )
+        val training = trainingContract(runtime, side, evaluation.signalTimeMillis)
         MetaBrainRuntime.decorate(
             index = runtime.index,
             engine = EngineId.ENGINE_3_V76_SCALPER,
@@ -402,8 +417,24 @@ object DualMarketLiveTrainingCoordinator {
             totalBookPressure = quality.totalBookPressure,
             wallPressure = quality.wallPressure,
             depthLevels = quality.depthLevels.toDouble(),
+            registerForTraining = training != null,
+            trainingInstrumentKey = training?.instrumentKey,
+            trainingPremium = training?.premium,
+            trainingLotSize = training?.lotSize ?: 0,
         )
         runtime.lastSignalMillis = maxOf(runtime.lastSignalMillis, evaluation.signalTimeMillis)
+    }
+
+    /** Nearest fresh option on the engine side; stale snapshot prices never seed labels. */
+    private fun trainingContract(runtime: MarketRuntime, side: PositionSide, timestamp: Long): TrainingContract? {
+        val quote = runtime.chain.asSequence()
+            .filter { it.type == side.name && it.instrumentKey.isNotBlank() && it.ltp > 0.0 && it.lastTickMillis > 0L }
+            .filter { abs(timestamp - it.lastTickMillis) <= MAX_TRAINING_QUOTE_AGE_MS }
+            .minByOrNull { abs(it.strike - runtime.spot) }
+            ?: return null
+        val lot = runtime.lotSizes[quote.instrumentKey] ?: return null
+        if (lot <= 0) return null
+        return TrainingContract(quote.instrumentKey, quote.ltp, lot)
     }
 
     @Synchronized
@@ -424,9 +455,11 @@ object DualMarketLiveTrainingCoordinator {
         activeTokenFingerprint = 0
         activeDate = null
         message = reason
+        MarketIndex.entries.forEach(MetaBrainRuntime::resetSession)
     }
 
     private const val WATCH_INTERVAL_MS = 30_000L
     private const val MIN_REBOOT_INTERVAL_MS = 5 * 60_000L
     private const val TICK_EVALUATION_INTERVAL_MS = 250L
+    private const val MAX_TRAINING_QUOTE_AGE_MS = 5_000L
 }

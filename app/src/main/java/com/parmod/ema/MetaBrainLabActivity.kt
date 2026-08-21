@@ -19,9 +19,11 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.model.MarketIndex
+import com.parmod.ema.training.DualMarketLiveTrainingCoordinator
 import com.parmod.ema.training.HistoricalCandidateGovernance
 import com.parmod.ema.training.HistoricalCorpusSource
 import com.parmod.ema.training.HistoricalCorpusTrainingViewModel
+import com.parmod.ema.training.HistoricalMarketScope
 import kotlinx.coroutines.delay
 import java.text.DateFormat
 import java.util.Date
@@ -30,6 +32,7 @@ class MetaBrainLabActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         MetaBrainRuntime.initialize(applicationContext)
+        DualMarketLiveTrainingCoordinator.initialize(applicationContext)
         setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { MetaBrainLabScreen() } } }
     }
 }
@@ -37,6 +40,7 @@ class MetaBrainLabActivity : ComponentActivity() {
 @Composable
 private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = viewModel()) {
     var report by remember { mutableStateOf(MetaBrainRuntime.report()) }
+    var liveResearch by remember { mutableStateOf(DualMarketLiveTrainingCoordinator.report()) }
     val training by trainingVm.state.collectAsState()
     var message by remember { mutableStateOf("AI TRAINING CENTER ready") }
     var profileMenu by remember { mutableStateOf(false) }
@@ -47,6 +51,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
     LaunchedEffect(Unit) {
         while (true) {
             report = MetaBrainRuntime.report()
+            liveResearch = DualMarketLiveTrainingCoordinator.report()
             delay(1000)
         }
     }
@@ -56,7 +61,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text("VARDHANI AI TRAINING CENTER", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Text("Upstox / local / combined corpus → walk-forward → strict locked holdout → live shadow → manual promotion", style = MaterialTheme.typography.labelMedium)
+        Text("NIFTY + SENSEX simultaneous live research · joint historical training · frozen Production · manual promotion", style = MaterialTheme.typography.labelMedium)
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -84,6 +89,36 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
             }
         }
 
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Text("SIMULTANEOUS LIVE AI RESEARCH", fontWeight = FontWeight.Bold)
+                Text("Dedicated read-only Upstox D30 research feed. NIFTY and SENSEX keep independent spot, option, D30, engine and pending-label state even when the dashboard displays only one market.", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    if (liveResearch.connected) "● CONNECTED · BOTH MARKETS" else "○ ${liveResearch.message}",
+                    color = if (liveResearch.connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                )
+                MarketIndex.entries.forEach { market ->
+                    val m = liveResearch.markets[market] ?: return@forEach
+                    HorizontalDivider()
+                    Text(market.name, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                    Row {
+                        LabMetric("Spot", if (m.spot > 0.0) "%.2f".format(m.spot) else "--", Modifier.weight(1f))
+                        LabMetric("Ticks", m.ticks.toString(), Modifier.weight(1f))
+                        LabMetric("D30", m.d30DepthLevels.toString(), Modifier.weight(1f))
+                    }
+                    Row {
+                        LabMetric("1m bars", m.oneMinuteBars.toString(), Modifier.weight(1f))
+                        LabMetric("Options", m.optionContracts.toString(), Modifier.weight(1f))
+                        LabMetric("Pending", (report.pendingByMarket[market] ?: 0).toString(), Modifier.weight(1f))
+                    }
+                    Text("Expiry ${m.expiry.ifBlank { "--" }} · last tick ${formatTime(m.lastTickMillis)}", style = MaterialTheme.typography.labelSmall)
+                    if (m.error.isNotBlank()) Text("⚠ ${m.error}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+
         HistoricalTrainingCard(
             state = training,
             vm = trainingVm,
@@ -93,7 +128,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("ADAPTIVE LIVE CANDIDATE SEARCH", fontWeight = FontWeight.Bold)
-                Text("Use after historical training or as a live-only fallback. Adaptive search evolves bounded LR/L2/TAKE/REJECT settings around the strongest archived live Candidate.", style = MaterialTheme.typography.labelSmall)
+                Text("Candidate evolution waits for balanced NIFTY + SENSEX unseen evidence. Every new Candidate restarts from frozen Production; exact repeats are avoided.", style = MaterialTheme.typography.labelSmall)
                 Text("Current: ${report.candidateName}", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                 Box {
                     OutlinedButton({ profileMenu = true }, Modifier.fillMaxWidth()) { Text("Seed profile: ${report.candidateProfile.title}") }
@@ -111,24 +146,18 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
                 }
                 val hp = report.candidateHyperParameters
                 Text("LR ${"%.4f".format(hp.learningRate)} · L2 ${"%.5f".format(hp.l2)} · TAKE ≥ ${pct(hp.takeThreshold)} · REJECT ≤ ${pct(hp.rejectThreshold)}", style = MaterialTheme.typography.bodySmall)
-                report.bestArchivedScore?.let { Text("Best archived live-search score ${"%.3f".format(it)}", style = MaterialTheme.typography.labelSmall) }
+                report.bestArchivedScore?.let { Text("Best archived dual-market score ${"%.3f".format(it)}", style = MaterialTheme.typography.labelSmall) }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Button({ message = MetaBrainRuntime.evolveBestCandidate().second }, Modifier.weight(1f)) { Text("EVOLVE BEST NOW", fontSize = 9.sp) }
-                    OutlinedButton({
-                        MetaBrainRuntime.resetCandidateLearning()
-                        message = "Candidate reset to frozen Production with current hyperparameters"
-                    }, Modifier.weight(1f)) { Text("RESET / RETRAIN", fontSize = 9.sp) }
+                    OutlinedButton({ MetaBrainRuntime.resetCandidateLearning(); message = "Candidate reset to frozen Production" }, Modifier.weight(1f)) { Text("RESET / RETRAIN", fontSize = 9.sp) }
                 }
                 OutlinedButton({ message = MetaBrainRuntime.startNextCandidate().second }, Modifier.fillMaxWidth()) { Text("ARCHIVE + NEXT NAMED SEED", fontSize = 9.sp) }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("AUTO ADAPTIVE SEARCH", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                        Text("At 150 fresh live labels a failed Candidate is archived, the best validated parent is evolved, exact repeats are avoided, and the next Candidate restarts from frozen Production. A passing Candidate stops search; promotion stays manual.", style = MaterialTheme.typography.labelSmall)
+                        Text("Evaluation requires ≥150 total live labels plus ≥50 from each market. A passing Candidate stops search; promotion remains manual.", style = MaterialTheme.typography.labelSmall)
                     }
-                    Switch(
-                        checked = report.autoSearchEnabled,
-                        onCheckedChange = { enabled -> message = MetaBrainRuntime.setAutoSearchEnabled(enabled).second },
-                    )
+                    Switch(checked = report.autoSearchEnabled, onCheckedChange = { enabled -> message = MetaBrainRuntime.setAutoSearchEnabled(enabled).second })
                 }
             }
         }
@@ -137,22 +166,33 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("FRESH LIVE UNSEEN VALIDATION", fontWeight = FontWeight.Bold)
-                Text("Production and Candidate are scored before Candidate learns each new live outcome. Historical champions must still pass this stage before promotion.", style = MaterialTheme.typography.labelSmall)
+                Text("Every outcome is market-isolated: NIFTY ticks resolve only NIFTY labels; SENSEX ticks resolve only SENSEX labels. Production/Candidate are scored before Candidate learns.", style = MaterialTheme.typography.labelSmall)
                 Row {
-                    LabMetric("Labels", v.labels.toString(), Modifier.weight(1f))
+                    LabMetric("Total labels", v.labels.toString(), Modifier.weight(1f))
                     LabMetric("Pending", report.pendingLabels.toString(), Modifier.weight(1f))
                 }
                 Row {
-                    LabMetric("Prod accuracy", pct(v.productionAccuracy), Modifier.weight(1f))
-                    LabMetric("Cand accuracy", pct(v.candidateAccuracy), Modifier.weight(1f))
+                    LabMetric("Prod acc", pct(v.productionAccuracy), Modifier.weight(1f))
+                    LabMetric("Cand acc", pct(v.candidateAccuracy), Modifier.weight(1f))
                 }
                 Row {
                     LabMetric("Prod Brier", "%.4f".format(v.productionBrier), Modifier.weight(1f))
                     LabMetric("Cand Brier", "%.4f".format(v.candidateBrier), Modifier.weight(1f))
                 }
                 Row {
-                    LabMetric("TAKE precision", pct(v.takePrecision), Modifier.weight(1f))
-                    LabMetric("REJECT precision", pct(v.rejectPrecision), Modifier.weight(1f))
+                    LabMetric("TAKE", "${pct(v.takePrecision)} (${v.candidateTake})", Modifier.weight(1f))
+                    LabMetric("REJECT", "${pct(v.rejectPrecision)} (${v.candidateReject})", Modifier.weight(1f))
+                }
+                MarketIndex.entries.forEach { market ->
+                    val mv = report.validationByMarket[market] ?: MetaBrainRuntime.ValidationStats()
+                    HorizontalDivider()
+                    Text("${market.name} LIVE VALIDATION", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                    Row {
+                        LabMetric("Labels", mv.labels.toString(), Modifier.weight(1f))
+                        LabMetric("TAKE", "${pct(mv.takePrecision)} (${mv.candidateTake})", Modifier.weight(1f))
+                        LabMetric("REJECT", "${pct(mv.rejectPrecision)} (${mv.candidateReject})", Modifier.weight(1f))
+                    }
+                    Text("Candidate ${pct(mv.candidateAccuracy)} / Brier ${"%.4f".format(mv.candidateBrier)} · Production ${pct(mv.productionAccuracy)} / ${"%.4f".format(mv.productionBrier)}", style = MaterialTheme.typography.labelSmall)
                 }
                 Text(
                     if (report.eligibleForPromotion) "✓ PROMOTION READY" else "NOT READY · ${report.promotionReason}",
@@ -174,7 +214,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text("#${index + 1} ${r.displayName}${if (r.passed) " · PASS" else ""}", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                                Text("${r.labels} labels · Acc ${pct(r.candidateAccuracy)} vs ${pct(r.productionAccuracy)} · Brier ${"%.4f".format(r.candidateBrier)}", style = MaterialTheme.typography.labelSmall)
+                                Text("${r.labels} labels · N ${r.niftyLabels} / S ${r.sensexLabels} · Acc ${pct(r.candidateAccuracy)} vs ${pct(r.productionAccuracy)}", style = MaterialTheme.typography.labelSmall)
                                 val rh = r.hyperParameters
                                 Text("LR ${"%.4f".format(rh.learningRate)} · L2 ${"%.5f".format(rh.l2)} · T ${pct(rh.takeThreshold)} · R ${pct(rh.rejectThreshold)}", style = MaterialTheme.typography.labelSmall)
                                 Text("TAKE ${pct(r.takePrecision)} · REJECT ${pct(r.rejectPrecision)} · ${formatTime(r.finishedAt)}", style = MaterialTheme.typography.labelSmall)
@@ -190,11 +230,8 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("TRAINING / STORAGE", fontWeight = FontWeight.Bold)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Button({ message = if (MetaBrainRuntime.forceSave()) "Model + live validation saved" else "Save failed" }, Modifier.weight(1f)) { Text("SAVE NOW", fontSize = 10.sp) }
-                    OutlinedButton({
-                        MetaBrainRuntime.resetCandidateLearning()
-                        message = "Candidate reset to frozen Production; installed historical Candidate discarded"
-                    }, Modifier.weight(1f)) { Text("RESET CANDIDATE", fontSize = 9.sp) }
+                    Button({ message = if (MetaBrainRuntime.forceSave()) "Model + dual-market validation saved" else "Save failed" }, Modifier.weight(1f)) { Text("SAVE NOW", fontSize = 10.sp) }
+                    OutlinedButton({ MetaBrainRuntime.resetCandidateLearning(); message = "Candidate reset; Production unchanged" }, Modifier.weight(1f)) { Text("RESET CANDIDATE", fontSize = 9.sp) }
                 }
             }
         }
@@ -202,31 +239,22 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("VALIDATION / DEPLOYMENT", fontWeight = FontWeight.Bold)
-                Button(
-                    onClick = { message = MetaBrainRuntime.promoteCandidate().second },
-                    enabled = report.eligibleForPromotion,
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("PROMOTE VALIDATED CANDIDATE") }
+                Button(onClick = { message = MetaBrainRuntime.promoteCandidate().second }, enabled = report.eligibleForPromotion, modifier = Modifier.fillMaxWidth()) { Text("PROMOTE VALIDATED CANDIDATE") }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton({
-                        message = if (MetaBrainRuntime.rollbackProduction()) "Production rolled back; AI gate disabled" else "No rollback snapshot available"
-                    }, Modifier.weight(1f), enabled = report.rollbackAvailable) { Text("ROLLBACK", fontSize = 10.sp) }
-                    OutlinedButton({ message = MetaBrainRuntime.setGateEnabled(!report.gateEnabled).second }, Modifier.weight(1f)) {
-                        Text(if (report.gateEnabled) "DISABLE GATE" else "ENABLE AI GATE", fontSize = 9.sp)
-                    }
+                    OutlinedButton({ message = if (MetaBrainRuntime.rollbackProduction()) "Production rolled back; AI gate disabled" else "No rollback snapshot available" }, Modifier.weight(1f), enabled = report.rollbackAvailable) { Text("ROLLBACK", fontSize = 10.sp) }
+                    OutlinedButton({ message = MetaBrainRuntime.setGateEnabled(!report.gateEnabled).second }, Modifier.weight(1f)) { Text(if (report.gateEnabled) "DISABLE GATE" else "ENABLE AI GATE", fontSize = 9.sp) }
                 }
-                Text("Historical training, adaptive search and live learning can modify Candidate only. Production changes only after the promotion gate. Learning or failed Candidates never place or force trades.", style = MaterialTheme.typography.labelSmall)
+                Text("Historical training, live learning and adaptive search modify Candidate only. Production changes only after balanced unseen dual-market validation and manual promotion.", style = MaterialTheme.typography.labelSmall)
             }
         }
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("TRAINING VALIDITY / FEATURE COVERAGE", fontWeight = FontWeight.Bold)
-                Text("Historical corpus: imported or Upstox expired CE/PE premium OHLCV+OI · completed-bar features · next-bar entry · actual 5-bar option-premium MFE/MAE · conservative stop-first ambiguity · slippage + ₹70.80 brokerage/GST · chronological walk-forward · locked holdout.", style = MaterialTheme.typography.bodySmall)
-                Text("Strict historical governance: ≥${HistoricalCandidateGovernance.MIN_HOLDOUT_LABELS} holdout labels · meaningful TAKE + REJECT counts · TAKE precision ≥${pct(HistoricalCandidateGovernance.MIN_TAKE_PRECISION)} · REJECT precision ≥${pct(HistoricalCandidateGovernance.MIN_REJECT_PRECISION)} · positive cost-adjusted TAKE net return · Candidate improvement over Production · ≥${HistoricalCandidateGovernance.MIN_DISTINCT_ENGINES} represented engine proxies · no engine >${pct(HistoricalCandidateGovernance.MAX_DOMINANT_ENGINE_SHARE)} of corpus.", style = MaterialTheme.typography.bodySmall)
-                Text("Local import supports CSV, XLSX, JSON, NDJSON and ZIP containing those formats. Rows are schema-checked, normalized and copied to app-private storage before training.", style = MaterialTheme.typography.bodySmall)
-                Text("Historical files do not provide native D30 order-book depth, microprice or walls unless explicitly present in a future compatible schema; current historical depth feature slots remain zero rather than fabricated. Fresh live learning still receives actual D30/order-flow inputs when available.", style = MaterialTheme.typography.bodySmall)
-                Text("Live labels remain a fresh 5-minute directional reality check, so a premium-trained historical Candidate must generalize to current market behavior before promotion.", style = MaterialTheme.typography.bodySmall)
+                Text("Historical: completed-bar/no-lookahead features · next-bar option execution · actual premium MFE/MAE · conservative stop-first ambiguity · slippage + ₹70.80 round-trip brokerage/GST · chronological walk-forward · action-aware adaptive generations · locked holdout opened once.", style = MaterialTheme.typography.bodySmall)
+                Text("BOTH mode: NIFTY and SENSEX are merged chronologically into one shared Candidate; development and final governance require meaningful evidence from each market. One market cannot overwrite the other.", style = MaterialTheme.typography.bodySmall)
+                Text("Live: dedicated process-lifetime read-only D30 feed · independent NIFTY/SENSEX engine/microstructure/pending state · per-market dedupe · per-market validation quotas · stale/out-of-order integrity filtering · automatic reconnect/expiry/ATM-universe refresh.", style = MaterialTheme.typography.bodySmall)
+                Text("Historical D30 is never fabricated when absent. Fresh live D30 supplies depth imbalance, microprice, TBQ/TSQ pressure, walls, OI/option flow and activity when Upstox provides it.", style = MaterialTheme.typography.bodySmall)
             }
         }
 
@@ -244,7 +272,7 @@ private fun HistoricalTrainingCard(
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("HISTORICAL CORPUS + AI RESEARCH", fontWeight = FontWeight.Bold)
-            Text("One pipeline for Upstox downloads, your own files, or both combined. Every source uses causal premium labels, chronological walk-forward and strict historical governance before any champion can become Candidate.", style = MaterialTheme.typography.labelSmall)
+            Text("UPSTOX / LOCAL / COMBINED. BOTH mode trains one shared Candidate on NIFTY + SENSEX rather than sequentially overwriting model state.", style = MaterialTheme.typography.labelSmall)
 
             Text("CORPUS SOURCE", fontWeight = FontWeight.Bold, fontSize = 10.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -263,7 +291,7 @@ private fun HistoricalTrainingCard(
                     Text("LOCAL CORPUS QUALITY", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                     Row {
                         LabMetric("Contracts", local.optionContracts.toString(), Modifier.weight(1f))
-                        LabMetric("Candles", local.rowsAccepted.toString(), Modifier.weight(1f))
+                        LabMetric("Rows", local.rowsAccepted.toString(), Modifier.weight(1f))
                         LabMetric("Rejected", local.rowsRejected.toString(), Modifier.weight(1f))
                     }
                     Row {
@@ -272,8 +300,9 @@ private fun HistoricalTrainingCard(
                         LabMetric("Deduped", local.duplicatesRemoved.toString(), Modifier.weight(1f))
                     }
                     Text("CE ${local.ceContracts} · PE ${local.peContracts} · files ${local.filesImported} · supported ${local.supportedFiles}", style = MaterialTheme.typography.labelSmall)
+                    if (state.prelabelledCorpusReady) Text("Pre-labelled splits · TRAIN ${state.prelabelledTrainRows} · VALIDATION ${state.prelabelledValidationRows} · TEST ${state.prelabelledTestRows}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall)
                     if (local.fromDate != null || local.toDate != null) Text("Coverage ${local.fromDate ?: "?"} → ${local.toDate ?: "?"}", style = MaterialTheme.typography.labelSmall)
-                    if (local.inferredLotSizeContracts > 0) Text("⚠ ${local.inferredLotSizeContracts} contract(s) use inferred lot size; cost metrics are approximate for those contracts.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                    if (local.inferredLotSizeContracts > 0) Text("⚠ ${local.inferredLotSizeContracts} contract(s) use inferred lot size", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
                     local.warnings.takeLast(3).forEach { Text("⚠ $it", style = MaterialTheme.typography.labelSmall) }
                     local.errors.takeLast(2).forEach { Text("ERROR · $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -291,9 +320,10 @@ private fun HistoricalTrainingCard(
             }
 
             Text("MARKET / WINDOW", fontWeight = FontWeight.Bold, fontSize = 10.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                TrainingChoice("NIFTY", state.selectedIndex == MarketIndex.NIFTY, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectIndex(MarketIndex.NIFTY) }
-                TrainingChoice("SENSEX", state.selectedIndex == MarketIndex.SENSEX, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectIndex(MarketIndex.SENSEX) }
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                HistoricalMarketScope.entries.forEach { scope ->
+                    TrainingChoice(scope.label, state.selectedMarketScope == scope, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectMarketScope(scope) }
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 listOf(1, 3, 6, 12).forEach { months ->
@@ -307,7 +337,7 @@ private fun HistoricalTrainingCard(
                 Text(state.message, style = MaterialTheme.typography.labelSmall)
                 OutlinedButton(vm::cancel, Modifier.fillMaxWidth()) { Text("CANCEL TRAINING SAFELY") }
             } else if (!state.isImporting) {
-                Button(vm::runOrResume, Modifier.fillMaxWidth()) { Text("RUN / RESUME ${state.selectedSource.label} HISTORICAL AI TRAINING") }
+                Button(vm::runOrResume, Modifier.fillMaxWidth()) { Text("RUN / RESUME ${state.selectedSource.label} ${state.selectedMarketScope.label} HISTORICAL AI TRAINING") }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     OutlinedButton(vm::clearUpstoxCache, Modifier.weight(1f)) { Text("CLEAR UPSTOX CACHE", fontSize = 8.sp) }
                     LabMetric("Cache", state.cacheHits.toString(), Modifier.weight(1f))
@@ -319,6 +349,7 @@ private fun HistoricalTrainingCard(
             state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
             state.result?.let { r ->
                 HorizontalDivider()
+                Text("RESULT · ${state.selectedMarketScope.label}", fontWeight = FontWeight.Bold)
                 Row {
                     LabMetric("Samples", r.corpusSamples.toString(), Modifier.weight(1f))
                     LabMetric("Contracts", r.contractsDownloaded.toString(), Modifier.weight(1f))
@@ -345,41 +376,37 @@ private fun HistoricalTrainingCard(
                     val h = best.hyperParameters
                     Text("LR ${"%.4f".format(h.learningRate)} · L2 ${"%.5f".format(h.l2)} · TAKE ${pct(h.takeThreshold)} · REJECT ${pct(h.rejectThreshold)}", style = MaterialTheme.typography.labelSmall)
                     Text("WF Candidate acc ${pct(best.candidate.accuracy)} / Brier ${"%.4f".format(best.candidate.brier)} vs Production ${pct(best.production.accuracy)} / ${"%.4f".format(best.production.brier)}", style = MaterialTheme.typography.labelSmall)
+                    Text("WF actions · TAKE ${best.candidate.takeSamples} @ ${pct(best.candidate.takePrecision)} · REJECT ${best.candidate.rejectSamples} @ ${pct(best.candidate.rejectPrecision)} · TAKE net ${pctSigned(best.candidate.takeAverageNetReturn)}", style = MaterialTheme.typography.labelSmall)
                 }
 
-                val governance = HistoricalCandidateGovernance.evaluate(
-                    candidate = r.holdoutCandidate,
-                    production = r.holdoutProduction,
-                    coverage = r.coverage,
-                    corpusSamples = r.corpusSamples,
-                    holdoutOpened = r.lockedHoldoutOpened,
-                )
-                val governanceColor = when (governance.status) {
-                    HistoricalCandidateGovernance.Status.PASS -> MaterialTheme.colorScheme.primary
-                    HistoricalCandidateGovernance.Status.FAIL -> MaterialTheme.colorScheme.error
-                    HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> MaterialTheme.colorScheme.secondary
-                    HistoricalCandidateGovernance.Status.CLOSED -> MaterialTheme.colorScheme.onSurfaceVariant
+                val singleGovernance = HistoricalCandidateGovernance.evaluate(r.holdoutCandidate, r.holdoutProduction, r.coverage, r.corpusSamples, r.lockedHoldoutOpened)
+                val statusLabel = if (state.selectedMarketScope == HistoricalMarketScope.BOTH) {
+                    when {
+                        !r.lockedHoldoutOpened -> "CLOSED"
+                        r.lockedHoldoutPassed -> "PASS"
+                        else -> "FAIL / INSUFFICIENT"
+                    }
+                } else singleGovernance.label
+                val statusColor = when {
+                    r.lockedHoldoutPassed -> MaterialTheme.colorScheme.primary
+                    r.lockedHoldoutOpened -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
                 }
-                Text(
-                    "LOCKED HOLDOUT: ${governance.label}",
-                    fontWeight = FontWeight.Bold,
-                    color = governanceColor,
-                )
+                Text("LOCKED HOLDOUT: $statusLabel", fontWeight = FontWeight.Bold, color = statusColor)
                 if (r.lockedHoldoutOpened) {
                     val c = r.holdoutCandidate
                     val p = r.holdoutProduction
                     if (c != null && p != null) {
                         Text("Holdout Candidate acc ${pct(c.accuracy)} · Brier ${"%.4f".format(c.brier)}", style = MaterialTheme.typography.labelSmall)
                         Text("TAKE ${pct(c.takePrecision)} (${c.takeSamples}) · TAKE avg net ${pctSigned(c.takeAverageNetReturn)}", style = MaterialTheme.typography.labelSmall)
-                        Text("REJECT ${pct(c.rejectPrecision)} (${c.rejectSamples}) · Holdout labels ${c.labels}", style = MaterialTheme.typography.labelSmall)
-                        Text("Holdout Production acc ${pct(p.accuracy)} · Brier ${"%.4f".format(p.brier)}", style = MaterialTheme.typography.labelSmall)
+                        Text("REJECT ${pct(c.rejectPrecision)} (${c.rejectSamples}) · labels ${c.labels}", style = MaterialTheme.typography.labelSmall)
+                        Text("Production acc ${pct(p.accuracy)} · Brier ${"%.4f".format(p.brier)}", style = MaterialTheme.typography.labelSmall)
                     }
-                    Text("Engine gate · min ${governance.requiredEngineSamples}/engine · dominant ${pct(governance.dominantEngineShare)} (max ${pct(HistoricalCandidateGovernance.MAX_DOMINANT_ENGINE_SHARE)})", style = MaterialTheme.typography.labelSmall)
-                    governance.reasons.take(5).forEach { reason ->
-                        Text(if (governance.passed) "✓ $reason" else "• $reason", color = governanceColor, style = MaterialTheme.typography.labelSmall)
+                    if (state.selectedMarketScope != HistoricalMarketScope.BOTH) {
+                        singleGovernance.reasons.take(5).forEach { Text(if (singleGovernance.passed) "✓ $it" else "• $it", color = statusColor, style = MaterialTheme.typography.labelSmall) }
                     }
                 }
-                Text(if (state.installedCandidate) "✓ HISTORICAL CHAMPION INSTALLED AS CANDIDATE · LIVE VALIDATION RESET TO 0" else "Production unchanged · historical Candidate not installed unless governance PASS", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                Text(if (state.installedCandidate) "✓ HISTORICAL CHAMPION INSTALLED AS CANDIDATE · DUAL LIVE VALIDATION RESET TO 0" else "Production unchanged · no historical Candidate installed unless all governance passes", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 Text(r.note, style = MaterialTheme.typography.labelSmall)
             }
         }

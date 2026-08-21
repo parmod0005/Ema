@@ -24,10 +24,6 @@ class NumericalMetaBrain(
         val rejectThreshold: Double = DEFAULT_REJECT_THRESHOLD,
     ) {
         fun sanitized(): HyperParameters {
-            // Probability cutoffs are policy parameters, not a claim that profitable
-            // trades must have >50% win probability. Historical research can calibrate
-            // lower cutoffs against cost-adjusted TAKE outcomes while live/manual seed
-            // profiles remain conservative at their configured thresholds.
             val take = takeThreshold.coerceIn(0.25, 0.90)
             val reject = rejectThreshold.coerceIn(0.05, 0.60).coerceAtMost(take - 0.05)
             return copy(
@@ -38,6 +34,36 @@ class NumericalMetaBrain(
             )
         }
     }
+
+    /**
+     * Causal feature extension. Every field must be known at or before the prediction
+     * timestamp. Fields are appended to the legacy vector so older 21-weight models can
+     * migrate safely with zero weights for new dimensions.
+     */
+    data class CausalExtras(
+        val premiumReturn1: Double = 0.0,
+        val premiumReturn3: Double = 0.0,
+        val premiumReturn5: Double = 0.0,
+        val premiumReturn15: Double = 0.0,
+        val emaSpread: Double = 0.0,
+        val emaSlope: Double = 0.0,
+        val zlemaSpread: Double = 0.0,
+        val rsi: Double = 50.0,
+        val macdHistogram: Double = 0.0,
+        val atrRatio: Double = 1.0,
+        val bbPosition: Double = 0.0,
+        val bbWidth: Double = 0.0,
+        val bodyRatio: Double = 0.0,
+        val wickSkew: Double = 0.0,
+        val volumeAcceleration: Double = 0.0,
+        val oiAcceleration: Double = 0.0,
+        val spotReturn3: Double = 0.0,
+        val optionSpotRelative: Double = 0.0,
+        val moneynessSteps: Double = 0.0,
+        val daysToExpiry: Double = 0.0,
+        val realizedVolatility: Double = 0.0,
+        val momentumPersistence: Double = 0.0,
+    )
 
     data class Features(
         val engine: EngineId,
@@ -60,8 +86,10 @@ class NumericalMetaBrain(
         val minutesFromOpen: Double,
         val recentEngineWinRate: Double,
         val recentEngineProfitFactor: Double,
+        val causal: CausalExtras = CausalExtras(),
     ) {
         fun vector(): DoubleArray = doubleArrayOf(
+            // Legacy v1 dimensions. Never reorder these.
             1.0,
             engine.ordinal / 2.0,
             index.ordinal.toDouble(),
@@ -83,6 +111,29 @@ class NumericalMetaBrain(
             (minutesFromOpen / 375.0).coerceIn(0.0, 1.2),
             (recentEngineWinRate / 100.0).coerceIn(0.0, 1.0),
             min(recentEngineProfitFactor, 3.0) / 3.0,
+            // Causal feature schema v2.
+            causal.premiumReturn1.coerceIn(-0.50, 0.50) * 2.0,
+            causal.premiumReturn3.coerceIn(-0.75, 0.75) / 0.75,
+            causal.premiumReturn5.coerceIn(-1.00, 1.00),
+            causal.premiumReturn15.coerceIn(-1.50, 1.50) / 1.50,
+            causal.emaSpread.coerceIn(-0.25, 0.25) * 4.0,
+            causal.emaSlope.coerceIn(-0.15, 0.15) / 0.15,
+            causal.zlemaSpread.coerceIn(-0.25, 0.25) * 4.0,
+            ((causal.rsi - 50.0) / 50.0).coerceIn(-1.0, 1.0),
+            causal.macdHistogram.coerceIn(-0.20, 0.20) * 5.0,
+            ((causal.atrRatio - 1.0) / 2.0).coerceIn(-1.0, 1.0),
+            causal.bbPosition.coerceIn(-2.0, 2.0) / 2.0,
+            causal.bbWidth.coerceIn(0.0, 1.0),
+            causal.bodyRatio.coerceIn(0.0, 1.0),
+            causal.wickSkew.coerceIn(-1.0, 1.0),
+            causal.volumeAcceleration.coerceIn(-3.0, 3.0) / 3.0,
+            causal.oiAcceleration.coerceIn(-3.0, 3.0) / 3.0,
+            causal.spotReturn3.coerceIn(-0.05, 0.05) / 0.05,
+            causal.optionSpotRelative.coerceIn(-0.50, 0.50) * 2.0,
+            (causal.moneynessSteps / 8.0).coerceIn(-1.5, 1.5),
+            (causal.daysToExpiry / 30.0).coerceIn(0.0, 2.0),
+            causal.realizedVolatility.coerceIn(0.0, 0.25) * 4.0,
+            causal.momentumPersistence.coerceIn(-1.0, 1.0),
         )
     }
 
@@ -109,10 +160,6 @@ class NumericalMetaBrain(
     private var learned = 0L
     private var version = 1L
     private var hyperParameters = HyperParameters(learningRate, l2, takeThreshold, rejectThreshold).sanitized()
-
-    // Ephemeral label-balance counters are deliberately reset when a model state is
-    // restored. They affect only subsequent gradient scaling; model weights remain the
-    // persistent source of truth. Laplace smoothing avoids unstable early-session jumps.
     private var sessionSuccesses = 0L
     private var sessionFailures = 0L
 
@@ -128,18 +175,22 @@ class NumericalMetaBrain(
 
     fun currentHyperParameters(): HyperParameters = hyperParameters
 
+    /** Accepts legacy v1 weights and zero-initialises newly appended causal features. */
     fun loadHistoricalPrior(priorWeights: DoubleArray, priorBias: Double, priorSamples: Long) {
-        require(priorWeights.size == FEATURE_COUNT)
-        priorWeights.copyInto(weights)
+        require(priorWeights.isNotEmpty() && priorWeights.size <= FEATURE_COUNT)
+        weights.fill(0.0)
+        priorWeights.copyInto(weights, endIndex = priorWeights.size)
         bias = priorBias
         learned = priorSamples.coerceAtLeast(0L)
         version++
         resetBalanceCounters()
     }
 
+    /** Backward-compatible restore for every prior VARDHANI numerical feature schema. */
     fun restore(state: ModelState) {
-        require(state.weights.size == FEATURE_COUNT)
-        state.weights.copyInto(weights)
+        require(state.weights.isNotEmpty() && state.weights.size <= FEATURE_COUNT)
+        weights.fill(0.0)
+        state.weights.copyInto(weights, endIndex = state.weights.size)
         bias = state.bias.coerceIn(-8.0, 8.0)
         learned = state.samplesLearned.coerceAtLeast(0L)
         version = state.modelVersion.coerceAtLeast(1L)
@@ -167,10 +218,6 @@ class NumericalMetaBrain(
         val x = features.vector()
         val p = predict(features).probabilitySuccess
         val y = if (success) 1.0 else 0.0
-
-        // Square-root inverse-frequency weighting is intentionally milder than full
-        // inverse-frequency weighting. It counters majority-class collapse while
-        // preserving probability calibration far better than hard oversampling.
         val classWeight = adaptiveClassWeight(success)
         val effectiveWeight = (sampleWeight.coerceIn(0.1, 5.0) * classWeight).coerceIn(0.1, 5.0)
         val error = (y - p) * effectiveWeight
@@ -198,7 +245,9 @@ class NumericalMetaBrain(
     }
 
     companion object {
-        const val FEATURE_COUNT = 21
+        const val LEGACY_FEATURE_COUNT = 21
+        const val FEATURE_COUNT = 43
+        const val FEATURE_SCHEMA_VERSION = 2
         const val DEFAULT_LEARNING_RATE = 0.015
         const val DEFAULT_L2 = 0.0005
         const val DEFAULT_TAKE_THRESHOLD = 0.66

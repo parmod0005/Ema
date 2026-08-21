@@ -35,7 +35,16 @@ object CausalFeatureEngineering {
         private var lastGlobalTimestamp = Long.MIN_VALUE
         private var lastCleanupEpochDay = Long.MIN_VALUE
 
-        fun observe(r: AimlHistoricalOptionCorpusV1Store.Record): NumericalMetaBrain.CausalExtras {
+        /**
+         * Advances causal history for [r]. Set [materialize] false when a compact-corpus
+         * row is only needed to warm rolling state. This is the fast path used between
+         * stride-selected model samples: history remains identical while expensive
+         * EMA/ZLEMA/RSI/MACD/ATR/Bollinger materialization is skipped.
+         */
+        fun observe(
+            r: AimlHistoricalOptionCorpusV1Store.Record,
+            materialize: Boolean = true,
+        ): NumericalMetaBrain.CausalExtras? {
             // The exported corpus is contract-grouped. When the stream rewinds from the
             // end of one contract to the beginning of the next (or a new generation),
             // no prior contract state is useful, so release it immediately. This keeps
@@ -85,7 +94,7 @@ object CausalFeatureEngineering {
                     expiryByKey.remove(oldKey)
                 }
             }
-            return fromPoints(q.toList())
+            return if (materialize) fromPoints(q.toList()) else null
         }
 
         fun clear() {
@@ -104,7 +113,16 @@ object CausalFeatureEngineering {
     private val streamedState = ThreadLocal.withInitial { PrelabelledState() }
 
     fun prelabelled(r: AimlHistoricalOptionCorpusV1Store.Record): NumericalMetaBrain.CausalExtras =
-        streamedState.get().observe(r)
+        requireNotNull(streamedState.get().observe(r, materialize = true))
+
+    /** Advance pre-labelled causal state without building the 43-feature snapshot. */
+    fun observePrelabelledOnly(r: AimlHistoricalOptionCorpusV1Store.Record) {
+        streamedState.get().observe(r, materialize = false)
+    }
+
+    /** Advance state and materialize exactly the snapshot for this emitted row. */
+    fun observeAndMaterializePrelabelled(r: AimlHistoricalOptionCorpusV1Store.Record): NumericalMetaBrain.CausalExtras =
+        requireNotNull(streamedState.get().observe(r, materialize = true))
 
     fun resetStreamedState() = streamedState.get().clear()
 

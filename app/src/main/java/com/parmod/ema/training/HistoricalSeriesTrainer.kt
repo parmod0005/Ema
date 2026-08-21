@@ -171,7 +171,7 @@ class HistoricalSeriesTrainer(
                         i,
                         hypers.size,
                         if (generation == 0) {
-                            "$sourceLabel · seed Candidate ${i + 1}/${hypers.size} · chronological folds"
+                            "$sourceLabel · seed Candidate ${i + 1}/${hypers.size} · nested chronological policy calibration + scoring"
                         } else {
                             "$sourceLabel · Adaptive G$generation ${guidance?.name ?: "BALANCED"} · Candidate ${i + 1}/${hypers.size} · development only · holdout untouched"
                         },
@@ -206,7 +206,7 @@ class HistoricalSeriesTrainer(
                     "HISTORICAL_EVOLVE",
                     adaptiveGenerations,
                     HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
-                    "$sourceLabel · G$adaptiveGenerations guidance ${guidance.name} · parent TAKE ${parent.candidate.takeSamples}/${HistoricalCandidateGovernance.requiredActionSamples(parent.candidate.labels)} · TAKE net ${"%+.2f%%".format(parent.candidate.takeAverageNetReturn * 100.0)} · Production frozen",
+                    "$sourceLabel · G$adaptiveGenerations ${guidance.name} · model evolves LR/L2; TAKE/REJECT recalibrates inside each development fold · Production frozen",
                 ),
             )
             evaluateBatch(batch.candidates, adaptiveGenerations, guidance)
@@ -234,7 +234,7 @@ class HistoricalSeriesTrainer(
                     "LOCKED_HOLDOUT",
                     0,
                     1,
-                    "$sourceLabel · development-qualified after G$adaptiveGenerations · opening locked holdout ONCE",
+                    "$sourceLabel · model + calibrated policy development-qualified after G$adaptiveGenerations · opening locked holdout ONCE",
                 ),
             )
             val champion = brainFromBaseline(best.hyperParameters)
@@ -259,16 +259,16 @@ class HistoricalSeriesTrainer(
                 evaluations.size,
                 evaluations.size,
                 when {
-                    championState != null -> "$sourceLabel historical adaptive search PASS after G$adaptiveGenerations · ready for fresh live validation"
+                    championState != null -> "$sourceLabel historical model + policy PASS after G$adaptiveGenerations · ready for fresh live validation"
                     governance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel locked holdout INSUFFICIENT DATA · search stopped; holdout is not reused"
                     holdoutOpened -> "$sourceLabel locked holdout FAIL · search stopped; holdout is not reused for tuning"
-                    developmentGovernance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel adaptive search exhausted G$adaptiveGenerations · action/evidence target not reached · holdout stayed closed"
-                    else -> "$sourceLabel adaptive historical search exhausted G$adaptiveGenerations · no development-qualified Candidate · holdout stayed closed"
+                    developmentGovernance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel adaptive search exhausted G$adaptiveGenerations · calibrated action/evidence target not reached · holdout stayed closed"
+                    else -> "$sourceLabel adaptive historical search exhausted G$adaptiveGenerations · no development-qualified model + policy · holdout stayed closed"
                 },
             ),
         )
 
-        val devNote = "Historical adaptive search: ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations; action-aware parent ranking; evolution used development/walk-forward only"
+        val devNote = "Historical adaptive search: ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations; each walk-forward block used early calibration then later scoring; locked holdout never tuned"
         val governanceNote = when {
             holdoutOpened -> "Locked governance ${governance.label}: ${governance.reasons.joinToString("; ")}"
             else -> "Development gate ${developmentGovernance.label}: ${developmentGovernance.reasons.joinToString("; ")}"
@@ -293,7 +293,7 @@ class HistoricalSeriesTrainer(
             holdoutProduction = holdoutProduction,
             championState = championState,
             errors = errors,
-            note = "$sourceLabel · $devNote · $governanceNote · actual option-premium MFE/MAE · next-bar entry · chronological walk-forward · locked holdout opened at most once · unavailable historical D30/depth stays zero.",
+            note = "$sourceLabel · $devNote · $governanceNote · actual option-premium MFE/MAE · next-bar entry · cost-aware TAKE/REJECT policy calibration · locked holdout opened at most once · unavailable historical D30/depth stays zero.",
         )
     }
 
@@ -370,30 +370,59 @@ class HistoricalSeriesTrainer(
         val blocks = requestedFolds + 1
         val candidateTotal = Accumulator()
         val productionTotal = Accumulator()
+        val takePolicies = ArrayList<Double>()
+        val rejectPolicies = ArrayList<Double>()
+        var calibrationScore = 0.0
         var foldsRun = 0
         var foldsWon = 0
+
         for (fold in 1..requestedFolds) {
             val trainEnd = development.size * fold / blocks
             val validateEnd = if (fold == requestedFolds) development.size else development.size * (fold + 1) / blocks
             if (trainEnd < 20 || validateEnd <= trainEnd) continue
             val train = development.subList(0, trainEnd)
             val validation = development.subList(trainEnd, validateEnd)
+            if (validation.size < MIN_FOLD_VALIDATION) continue
+            val calibrationSize = max(MIN_FOLD_CALIBRATION, (validation.size * CALIBRATION_FRACTION).toInt())
+                .coerceAtMost(validation.size - MIN_FOLD_SCORING)
+            if (calibrationSize <= 0 || validation.size - calibrationSize < MIN_FOLD_SCORING) continue
+            val calibrationSlice = validation.subList(0, calibrationSize)
+            val scoringSlice = validation.subList(calibrationSize, validation.size)
+
             val candidate = brainFromBaseline(hyper)
             learn(candidate, train)
+            val stream = BinaryTrainingPolicy.StreamingCalibration()
+            calibrationSlice.forEach { s ->
+                val p = candidate.predict(s.features)
+                stream.add(p.probabilitySuccess, s.success, s.netReturn)
+            }
+            val policy = BinaryTrainingPolicy.applyCalibration(candidate, stream)
+            takePolicies += policy.takeThreshold
+            rejectPolicies += policy.rejectThreshold
+            calibrationScore += policy.score
+
             val production = brainFromBaseline(productionBaseline.hyperParameters)
-            val cm = evaluate(candidate, validation)
-            val pm = evaluate(production, validation)
+            val cm = evaluate(candidate, scoringSlice)
+            val pm = evaluate(production, scoringSlice)
             candidateTotal.merge(cm)
             productionTotal.merge(pm)
             foldsRun++
             if (foldScore(cm.metrics(), pm.metrics()) > 0.0) foldsWon++
         }
+
         val candidateMetrics = candidateTotal.metrics()
         val productionMetrics = productionTotal.metrics()
         val winRatio = if (foldsRun == 0) 0.0 else foldsWon.toDouble() / foldsRun
-        val score = foldScore(candidateMetrics, productionMetrics) + 0.08 * (winRatio - 0.50)
+        val medianTake = median(takePolicies, hyper.takeThreshold)
+        val medianReject = median(rejectPolicies, hyper.rejectThreshold).coerceAtMost(medianTake - BinaryTrainingPolicy.MIN_THRESHOLD_GAP)
+        val calibratedHyper = HistoricalAdaptiveCandidateSearch.bounded(
+            hyper.copy(takeThreshold = medianTake, rejectThreshold = medianReject),
+        )
+        val score = foldScore(candidateMetrics, productionMetrics) +
+            0.08 * (winRatio - 0.50) +
+            if (foldsRun == 0) 0.0 else 0.10 * calibrationScore / foldsRun
         val robust = foldsRun >= 3 && foldsWon >= ceil(foldsRun * 0.75).toInt()
-        return HistoricalCorpusTrainer.CandidateEvaluation(hyper, foldsRun, foldsWon, candidateMetrics, productionMetrics, score, robust)
+        return HistoricalCorpusTrainer.CandidateEvaluation(calibratedHyper, foldsRun, foldsWon, candidateMetrics, productionMetrics, score, robust)
     }
 
     private fun foldScore(candidate: HistoricalCorpusTrainer.Metrics, production: HistoricalCorpusTrainer.Metrics): Double {
@@ -463,5 +492,19 @@ class HistoricalSeriesTrainer(
         return ((((c - b) / b) - ((b - a) / a)) * 1_000.0).coerceIn(-3.0, 3.0)
     }
 
+    private fun median(values: List<Double>, fallback: Double): Double {
+        if (values.isEmpty()) return fallback
+        val sorted = values.sorted()
+        val mid = sorted.size / 2
+        return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2.0
+    }
+
     private fun List<Double>.averageOrZero(): Double = if (isEmpty()) 0.0 else average()
+
+    companion object {
+        private const val CALIBRATION_FRACTION = 0.35
+        private const val MIN_FOLD_CALIBRATION = 12
+        private const val MIN_FOLD_SCORING = 20
+        private const val MIN_FOLD_VALIDATION = MIN_FOLD_CALIBRATION + MIN_FOLD_SCORING
+    }
 }

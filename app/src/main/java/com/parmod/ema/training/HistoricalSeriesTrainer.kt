@@ -154,9 +154,40 @@ class HistoricalSeriesTrainer(
             )
         }
 
+        val embargoMs = TrainingLeakageGuard.embargoMillis(config.interval, config.labelConfig.horizonBars)
         val developmentEnd = (corpus.size * config.developmentFraction).toInt().coerceIn(config.walkForwardFolds + 2, corpus.size - 1)
-        val development = corpus.subList(0, developmentEnd)
+        val rawDevelopment = corpus.subList(0, developmentEnd)
         val holdout = corpus.subList(developmentEnd, corpus.size)
+        val development = TrainingLeakageGuard.purgeBeforeBoundary(
+            rows = rawDevelopment,
+            boundaryTimestamp = holdout.first().timestamp,
+            embargoMillis = embargoMs,
+            timestamp = { it.timestamp },
+        )
+        if (development.size < config.walkForwardFolds + 2) {
+            return HistoricalCorpusTrainer.Result(
+                index = index,
+                months = config.months,
+                fromDate = from,
+                toDate = to,
+                expiries = expiryCount,
+                contractsDownloaded = selected.size,
+                corpusSamples = corpus.size,
+                coverage = coverage,
+                averageMfeReturn = corpus.map { it.mfeReturn }.averageOrZero(),
+                averageMaeReturn = corpus.map { it.maeReturn }.averageOrZero(),
+                averageNetReturn = corpus.map { it.netReturn }.averageOrZero(),
+                candidatesEvaluated = 0,
+                bestWalkForward = null,
+                lockedHoldoutOpened = false,
+                lockedHoldoutPassed = false,
+                holdoutCandidate = null,
+                holdoutProduction = null,
+                championState = null,
+                errors = errors + "Leakage embargo left insufficient development evidence",
+                note = "$sourceLabel · fail-closed leakage validation blocked training; Production unchanged.",
+            )
+        }
         val seedHypers = candidateHyperParameters()
         val evaluations = ArrayList<HistoricalCorpusTrainer.CandidateEvaluation>()
         val seen = seedHypers.mapTo(linkedSetOf()) { HistoricalAdaptiveCandidateSearch.signature(it) }
@@ -171,13 +202,13 @@ class HistoricalSeriesTrainer(
                         i,
                         hypers.size,
                         if (generation == 0) {
-                            "$sourceLabel · seed Candidate ${i + 1}/${hypers.size} · nested chronological policy calibration + scoring"
+                            "$sourceLabel · seed Candidate ${i + 1}/${hypers.size} · purged chronological calibration + scoring"
                         } else {
                             "$sourceLabel · Adaptive G$generation ${guidance?.name ?: "BALANCED"} · Candidate ${i + 1}/${hypers.size} · development only · holdout untouched"
                         },
                     ),
                 )
-                evaluations += evaluateWalkForward(development, hyper, config.walkForwardFolds)
+                evaluations += evaluateWalkForward(development, hyper, config.walkForwardFolds, embargoMs)
             }
         }
 
@@ -206,7 +237,7 @@ class HistoricalSeriesTrainer(
                     "HISTORICAL_EVOLVE",
                     adaptiveGenerations,
                     HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
-                    "$sourceLabel · G$adaptiveGenerations ${guidance.name} · model evolves LR/L2; TAKE/REJECT recalibrates inside each development fold · Production frozen",
+                    "$sourceLabel · G$adaptiveGenerations ${guidance.name} · model evolves LR/L2; TAKE/REJECT recalibrates inside each purged development fold · Production frozen",
                 ),
             )
             evaluateBatch(batch.candidates, adaptiveGenerations, guidance)
@@ -234,7 +265,7 @@ class HistoricalSeriesTrainer(
                     "LOCKED_HOLDOUT",
                     0,
                     1,
-                    "$sourceLabel · model + calibrated policy development-qualified after G$adaptiveGenerations · opening locked holdout ONCE",
+                    "$sourceLabel · model + calibrated policy development-qualified after G$adaptiveGenerations · opening embargoed locked holdout ONCE",
                 ),
             )
             val champion = brainFromBaseline(best.hyperParameters)
@@ -259,7 +290,7 @@ class HistoricalSeriesTrainer(
                 evaluations.size,
                 evaluations.size,
                 when {
-                    championState != null -> "$sourceLabel historical model + policy PASS after G$adaptiveGenerations · ready for fresh live validation"
+                    championState != null -> "$sourceLabel historical model + policy PASS after G$adaptiveGenerations · leakage guard PASS · ready for fresh live validation"
                     governance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel locked holdout INSUFFICIENT DATA · search stopped; holdout is not reused"
                     holdoutOpened -> "$sourceLabel locked holdout FAIL · search stopped; holdout is not reused for tuning"
                     developmentGovernance.status == HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "$sourceLabel adaptive search exhausted G$adaptiveGenerations · calibrated action/evidence target not reached · holdout stayed closed"
@@ -268,7 +299,7 @@ class HistoricalSeriesTrainer(
             ),
         )
 
-        val devNote = "Historical adaptive search: ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations; each walk-forward block used early calibration then later scoring; locked holdout never tuned"
+        val devNote = "Historical adaptive search: ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations; every TRAIN/calibration/scoring/holdout boundary purged by ${embargoMs / 60_000L}m; locked holdout never tuned"
         val governanceNote = when {
             holdoutOpened -> "Locked governance ${governance.label}: ${governance.reasons.joinToString("; ")}"
             else -> "Development gate ${developmentGovernance.label}: ${developmentGovernance.reasons.joinToString("; ")}"
@@ -366,6 +397,7 @@ class HistoricalSeriesTrainer(
         development: List<Sample>,
         hyper: NumericalMetaBrain.HyperParameters,
         requestedFolds: Int,
+        embargoMs: Long,
     ): HistoricalCorpusTrainer.CandidateEvaluation {
         val blocks = requestedFolds + 1
         val candidateTotal = Accumulator()
@@ -380,14 +412,26 @@ class HistoricalSeriesTrainer(
             val trainEnd = development.size * fold / blocks
             val validateEnd = if (fold == requestedFolds) development.size else development.size * (fold + 1) / blocks
             if (trainEnd < 20 || validateEnd <= trainEnd) continue
-            val train = development.subList(0, trainEnd)
+            val rawTrain = development.subList(0, trainEnd)
             val validation = development.subList(trainEnd, validateEnd)
             if (validation.size < MIN_FOLD_VALIDATION) continue
+            val train = TrainingLeakageGuard.purgeBeforeBoundary(rawTrain, validation.first().timestamp, embargoMs) { it.timestamp }
+            if (train.size < 20) continue
             val calibrationSize = max(MIN_FOLD_CALIBRATION, (validation.size * CALIBRATION_FRACTION).toInt())
                 .coerceAtMost(validation.size - MIN_FOLD_SCORING)
             if (calibrationSize <= 0 || validation.size - calibrationSize < MIN_FOLD_SCORING) continue
-            val calibrationSlice = validation.subList(0, calibrationSize)
+            val rawCalibration = validation.subList(0, calibrationSize)
             val scoringSlice = validation.subList(calibrationSize, validation.size)
+            val calibrationSlice = TrainingLeakageGuard.purgeBeforeBoundary(rawCalibration, scoringSlice.first().timestamp, embargoMs) { it.timestamp }
+            if (calibrationSlice.size < MIN_FOLD_CALIBRATION) continue
+            val leakage = TrainingLeakageGuard.validateOrderedSlices(
+                train = train,
+                calibration = calibrationSlice,
+                scoring = scoringSlice,
+                embargoMillis = embargoMs,
+                timestamp = { it.timestamp },
+            )
+            if (!leakage.passed) continue
 
             val candidate = brainFromBaseline(hyper)
             learn(candidate, train)

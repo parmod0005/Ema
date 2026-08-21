@@ -22,14 +22,11 @@ import java.time.format.DateTimeFormatter
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import kotlin.concurrent.thread
 
 /**
- * Append-only live research archive designed to survive normal APK upgrades and be
- * portable across uninstall/signature/device changes via explicit ZIP export/import.
- *
- * Underlyings are sampled once/second; option research snapshots are sampled every
- * five seconds to control phone storage. Completed 1m bars, every registered AI
- * observation and every resolved outcome are stored separately.
+ * Persistent live research archive. Raw tick/D30 capture is storage-protected while
+ * 1m bars, exact AI observations and resolved outcomes remain preservation-priority.
  */
 object LiveResearchArchive {
     data class Summary(
@@ -43,20 +40,23 @@ object LiveResearchArchive {
         val importedArchives: Int = 0,
         val schemaVersion: Int = ARCHIVE_SCHEMA,
         val featureSchemaVersion: Int = NumericalMetaBrain.FEATURE_SCHEMA_VERSION,
+        val quotaBytes: Long = 0L,
+        val freeBytes: Long = 0L,
+        val rawCaptureEnabled: Boolean = true,
+        val compactTrainingRecords: Long = 0L,
+        val prunedRawFiles: Int = 0,
+        val storageMessage: String = "",
     )
 
-    data class DepthRow(
-        val bidPrice: Double,
-        val bidQty: Long,
-        val askPrice: Double,
-        val askQty: Long,
-    )
+    data class DepthRow(val bidPrice: Double, val bidQty: Long, val askPrice: Double, val askQty: Long)
 
     private lateinit var appContext: Context
     private var initialized = false
     private val lastTickWrite = HashMap<String, Long>()
     private val zone = ZoneId.of("Asia/Kolkata")
     private val dayFormat = DateTimeFormatter.ISO_LOCAL_DATE
+    private var lastMaintenanceRequestedAt = 0L
+    @Volatile private var maintenanceRunning = false
 
     @Synchronized
     fun initialize(context: Context) {
@@ -64,6 +64,7 @@ object LiveResearchArchive {
         appContext = context.applicationContext
         root().mkdirs()
         initialized = true
+        scheduleMaintenance(force = true)
     }
 
     @Synchronized
@@ -82,28 +83,22 @@ object LiveResearchArchive {
         depth: List<DepthRow>,
     ) {
         if (!initialized || instrumentKey.isBlank() || timestamp <= 0L) return
+        scheduleMaintenance()
+        if (!storageManager().rawCaptureAllowed()) return
         val sampleKey = "${index.name}|$instrumentKey"
         val last = lastTickWrite[sampleKey] ?: 0L
         val interval = if (kind == "UNDERLYING") UNDERLYING_SAMPLE_MS else OPTION_SAMPLE_MS
         if (timestamp - last < interval) return
         lastTickWrite[sampleKey] = timestamp
         val row = base("vardhani-live-tick-v$ARCHIVE_SCHEMA", timestamp)
-            .put("market", index.name)
-            .put("kind", kind)
-            .put("instrument_key", instrumentKey)
-            .put("ltp", ltp ?: JSONObject.NULL)
-            .put("oi", oi ?: JSONObject.NULL)
-            .put("volume", volume ?: JSONObject.NULL)
-            .put("bid", bid ?: JSONObject.NULL)
-            .put("ask", ask ?: JSONObject.NULL)
-            .put("tbq", totalBuyQty ?: JSONObject.NULL)
-            .put("tsq", totalSellQty ?: JSONObject.NULL)
+            .put("market", index.name).put("kind", kind).put("instrument_key", instrumentKey)
+            .put("ltp", ltp ?: JSONObject.NULL).put("oi", oi ?: JSONObject.NULL).put("volume", volume ?: JSONObject.NULL)
+            .put("bid", bid ?: JSONObject.NULL).put("ask", ask ?: JSONObject.NULL)
+            .put("tbq", totalBuyQty ?: JSONObject.NULL).put("tsq", totalSellQty ?: JSONObject.NULL)
             .put("depth_levels", depth.size)
         if (depth.isNotEmpty()) {
             val arr = JSONArray()
-            depth.take(MAX_ARCHIVED_DEPTH).forEach { d ->
-                arr.put(JSONArray().put(d.bidPrice).put(d.bidQty).put(d.askPrice).put(d.askQty))
-            }
+            depth.take(MAX_ARCHIVED_DEPTH).forEach { d -> arr.put(JSONArray().put(d.bidPrice).put(d.bidQty).put(d.askPrice).put(d.askQty)) }
             row.put("depth", arr)
         }
         append(sessionFile(timestamp, "ticks.ndjson"), row.toString())
@@ -111,25 +106,13 @@ object LiveResearchArchive {
     }
 
     @Synchronized
-    fun captureMinuteBar(
-        index: MarketIndex,
-        timestamp: Long,
-        open: Double,
-        high: Double,
-        low: Double,
-        close: Double,
-        ticks: Long,
-    ) {
+    fun captureMinuteBar(index: MarketIndex, timestamp: Long, open: Double, high: Double, low: Double, close: Double, ticks: Long) {
         if (!initialized || timestamp <= 0L || close <= 0.0) return
         val row = base("vardhani-live-minute-v$ARCHIVE_SCHEMA", timestamp)
-            .put("market", index.name)
-            .put("open", open)
-            .put("high", high)
-            .put("low", low)
-            .put("close", close)
-            .put("ticks", ticks)
+            .put("market", index.name).put("open", open).put("high", high).put("low", low).put("close", close).put("ticks", ticks)
         append(sessionFile(timestamp, "underlying_1m.ndjson"), row.toString())
         increment(KEY_MINUTE_ROWS)
+        scheduleMaintenance()
     }
 
     @Synchronized
@@ -150,27 +133,16 @@ object LiveResearchArchive {
         hyper: NumericalMetaBrain.HyperParameters,
     ) {
         if (!initialized || id.isBlank() || timestamp <= 0L) return
-        val vector = JSONArray()
-        features.vector().forEach { vector.put(it) }
+        val vector = JSONArray(); features.vector().forEach(vector::put)
         val row = base("vardhani-live-observation-v$ARCHIVE_SCHEMA", timestamp)
-            .put("id", id)
-            .put("market", index.name)
-            .put("engine", engine.name)
-            .put("side", side.name)
-            .put("instrument_key", instrumentKey)
-            .put("entry_spot", entrySpot)
-            .put("entry_premium", entryPremium)
-            .put("lot_size", lotSize)
-            .put("production_probability", productionProbability)
-            .put("candidate_probability", candidateProbability)
-            .put("candidate_decision", candidateDecision.name)
-            .put("learning_rate", hyper.learningRate)
-            .put("l2", hyper.l2)
-            .put("take_threshold", hyper.takeThreshold)
-            .put("reject_threshold", hyper.rejectThreshold)
-            .put("features", vector)
+            .put("id", id).put("market", index.name).put("engine", engine.name).put("side", side.name)
+            .put("instrument_key", instrumentKey).put("entry_spot", entrySpot).put("entry_premium", entryPremium).put("lot_size", lotSize)
+            .put("production_probability", productionProbability).put("candidate_probability", candidateProbability)
+            .put("candidate_decision", candidateDecision.name).put("learning_rate", hyper.learningRate).put("l2", hyper.l2)
+            .put("take_threshold", hyper.takeThreshold).put("reject_threshold", hyper.rejectThreshold).put("features", vector)
         append(sessionFile(timestamp, "observations.ndjson"), row.toString())
         increment(KEY_OBSERVATIONS)
+        scheduleMaintenance()
     }
 
     @Synchronized
@@ -187,34 +159,43 @@ object LiveResearchArchive {
     ) {
         if (!initialized || id.isBlank() || timestamp <= 0L) return
         val row = base("vardhani-live-outcome-v$ARCHIVE_SCHEMA", timestamp)
-            .put("id", id)
-            .put("market", index.name)
-            .put("success", success)
-            .put("exit_premium", exitPremium)
-            .put("mfe_return", mfeReturn)
-            .put("mae_return", maeReturn)
-            .put("net_return", netReturn)
-            .put("exit_reason", exitReason)
+            .put("id", id).put("market", index.name).put("success", success).put("exit_premium", exitPremium)
+            .put("mfe_return", mfeReturn).put("mae_return", maeReturn).put("net_return", netReturn).put("exit_reason", exitReason)
         append(sessionFile(timestamp, "outcomes.ndjson"), row.toString())
         increment(KEY_OUTCOMES)
+        scheduleMaintenance()
     }
 
     @Synchronized
     fun summary(): Summary {
         if (!initialized) return Summary()
-        val sessionDirs = sessionsRoot().listFiles()?.filter { it.isDirectory }.orEmpty()
+        val sessionDirs = sessionsRoot().listFiles()?.filter(File::isDirectory).orEmpty()
         val allFiles = sessionDirs.flatMap { it.walkTopDown().filter(File::isFile).toList() }
-        val prefs = prefs()
+        val p = prefs(); val storage = storageManager().status()
         return Summary(
-            sessions = sessionDirs.size,
-            files = allFiles.size,
-            bytes = allFiles.sumOf { it.length() },
-            tickRows = prefs.getLong(KEY_TICK_ROWS, 0L),
-            minuteRows = prefs.getLong(KEY_MINUTE_ROWS, 0L),
-            observations = prefs.getLong(KEY_OBSERVATIONS, 0L),
-            outcomes = prefs.getLong(KEY_OUTCOMES, 0L),
-            importedArchives = prefs.getInt(KEY_IMPORTED, 0),
+            sessions = sessionDirs.size, files = allFiles.size, bytes = allFiles.sumOf(File::length),
+            tickRows = p.getLong(KEY_TICK_ROWS, 0L), minuteRows = p.getLong(KEY_MINUTE_ROWS, 0L),
+            observations = p.getLong(KEY_OBSERVATIONS, 0L), outcomes = p.getLong(KEY_OUTCOMES, 0L),
+            importedArchives = p.getInt(KEY_IMPORTED, 0), quotaBytes = storage.policy.quotaBytes, freeBytes = storage.freeBytes,
+            rawCaptureEnabled = storage.rawCaptureEnabled, compactTrainingRecords = storage.compactTrainingRecords,
+            prunedRawFiles = storage.prunedRawFiles, storageMessage = storage.message,
         )
+    }
+
+    fun storageStatus(): LiveResearchArchiveStorageManager.Status {
+        check(initialized); return storageManager().status()
+    }
+
+    fun setStorageQuotaGiB(gib: Int): LiveResearchArchiveStorageManager.Policy {
+        check(initialized); val policy = storageManager().setQuotaGiB(gib); scheduleMaintenance(force = true); return policy
+    }
+
+    fun setRawRetentionDays(days: Int): LiveResearchArchiveStorageManager.Policy {
+        check(initialized); val policy = storageManager().setRawRetentionDays(days); scheduleMaintenance(force = true); return policy
+    }
+
+    fun runStorageMaintenance(): LiveResearchArchiveStorageManager.Status {
+        check(initialized); return storageManager().maintain(allowPrune = true)
     }
 
     @Synchronized
@@ -222,27 +203,19 @@ object LiveResearchArchive {
         check(initialized) { "LiveResearchArchive is not initialized" }
         ZipOutputStream(BufferedOutputStream(output, BUFFER)).use { zip ->
             val s = summary()
-            val manifest = JSONObject()
-                .put("schema", "vardhani-live-archive-v$ARCHIVE_SCHEMA")
-                .put("feature_schema", NumericalMetaBrain.FEATURE_SCHEMA_VERSION)
-                .put("created_at", System.currentTimeMillis())
+            val manifest = JSONObject().put("schema", "vardhani-live-archive-v$ARCHIVE_SCHEMA")
+                .put("feature_schema", NumericalMetaBrain.FEATURE_SCHEMA_VERSION).put("created_at", System.currentTimeMillis())
                 .put("app_version", BuildConfig.VERSION_NAME)
                 .put("summary", JSONObject().apply {
-                    put("sessions", s.sessions); put("files", s.files); put("bytes", s.bytes)
-                    put("tick_rows", s.tickRows); put("minute_rows", s.minuteRows)
-                    put("observations", s.observations); put("outcomes", s.outcomes)
+                    put("sessions", s.sessions); put("files", s.files); put("bytes", s.bytes); put("tick_rows", s.tickRows)
+                    put("minute_rows", s.minuteRows); put("observations", s.observations); put("outcomes", s.outcomes)
+                    put("compact_training_records", s.compactTrainingRecords); put("pruned_raw_files", s.prunedRawFiles)
                 })
-            zip.putNextEntry(ZipEntry("manifest.json"))
-            zip.write(manifest.toString(2).toByteArray())
-            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("manifest.json")); zip.write(manifest.toString(2).toByteArray()); zip.closeEntry()
             val base = sessionsRoot()
-            if (base.exists()) {
-                base.walkTopDown().filter(File::isFile).forEach { file ->
-                    val relative = file.relativeTo(base).invariantSeparatorsPath
-                    zip.putNextEntry(ZipEntry("sessions/$relative"))
-                    FileInputStream(file).use { it.copyTo(zip, BUFFER) }
-                    zip.closeEntry()
-                }
+            base.walkTopDown().filter(File::isFile).forEach { file ->
+                val relative = file.relativeTo(base).invariantSeparatorsPath
+                zip.putNextEntry(ZipEntry("sessions/$relative")); FileInputStream(file).use { it.copyTo(zip, BUFFER) }; zip.closeEntry()
             }
         }
     }
@@ -257,20 +230,14 @@ object LiveResearchArchive {
                 var entries = 0
                 while (true) {
                     val entry = zip.nextEntry ?: break
-                    entries++
-                    if (entries > MAX_IMPORT_ENTRIES) error("Research archive contains too many files")
+                    entries++; if (entries > MAX_IMPORT_ENTRIES) error("Research archive contains too many files")
                     if (entry.isDirectory) { zip.closeEntry(); continue }
                     val normalized = entry.name.replace('\\', '/')
-                    if (!normalized.startsWith("sessions/") || ".." in normalized.split('/')) {
-                        zip.closeEntry(); continue
-                    }
-                    val relative = normalized.removePrefix("sessions/")
-                    if (relative.isBlank()) { zip.closeEntry(); continue }
-                    val staged = File(temp, relative)
-                    staged.parentFile?.mkdirs()
+                    if (!normalized.startsWith("sessions/") || ".." in normalized.split('/')) { zip.closeEntry(); continue }
+                    val relative = normalized.removePrefix("sessions/"); if (relative.isBlank()) { zip.closeEntry(); continue }
+                    val staged = File(temp, relative); staged.parentFile?.mkdirs()
                     FileOutputStream(staged).use { out -> copyLimited(zip, out, MAX_IMPORTED_FILE_BYTES) }
-                    val target = File(sessionsRoot(), relative)
-                    target.parentFile?.mkdirs()
+                    val target = File(sessionsRoot(), relative); target.parentFile?.mkdirs()
                     when {
                         !target.exists() -> { staged.copyTo(target); imported++ }
                         sha256(target) == sha256(staged) -> Unit
@@ -284,57 +251,42 @@ object LiveResearchArchive {
                     zip.closeEntry()
                 }
             }
-        } finally {
-            temp.deleteRecursively()
-        }
+        } finally { temp.deleteRecursively() }
         if (imported > 0) prefs().edit().putInt(KEY_IMPORTED, prefs().getInt(KEY_IMPORTED, 0) + 1).apply()
+        scheduleMaintenance(force = true)
         return imported
     }
 
-    private fun base(schema: String, timestamp: Long) = JSONObject()
-        .put("schema", schema)
-        .put("archive_schema", ARCHIVE_SCHEMA)
-        .put("feature_schema", NumericalMetaBrain.FEATURE_SCHEMA_VERSION)
-        .put("app_version", BuildConfig.VERSION_NAME)
-        .put("timestamp", timestamp)
-
-    private fun append(file: File, line: String) {
-        file.parentFile?.mkdirs()
-        file.appendText(line + "\n", Charsets.UTF_8)
+    private fun scheduleMaintenance(force: Boolean = false) {
+        if (!initialized) return
+        val now = System.currentTimeMillis()
+        if (!force && (maintenanceRunning || now - lastMaintenanceRequestedAt < MAINTENANCE_INTERVAL_MS)) return
+        lastMaintenanceRequestedAt = now; maintenanceRunning = true
+        thread(name = "vardhani-archive-maintenance", isDaemon = true) {
+            try { storageManager().maintain(allowPrune = true) } finally { maintenanceRunning = false }
+        }
     }
 
+    private fun storageManager() = LiveResearchArchiveStorageManager(appContext)
+    private fun base(schema: String, timestamp: Long) = JSONObject().put("schema", schema).put("archive_schema", ARCHIVE_SCHEMA)
+        .put("feature_schema", NumericalMetaBrain.FEATURE_SCHEMA_VERSION).put("app_version", BuildConfig.VERSION_NAME).put("timestamp", timestamp)
+    private fun append(file: File, line: String) { file.parentFile?.mkdirs(); file.appendText(line + "\n", Charsets.UTF_8) }
     private fun sessionFile(timestamp: Long, name: String): File {
         val day = Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate().format(dayFormat)
         return File(File(sessionsRoot(), day), name)
     }
-
     private fun root(): File = File(appContext.filesDir, "vardhani_live_research_archive/v$ARCHIVE_SCHEMA")
     private fun sessionsRoot(): File = File(root(), "sessions").apply { mkdirs() }
     private fun prefs() = appContext.getSharedPreferences("vardhani_live_archive_stats", 0)
     private fun increment(key: String) = prefs().edit().putLong(key, prefs().getLong(key, 0L) + 1L).apply()
 
     private fun copyLimited(input: InputStream, output: OutputStream, limit: Long) {
-        val buffer = ByteArray(BUFFER)
-        var total = 0L
-        while (true) {
-            val n = input.read(buffer)
-            if (n <= 0) break
-            total += n
-            if (total > limit) error("Imported research file exceeds safety limit")
-            output.write(buffer, 0, n)
-        }
+        val buffer = ByteArray(BUFFER); var total = 0L
+        while (true) { val n = input.read(buffer); if (n <= 0) break; total += n; if (total > limit) error("Imported research file exceeds safety limit"); output.write(buffer, 0, n) }
     }
-
     private fun sha256(file: File): String {
         val md = MessageDigest.getInstance("SHA-256")
-        FileInputStream(file).use { input ->
-            val b = ByteArray(BUFFER)
-            while (true) {
-                val n = input.read(b)
-                if (n <= 0) break
-                md.update(b, 0, n)
-            }
-        }
+        FileInputStream(file).use { input -> val b = ByteArray(BUFFER); while (true) { val n = input.read(b); if (n <= 0) break; md.update(b, 0, n) } }
         return md.digest().joinToString("") { "%02x".format(it) }
     }
 
@@ -345,6 +297,7 @@ object LiveResearchArchive {
     private const val MAX_IMPORT_ENTRIES = 10_000
     private const val MAX_IMPORTED_FILE_BYTES = 2L * 1024 * 1024 * 1024
     private const val BUFFER = 64 * 1024
+    private const val MAINTENANCE_INTERVAL_MS = 30L * 60L * 1000L
     private const val KEY_TICK_ROWS = "tick_rows"
     private const val KEY_MINUTE_ROWS = "minute_rows"
     private const val KEY_OBSERVATIONS = "observations"

@@ -5,7 +5,7 @@ import com.parmod.ema.model.MarketIndex
 import java.time.LocalDate
 import kotlin.math.abs
 
-/** Downloads the same expired-option series used by historical AI training, using the resumable Upstox cache. */
+/** Downloads expired-option series using the resumable Upstox cache. */
 class UpstoxCorpusSeriesLoader(private val client: UpstoxPlusHistoricalClient) {
     data class Result(
         val series: List<HistoricalOptionSeries>,
@@ -23,10 +23,11 @@ class UpstoxCorpusSeriesLoader(private val client: UpstoxPlusHistoricalClient) {
         onProgress: (HistoricalCorpusTrainer.Progress) -> Unit = {},
         shouldCancel: () -> Boolean = { false },
     ): Result {
-        require(months in setOf(1L, 3L, 6L, 12L))
-        val from = today.minusMonths(months)
+        require(months.toInt() in PrelabelledTrainingWindowPlan.ALLOWED_MONTHS)
         onProgress(HistoricalCorpusTrainer.Progress("DISCOVERY", 0, 1, "Discovering expired ${index.name} option expiries…"))
-        val expiries = client.getExpiries(index).filter { !it.isBefore(from) && !it.isAfter(today) }
+        val available = client.getExpiries(index).filter { !it.isAfter(today) }.sorted()
+        val from = if (months == PrelabelledTrainingWindowPlan.FULL.toLong()) available.firstOrNull() ?: today else today.minusMonths(months)
+        val expiries = if (months == PrelabelledTrainingWindowPlan.FULL.toLong()) available else available.filter { !it.isBefore(from) }
         val work = expiries.flatMap { expiry ->
             if (shouldCancel()) error("Training cancelled")
             selectResearchContracts(client.getExpiredOptionContracts(index, expiry), strikesEachSide)
@@ -37,7 +38,7 @@ class UpstoxCorpusSeriesLoader(private val client: UpstoxPlusHistoricalClient) {
             if (shouldCancel()) error("Training cancelled")
             onProgress(HistoricalCorpusTrainer.Progress("DOWNLOAD", i, work.size, "${contract.expiry} ${contract.strike.toInt()} ${contract.optionType}"))
             runCatching {
-                val start = contract.expiry.minusDays(7).coerceAtLeast(from)
+                val start = if (months == PrelabelledTrainingWindowPlan.FULL.toLong()) contract.expiry.minusDays(7) else contract.expiry.minusDays(7).coerceAtLeast(from)
                 val candles = client.getExpiredCandles(contract.instrumentKey, interval, start, contract.expiry)
                 if (candles.isNotEmpty()) {
                     result += HistoricalOptionSeries(

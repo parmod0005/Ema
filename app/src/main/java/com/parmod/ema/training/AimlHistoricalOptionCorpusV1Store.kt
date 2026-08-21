@@ -232,16 +232,44 @@ class AimlHistoricalOptionCorpusV1Store(private val context: Context) {
     fun clear() { root.deleteRecursively(); dataDir.mkdirs() }
 
     /**
-     * Streams the compact cache without loading a split into heap. Causal rolling state
-     * consumes EVERY row before stride sampling, preserving true bar spacing even when
-     * the search trains only on every Nth row. The scoped context is consumed by the
-     * next NumericalMetaBrain.Features constructor inside action().
+     * Lightweight compact-cache count. It intentionally does not construct causal
+     * indicators; use it for market/window sizing and stride planning.
+     */
+    fun count(
+        split: Split,
+        shouldCancel: () -> Boolean = { false },
+        accept: (Record) -> Boolean = { true },
+    ): Long {
+        val expected = rows(split)
+        val path = file(split)
+        if (expected <= 0L || !path.isFile) return 0L
+        var accepted = 0L
+        DataInputStream(BufferedInputStream(FileInputStream(path), BUFFER)).use { input ->
+            require(input.readUTF() == MAGIC) { "Unsupported compact historical corpus version" }
+            var rowIndex = 0L
+            while (rowIndex < expected) {
+                if (shouldCancel()) error("Training cancelled")
+                if (accept(readRecord(input))) accepted++
+                rowIndex++
+            }
+        }
+        return accepted
+    }
+
+    /**
+     * Streams the compact cache without loading a split into heap. Every physical row
+     * still advances causal rolling state. Expensive feature materialization happens
+     * only for rows accepted by [accept] and selected by [stride]. Stride is therefore
+     * based on eligible market/window rows rather than unrelated raw file positions.
+     * State is explicitly reset before/after each scan so repeated generations are
+     * deterministic and cannot leak rolling history between scans.
      */
     fun forEach(
         split: Split,
         stride: Int = 1,
         maxAccepted: Long = Long.MAX_VALUE,
         shouldCancel: () -> Boolean = { false },
+        accept: (Record) -> Boolean = { true },
         action: (Record) -> Unit,
     ): Long {
         require(stride >= 1)
@@ -249,25 +277,37 @@ class AimlHistoricalOptionCorpusV1Store(private val context: Context) {
         val path = file(split)
         if (expected <= 0L || !path.isFile) return 0L
         var emitted = 0L
-        DataInputStream(BufferedInputStream(FileInputStream(path), BUFFER)).use { input ->
-            require(input.readUTF() == MAGIC) { "Unsupported compact historical corpus version" }
-            var rowIndex = 0L
-            while (rowIndex < expected) {
-                if (shouldCancel()) error("Training cancelled")
-                val record = readRecord(input)
-                val causal = CausalFeatureEngineering.prelabelled(record)
-                if (rowIndex % stride == 0L) {
-                    NumericalMetaBrain.setThreadCausalExtras(causal)
-                    try {
-                        action(record)
-                    } finally {
-                        NumericalMetaBrain.clearThreadCausalExtras()
+        var eligibleIndex = 0L
+        CausalFeatureEngineering.resetStreamedState()
+        try {
+            DataInputStream(BufferedInputStream(FileInputStream(path), BUFFER)).use { input ->
+                require(input.readUTF() == MAGIC) { "Unsupported compact historical corpus version" }
+                var rowIndex = 0L
+                while (rowIndex < expected) {
+                    if (shouldCancel()) error("Training cancelled")
+                    val record = readRecord(input)
+                    val eligible = accept(record)
+                    val emit = eligible && eligibleIndex % stride == 0L
+                    if (emit) {
+                        val causal = CausalFeatureEngineering.observeAndMaterializePrelabelled(record)
+                        NumericalMetaBrain.setThreadCausalExtras(causal)
+                        try {
+                            action(record)
+                        } finally {
+                            NumericalMetaBrain.clearThreadCausalExtras()
+                        }
+                        emitted++
+                    } else {
+                        CausalFeatureEngineering.observePrelabelledOnly(record)
                     }
-                    emitted++
+                    if (eligible) eligibleIndex++
                     if (emitted >= maxAccepted) break
+                    rowIndex++
                 }
-                rowIndex++
             }
+        } finally {
+            NumericalMetaBrain.clearThreadCausalExtras()
+            CausalFeatureEngineering.resetStreamedState()
         }
         return emitted
     }

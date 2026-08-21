@@ -10,8 +10,8 @@ import kotlin.math.max
  * Defines leakage-resistant chronological roles over the compact pre-labelled shards.
  *
  * The imported files may be contract-grouped, therefore their TRAIN/VALIDATION/TEST
- * names are treated as storage shards for windowed research. Model roles are derived
- * from timestamps across all shards. FULL uses the complete available date range;
+ * names are treated as storage shards for research. Model roles are derived from
+ * timestamps across all shards. FULL uses the complete available date range;
  * 1/3/6/12M are trailing windows anchored to the corpus' latest timestamp.
  */
 object PrelabelledTrainingWindowPlan {
@@ -33,6 +33,7 @@ object PrelabelledTrainingWindowPlan {
         val requestedMonths: Int,
         val fromDate: LocalDate,
         val toDate: LocalDate,
+        val window: Source,
         val train: Source,
         val calibration: Source,
         val scoring: Source,
@@ -42,7 +43,7 @@ object PrelabelledTrainingWindowPlan {
         val testBoundaryMs: Long,
         val embargoMs: Long = EMBARGO_MS,
     ) {
-        val label: String get() = if (requestedMonths == FULL) "FULL" else "${requestedMonths}M"
+        val label: String get() = label(requestedMonths)
     }
 
     fun build(
@@ -80,7 +81,7 @@ object PrelabelledTrainingWindowPlan {
         val trainBoundary = startMs + span * TRAIN_PERCENT / 100L
         val testBoundary = startMs + span * (TRAIN_PERCENT + VALIDATION_PERCENT) / 100L
         val validationSpan = testBoundary - trainBoundary
-        val calibrationBoundary = trainBoundary + (validationSpan * CALIBRATION_PERCENT).toLong()
+        val calibrationBoundary = trainBoundary + (validationSpan * CALIBRATION_FRACTION).toLong()
 
         // Labels inspect five future minutes; every preceding role ends six minutes
         // before the next role starts. Rows inside those gaps are deliberately unused.
@@ -96,6 +97,7 @@ object PrelabelledTrainingWindowPlan {
             requestedMonths = months,
             fromDate = Instant.ofEpochMilli(startMs).atOffset(IST).toLocalDate(),
             toDate = endDate,
+            window = Source(allSplits, markets, startMs, globalMax),
             train = Source(allSplits, markets, startMs, trainEnd),
             calibration = Source(allSplits, markets, trainBoundary, calibrationEnd),
             scoring = Source(allSplits, markets, calibrationBoundary, scoringEnd),
@@ -155,7 +157,7 @@ object PrelabelledTrainingWindowPlan {
 
     private const val TRAIN_PERCENT = 70L
     private const val VALIDATION_PERCENT = 15L
-    private const val CALIBRATION_PERCENT = 0.35
+    private const val CALIBRATION_FRACTION = 0.35
     const val EMBARGO_MINUTES = 6L
     const val EMBARGO_MS = EMBARGO_MINUTES * 60_000L
     private const val MIN_WINDOW_MS = 3L * 24L * 60L * 60L * 1000L

@@ -10,6 +10,19 @@ enum class HistoricalCorpusSource(val label: String) {
     COMBINED("COMBINED"),
 }
 
+enum class HistoricalMarketScope(val label: String) {
+    NIFTY("NIFTY"),
+    SENSEX("SENSEX"),
+    BOTH("BOTH"),
+    ;
+
+    fun singleIndexOrNull(): MarketIndex? = when (this) {
+        NIFTY -> MarketIndex.NIFTY
+        SENSEX -> MarketIndex.SENSEX
+        BOTH -> null
+    }
+}
+
 data class HistoricalOptionSeries(
     val index: MarketIndex,
     val optionType: String,
@@ -43,4 +56,5 @@ data class LocalCorpusSummary(
     val errors: List<String> = emptyList(),
 ) {
     val trainable: Boolean get() = optionContracts > 0 && rowsAccepted > 0
+    val bothMarketsPresent: Boolean get() = niftyContracts > 0 && sensexContracts > 0
 }

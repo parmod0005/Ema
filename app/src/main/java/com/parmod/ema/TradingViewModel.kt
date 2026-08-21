@@ -5,7 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import com.parmod.ema.data.UpstoxIntradayCandleClient
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxTickStream
-import com.parmod.ema.engine.ExecutionEngineV2
+import com.parmod.ema.engine.AdaptiveExitEngine
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.engine.OptionSelector
 import com.parmod.ema.engine.TickNativeDualEngine
@@ -46,10 +46,8 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private val tickCore = TickNativeDualEngine()
     private val v76Core = V76ScalperEngine()
     private val optionSelector = OptionSelector()
-    private val executionEngine = ExecutionEngineV2()
+    private val adaptiveExit = AdaptiveExitEngine()
 
-    private var engine1Execution: ExecutionEngineV2.State? = null
-    private var engine2Execution: ExecutionEngineV2.State? = null
     private var engine1LastExit = 0L
     private var engine2LastExit = 0L
     private var lastSignalPublishMillis = 0L
@@ -482,31 +480,38 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
         val lotSize = if (s.index == MarketIndex.NIFTY) 65 else 20
         val lots = s.selectedLots
         val qty = lotSize * lots
+        val entry = if (engine == EngineId.ENGINE_3_V76_SCALPER) paperBuy(q) else if (q.ask > 0.0) q.ask else q.ltp
+        if (entry <= 0.0) return
+        if (engine == EngineId.ENGINE_3_V76_SCALPER && entry !in V76ScalperEngine.MIN_OPTION_PREMIUM..V76ScalperEngine.MAX_OPTION_PREMIUM) return
 
-        if (engine == EngineId.ENGINE_3_V76_SCALPER) {
-            val entry = paperBuy(q)
-            if (entry !in V76ScalperEngine.MIN_OPTION_PREMIUM..V76ScalperEngine.MAX_OPTION_PREMIUM) return
-            val strategy = if (reason.contains("BREAKOUT")) "BREAKOUT" else "PULLBACK"
-            val stopPct = if (strategy == "BREAKOUT") V76ScalperEngine.FAST_STOP_PERCENT else V76ScalperEngine.PULLBACK_STOP_PERCENT
-            val targetPct = if (strategy == "BREAKOUT") V76ScalperEngine.FAST_TARGET_PERCENT else V76ScalperEngine.PULLBACK_TARGET_PERCENT
-            val maxHold = if (strategy == "BREAKOUT") V76ScalperEngine.FAST_MAX_HOLD_MINUTES else V76ScalperEngine.PULLBACK_MAX_HOLD_MINUTES
-            val p = PaperPosition(
-                side = side, strike = q.strike, quantity = qty, entryPrice = entry, currentPrice = q.ltp,
-                highestPrice = entry, stopPrice = entry * (1 - stopPct / 100.0), targetPrice = entry * (1 + targetPct / 100.0),
-                openedAtMillis = System.currentTimeMillis(), strategy = strategy, lotSize = lotSize, lots = lots, initialQuantity = qty,
-                indexInvalidation = lastV76Evaluation.indexInvalidation, maxHoldMinutes = maxHold,
-            )
-            sessionV76().trades++
-            setEngineState(engine, engineState(engine).copy(position = p, message = "V7.6 PAPER ${side.name} ${q.strike.toInt()} · $strategy"))
-            recordOpenTrade(engine, p, strategy)
-            return
+        val strategy = when {
+            engine != EngineId.ENGINE_3_V76_SCALPER -> engine.name
+            reason.contains("BREAKOUT", ignoreCase = true) -> "BREAKOUT"
+            else -> "PULLBACK"
         }
-
-        val entry = if (q.ask > 0.0) q.ask else q.ltp
-        val exec = executionEngine.open(entry)
-        val p = PaperPosition(side, q.strike, qty, entry, q.ltp, exec.highestPrice, exec.stopPrice, exec.targetPrice, openedAtMillis = System.currentTimeMillis(), lotSize = lotSize, lots = lots, initialQuantity = qty)
-        if (engine == EngineId.ENGINE_1_TREND) engine1Execution = exec else engine2Execution = exec
-        setEngineState(engine, engineState(engine).copy(position = p, message = "PAPER ${side.name} ${q.strike.toInt()} · $reason"))
+        val now = System.currentTimeMillis()
+        val plan = adaptiveExit.open(engine, side, entry, now, strategy)
+        val invalidation = if (engine == EngineId.ENGINE_3_V76_SCALPER) lastV76Evaluation.indexInvalidation else expectedSignal?.stopLoss ?: 0.0
+        val p = PaperPosition(
+            side = side,
+            strike = q.strike,
+            quantity = qty,
+            entryPrice = entry,
+            currentPrice = q.ltp,
+            highestPrice = entry,
+            stopPrice = plan.stopPrice,
+            targetPrice = plan.target1Price,
+            openedAtMillis = now,
+            strategy = strategy,
+            lotSize = lotSize,
+            lots = lots,
+            initialQuantity = qty,
+            indexInvalidation = invalidation,
+            maxHoldMinutes = plan.maxHoldMinutes,
+        )
+        if (engine == EngineId.ENGINE_3_V76_SCALPER) sessionV76().trades++
+        val label = if (engine == EngineId.ENGINE_3_V76_SCALPER) "V7.6 PAPER" else "PAPER"
+        setEngineState(engine, engineState(engine).copy(position = p, message = "$label ${side.name} ${q.strike.toInt()} · ADAPTIVE EXIT · $strategy"))
         recordOpenTrade(engine, p, reason)
     }
 
@@ -579,76 +584,86 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun managePositions() {
-        manageEngine12(EngineId.ENGINE_1_TREND); manageEngine12(EngineId.ENGINE_2_AVWAP_LIQUIDITY); manageV76(); updateRiskLock()
+        manageAdaptive(EngineId.ENGINE_1_TREND)
+        manageAdaptive(EngineId.ENGINE_2_AVWAP_LIQUIDITY)
+        manageAdaptive(EngineId.ENGINE_3_V76_SCALPER)
+        updateRiskLock()
     }
 
-    private fun manageEngine12(engine: EngineId) {
-        val state = engineState(engine); val position = state.position ?: return
-        val execution = if (engine == EngineId.ENGINE_1_TREND) engine1Execution else engine2Execution
-        val base = execution ?: executionEngine.open(position.entryPrice)
-        val opposite = (position.side == PositionSide.CE && state.signal.action == SignalAction.BUY_PE) || (position.side == PositionSide.PE && state.signal.action == SignalAction.BUY_CE)
-        val update = executionEngine.update(base, position.currentPrice, opposite)
-        if (engine == EngineId.ENGINE_1_TREND) engine1Execution = update.state else engine2Execution = update.state
-        setEngineState(engine, state.copy(position = position.copy(highestPrice = update.state.highestPrice, stopPrice = update.state.stopPrice, targetPrice = update.state.targetPrice, breakevenActive = update.state.breakevenActive, trailingActive = update.state.trailingActive)))
-        update.exitReason?.let { closeEnginePosition(engine, it.name.replace('_', ' ')) }
-    }
-
-    private fun manageV76() {
-        var state = _state.value.engine3
+    private fun manageAdaptive(engine: EngineId) {
+        var state = engineState(engine)
         var p = state.position ?: return
         val q = _state.value.optionChain.firstOrNull { it.strike == p.strike && it.type == p.side.name } ?: return
         val price = q.ltp
-        if (price <= 0) return
-        val highest = max(p.highestPrice, price)
-        val peakGain = max(0.0, highest - p.entryPrice)
-        val peakPct = if (p.entryPrice > 0) peakGain / p.entryPrice * 100 else 0.0
-        val peakGross = peakGain * p.quantity
-        var stop = p.stopPrice
-        var trailing = p.trailingActive
+        if (price <= 0.0) return
+        val now = System.currentTimeMillis()
+        val opposite = (p.side == PositionSide.CE && state.signal.action == SignalAction.BUY_PE) ||
+            (p.side == PositionSide.PE && state.signal.action == SignalAction.BUY_CE)
+        val invalid = (p.side == PositionSide.CE && p.indexInvalidation > 0.0 && _state.value.spotPrice < p.indexInvalidation) ||
+            (p.side == PositionSide.PE && p.indexInvalidation > 0.0 && _state.value.spotPrice > p.indexInvalidation)
+        val quality = if (_state.value.connectionMode == ConnectionMode.DEMO) null else V76ExecutionQualityEngine.evaluate(p.side, _state.value.optionChain, _state.value.spotPrice)
+        val update = adaptiveExit.update(
+            engine = engine,
+            side = p.side,
+            entryPrice = p.entryPrice,
+            currentPrice = price,
+            timestamp = now,
+            currentStopPrice = p.stopPrice,
+            previousHighestPrice = p.highestPrice,
+            target1Hit = p.target1Hit,
+            quantity = p.quantity,
+            strategy = p.strategy,
+            oppositeSignal = opposite,
+            indexInvalidated = invalid,
+            quality = quality,
+        )
 
-        if (!p.target1Hit && (peakPct >= V76ScalperEngine.PROFIT_LOCK_TRIGGER_PERCENT || peakGross >= V76ScalperEngine.PROFIT_LOCK_TRIGGER_GROSS_INR) && peakGain > 0) {
-            val minGain = p.entryPrice * V76ScalperEngine.PROFIT_LOCK_MIN_PERCENT / 100.0
-            stop = max(stop, p.entryPrice + max(minGain, peakGain * V76ScalperEngine.PROFIT_LOCK_RETAIN_RATIO)); trailing = true
-        }
-
-        if (!p.target1Hit && price >= p.targetPrice) {
-            var realized = p.realizedPartialPnl; var qty = p.quantity; var lots = p.lots; var bookedQty = p.target1ExitQuantity
-            val fill = paperSell(q)
+        if (update.partialTrigger && !p.target1Hit) {
+            var realized = p.realizedPartialPnl
+            var qty = p.quantity
+            var lots = p.lots
+            var bookedQty = p.target1ExitQuantity
             if (lots >= 2) {
-                var partialLots = max(1, (lots * V76ScalperEngine.TARGET1_PARTIAL_FRACTION).toInt())
+                var partialLots = max(1, (lots * AdaptiveExitEngine.TARGET1_PARTIAL_FRACTION).toInt())
                 partialLots = min(partialLots, lots - 1)
                 val partialQty = partialLots * p.lotSize
-                realized += (fill - p.entryPrice) * partialQty - V76ScalperEngine.PAPER_EXTRA_PARTIAL_EXIT_COST
-                qty -= partialQty; lots -= partialLots; bookedQty += partialQty
+                val fill = paperSell(q)
+                realized += (fill - p.entryPrice) * partialQty - AdaptiveExitEngine.PAPER_EXTRA_EXIT_ORDER_COST_INR
+                qty -= partialQty
+                lots -= partialLots
+                bookedQty += partialQty
             }
-            p = p.copy(quantity = qty, lots = lots, target1Hit = true, target1ExitQuantity = bookedQty, realizedPartialPnl = realized,
-                maxHoldMinutes = if (p.strategy == "BREAKOUT") V76ScalperEngine.RUNNER_BREAKOUT_MAX_HOLD_MINUTES else V76ScalperEngine.RUNNER_PULLBACK_MAX_HOLD_MINUTES)
+            p = p.copy(
+                quantity = qty,
+                lots = lots,
+                target1Hit = true,
+                target1ExitQuantity = bookedQty,
+                realizedPartialPnl = realized,
+                maxHoldMinutes = update.runnerMaxHoldMinutes,
+            )
         }
-        if (p.target1Hit && peakGain > 0) { stop = max(stop, p.entryPrice + peakGain * V76ScalperEngine.RUNNER_RETAIN_RATIO); trailing = true }
-        p = p.copy(currentPrice = price, highestPrice = highest, stopPrice = stop, trailingActive = trailing)
-        setEngineState(EngineId.ENGINE_3_V76_SCALPER, state.copy(position = p))
 
-        val held = (System.currentTimeMillis() - p.openedAtMillis) / 60_000.0
-        val local = Instant.now().atZone(ZoneId.of("Asia/Kolkata")); val minute = local.hour * 60 + local.minute
-        val invalid = (p.side == PositionSide.CE && _state.value.spotPrice > 0 && _state.value.spotPrice < p.indexInvalidation) || (p.side == PositionSide.PE && _state.value.spotPrice > p.indexInvalidation && p.indexInvalidation > 0)
-        val reason = when {
-            price <= p.stopPrice -> if (p.target1Hit) "RUNNER TRAILING STOP" else if (p.trailingActive) "TRAILING STOP" else "PREMIUM STOP"
-            invalid -> "INDEX INVALIDATION"
-            held >= p.maxHoldMinutes -> if (p.target1Hit) "RUNNER TIME STOP" else "TIME STOP"
-            minute >= V76ScalperEngine.FORCE_EXIT_MINUTE -> "SESSION EXIT"
-            else -> null
-        }
-        if (reason != null) closeEnginePosition(EngineId.ENGINE_3_V76_SCALPER, reason)
+        p = p.copy(
+            currentPrice = price,
+            highestPrice = update.highestPrice,
+            stopPrice = update.stopPrice,
+            targetPrice = update.target1Price,
+            breakevenActive = update.breakevenActive,
+            trailingActive = update.trailingActive,
+            maxHoldMinutes = if (p.target1Hit) update.runnerMaxHoldMinutes else update.maxHoldMinutes,
+        )
+        val adaptiveMessage = "ADAPTIVE EXIT · ${update.diagnostic}${if (p.target1Hit) " · RUNNER" else ""}"
+        setEngineState(engine, state.copy(position = p, message = adaptiveMessage))
+        update.exitReason?.let { closeEnginePosition(engine, it.name.replace('_', ' ')) }
     }
 
     private fun closeEnginePosition(engine: EngineId, reason: String) {
         val current = engineState(engine); val position = current.position ?: return
-        var pnl = position.pnl
-        var exitPrice = position.currentPrice
+        val q = _state.value.optionChain.firstOrNull { it.strike == position.strike && it.type == position.side.name }
+        val exitPrice = q?.let(::paperSell) ?: position.currentPrice
+        val pnl = position.realizedPartialPnl + (exitPrice - position.entryPrice) * position.quantity - AdaptiveExitEngine.PAPER_ROUND_TRIP_COST_INR
+        adaptiveExit.close(engine)
         if (engine == EngineId.ENGINE_3_V76_SCALPER) {
-            val q = _state.value.optionChain.firstOrNull { it.strike == position.strike && it.type == position.side.name }
-            exitPrice = q?.let(::paperSell) ?: position.currentPrice
-            pnl = position.realizedPartialPnl + (exitPrice - position.entryPrice) * position.quantity - V76ScalperEngine.PAPER_FIXED_COST_PER_TRADE
             val session = sessionV76(); session.pnl += pnl; session.consecutiveLosses = if (pnl < 0) session.consecutiveLosses + 1 else 0
             session.kill = session.pnl <= V76ScalperEngine.MAX_DAILY_LOSS_INR_PER_INDEX || session.consecutiveLosses >= V76ScalperEngine.MAX_CONSECUTIVE_LOSSES
             session.lastExitMillis = System.currentTimeMillis(); session.lastExitSide = position.side
@@ -658,7 +673,11 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
             realizedPnl = realized, grossProfit = old.grossProfit + pnl.coerceAtLeast(0.0), grossLoss = old.grossLoss + (-pnl).coerceAtLeast(0.0), peakEquity = peak, maxDrawdown = max(old.maxDrawdown, drawdown))
         setEngineState(engine, current.copy(position = null, performance = perf, message = "$reason · P&L ₹${"%.2f".format(pnl)}"))
         recordCloseTrade(engine, position, exitPrice, pnl, reason)
-        when (engine) { EngineId.ENGINE_1_TREND -> { engine1Execution = null; engine1LastExit = System.currentTimeMillis() }; EngineId.ENGINE_2_AVWAP_LIQUIDITY -> { engine2Execution = null; engine2LastExit = System.currentTimeMillis() }; else -> Unit }
+        when (engine) {
+            EngineId.ENGINE_1_TREND -> engine1LastExit = System.currentTimeMillis()
+            EngineId.ENGINE_2_AVWAP_LIQUIDITY -> engine2LastExit = System.currentTimeMillis()
+            else -> Unit
+        }
         updateRiskLock()
     }
 
@@ -676,7 +695,7 @@ class TradingViewModel(application: Application) : AndroidViewModel(application)
     private fun engineState(engine: EngineId) = when (engine) { EngineId.ENGINE_1_TREND -> _state.value.engine1; EngineId.ENGINE_2_AVWAP_LIQUIDITY -> _state.value.engine2; EngineId.ENGINE_3_V76_SCALPER -> _state.value.engine3 }
     private fun setEngineState(engine: EngineId, value: EngineState) { _state.value = when (engine) { EngineId.ENGINE_1_TREND -> _state.value.copy(engine1 = value); EngineId.ENGINE_2_AVWAP_LIQUIDITY -> _state.value.copy(engine2 = value); EngineId.ENGINE_3_V76_SCALPER -> _state.value.copy(engine3 = value) } }
 
-    private fun resetMarketStructure() { tickCore.reset(); V76ExecutionQualityEngine.reset(); lastSignalPublishMillis = 0L; v76Working = null; v76Bars.clear(); lastV76SignalMillis = 0L; vixLtp = 0.0 }
+    private fun resetMarketStructure() { tickCore.reset(); V76ExecutionQualityEngine.reset(); adaptiveExit.reset(); lastSignalPublishMillis = 0L; v76Working = null; v76Bars.clear(); lastV76SignalMillis = 0L; vixLtp = 0.0 }
 
     private fun buildDemoChain(spot: Double): List<OptionQuote> {
         val step = if (_state.value.index == MarketIndex.NIFTY) 50 else 100; val atm = (spot / step).toInt() * step

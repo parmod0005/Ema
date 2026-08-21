@@ -84,7 +84,7 @@ class LiveResearchArchiveStorageManager(context: Context) {
 
         sessions.forEach { session ->
             val sessionDate = runCatching { LocalDate.parse(session.name) }.getOrNull() ?: return@forEach
-            if (!sessionDate.isBefore(today)) return@forEach // Never compact an active session.
+            if (!sessionDate.isBefore(today)) return@forEach
             val compact = ensureTrainingCompact(session)
             if (compact.created) compacted++
             if (compact.valid) {
@@ -178,7 +178,7 @@ class LiveResearchArchiveStorageManager(context: Context) {
         if (records.isEmpty()) return CompactResult(false, false, 0L, false)
         val temp = File(session, LiveArchiveTrainingStore.COMPACT_FILE + ".tmp")
         if (temp.exists()) temp.delete()
-        GZIPOutputStream(BufferedOutputStream(FileOutputStream(temp), BUFFER)).bufferedWriter(Charsets.UTF_8, BUFFER).use { writer ->
+        GZIPOutputStream(BufferedOutputStream(FileOutputStream(temp), BUFFER)).bufferedWriter(Charsets.UTF_8).use { writer ->
             records.forEach { r ->
                 val features = org.json.JSONArray()
                 r.vector.forEach(features::put)
@@ -324,6 +324,7 @@ class LiveResearchArchiveStorageManager(context: Context) {
         }
         return md.digest().hex()
     }
+
     private fun ByteArray.hex(): String = joinToString("") { "%02x".format(it) }
 
     companion object {

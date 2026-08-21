@@ -3,11 +3,12 @@ package com.parmod.ema.engine
 import kotlin.math.roundToInt
 
 /**
- * Deterministic, bounded hyper-parameter evolution for VARDHANI candidate search.
+ * Deterministic, bounded hyper-parameter evolution for VARDHANI Candidate search.
  *
- * This helper never touches the Production model. It only proposes a new Candidate
- * configuration around a supplied parent configuration. Runtime promotion remains
- * separately gated by out-of-sample validation in [MetaBrainRuntime].
+ * Production is never modified here. Seed profiles remain conservative, while the
+ * wider policy bounds deliberately preserve a threshold that was calibrated and
+ * governance-approved by historical development. Live unseen validation is the next
+ * gate; it must not silently clamp a historical champion back to 60% TAKE.
  */
 object AdaptiveCandidateSearch {
     data class GeneratedCandidate(
@@ -49,9 +50,6 @@ object AdaptiveCandidateSearch {
             }
         }
 
-        // If every standard neighbour has already been tested, apply a small,
-        // deterministic generation-dependent nudge. This keeps the search moving
-        // without allowing unconstrained random drift.
         repeat(32) { attempt ->
             val step = generation.coerceAtLeast(1) + attempt
             val lrFactor = 1.0 + ((step % 9) - 4) * 0.025
@@ -71,7 +69,6 @@ object AdaptiveCandidateSearch {
             }
         }
 
-        // Extremely defensive final fallback. It is still bounded and deterministic.
         val fallback = bounded(
             safeParent.copy(
                 learningRate = safeParent.learningRate + 0.0005,
@@ -117,9 +114,9 @@ object AdaptiveCandidateSearch {
     private const val MAX_LR = 0.050
     private const val MIN_L2 = 0.00005
     private const val MAX_L2 = 0.00500
-    private const val MIN_TAKE = 0.60
-    private const val MAX_TAKE = 0.80
-    private const val MIN_REJECT = 0.25
-    private const val MAX_REJECT = 0.48
-    private const val MIN_THRESHOLD_GAP = 0.08
+    private const val MIN_TAKE = 0.25
+    private const val MAX_TAKE = 0.90
+    private const val MIN_REJECT = 0.05
+    private const val MAX_REJECT = 0.60
+    private const val MIN_THRESHOLD_GAP = 0.05
 }

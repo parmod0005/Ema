@@ -7,21 +7,12 @@ import com.parmod.ema.model.PositionSide
 import com.parmod.ema.model.SignalAction
 import com.parmod.ema.model.SignalSnapshot
 import com.parmod.ema.model.TrendDirection
+import com.parmod.ema.training.LiveResearchArchive
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.pow
 
-/**
- * Persistent VARDHANI numerical Meta Brain.
- *
- * V5 industrial training rules:
- * - NIFTY and SENSEX pending labels/validation are isolated,
- * - the dedicated research coordinator is the only live-training registrar,
- * - live labels use the actual CE/PE premium path with costs, matching historical targets,
- * - dashboard signal decoration performs inference/gating only and cannot duplicate labels,
- * - every Candidate has a frozen seed snapshot so RESET truly returns to its pre-live-learning state,
- * - Production is frozen until balanced dual-market unseen validation + manual promotion.
- */
+/** Persistent VARDHANI numerical Meta Brain. */
 object MetaBrainRuntime {
     private const val HISTORICAL_PRIOR_SAMPLES = 71L
     private const val HISTORICAL_PRIOR_BIAS = 0.2001902471
@@ -118,10 +109,11 @@ object MetaBrainRuntime {
         val candidateOrigin: String,
         val validationByMarket: Map<MarketIndex, ValidationStats> = emptyMap(),
         val pendingByMarket: Map<MarketIndex, Int> = emptyMap(),
-        val liveLabelSchema: String = "OPTION_PREMIUM_V2",
+        val liveLabelSchema: String = "OPTION_PREMIUM_V3_CAUSAL",
     )
 
     private data class Pending(
+        val id: String,
         val index: MarketIndex,
         val features: NumericalMetaBrain.Features,
         val productionPrediction: NumericalMetaBrain.Prediction,
@@ -202,15 +194,9 @@ object MetaBrainRuntime {
 
         val schema = prefs.getInt(KEY_LIVE_LABEL_SCHEMA, 1)
         if (schema < LIVE_LABEL_SCHEMA_VERSION) {
-            // Old live labels were spot-direction labels and are not directly comparable to
-            // the premium MFE/MAE corpus. Never mix validation statistics across schemas.
-            if (validation.labels > 0L) {
-                candidate.restore(production.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = activeHyper))
-                candidateOrigin = ""
-                candidateSeedState = candidate.snapshot()
-            } else if (candidateSeedState == null) {
-                candidateSeedState = candidate.snapshot()
-            }
+            // Feature/label schemas changed. Keep frozen model weights and Candidate origin,
+            // but never mix older validation statistics with the new causal premium schema.
+            if (candidateSeedState == null) candidateSeedState = candidate.snapshot()
             resetLiveValidation()
         }
         if (candidateSeedState == null) candidateSeedState = candidate.snapshot()
@@ -229,7 +215,6 @@ object MetaBrainRuntime {
         lastRegistered.keys.removeAll { it.startsWith(prefix) }
     }
 
-    /** Legacy spot observation resolves only explicit spot-fallback labels. */
     @Synchronized fun observeSpot(price: Double, timestamp: Long) = observeSpot(inferMarket(price), price, timestamp)
 
     @Synchronized
@@ -253,25 +238,18 @@ object MetaBrainRuntime {
                     failureBarrier -> false
                     else -> directional >= SPOT_TIMEOUT_SUCCESS_RETURN
                 }
-                finishLabel(p, success, if (successBarrier || failureBarrier) 1.25 else 0.75)
+                finishLabel(
+                    p, success, if (successBarrier || failureBarrier) 1.25 else 0.75,
+                    timestamp, 0.0, directional, if (successBarrier) "SPOT_TARGET" else if (failureBarrier) "SPOT_STOP" else "SPOT_TIMEOUT",
+                )
                 iterator.remove()
             }
         }
         afterLabelBatch()
     }
 
-    /**
-     * Actual live CE/PE premium label path. The first target/stop barrier hit wins,
-     * so tick data removes OHLC same-bar ambiguity. Timeout labels include slippage
-     * plus the same ₹70.80 round-trip cost model used by historical research.
-     */
     @Synchronized
-    fun observeOptionPremium(
-        index: MarketIndex,
-        instrumentKey: String,
-        premium: Double,
-        timestamp: Long,
-    ) {
+    fun observeOptionPremium(index: MarketIndex, instrumentKey: String, premium: Double, timestamp: Long) {
         if (instrumentKey.isBlank() || premium <= 0.0 || timestamp <= 0L) return
         val iterator = pending.entries.iterator()
         while (iterator.hasNext()) {
@@ -291,16 +269,36 @@ object MetaBrainRuntime {
                 }
                 val deployed = max(p.entryPremium * p.lotSize, 1.0)
                 val netReturn = exitReturn - 2.0 * SLIPPAGE_EACH_SIDE - FLAT_ROUND_TRIP_COST / deployed
-                finishLabel(p, netReturn > 0.0, if (stopHit || targetHit) 1.25 else 0.75)
+                val reason = when { stopHit -> "STOP"; targetHit -> "TARGET"; else -> "TIMEOUT" }
+                finishLabel(p, netReturn > 0.0, if (stopHit || targetHit) 1.25 else 0.75, timestamp, premium, netReturn, reason)
                 iterator.remove()
             }
         }
         afterLabelBatch()
     }
 
-    private fun finishLabel(p: Pending, success: Boolean, weight: Double) {
+    private fun finishLabel(
+        p: Pending,
+        success: Boolean,
+        weight: Double,
+        timestamp: Long,
+        exitPremium: Double,
+        netReturn: Double,
+        reason: String,
+    ) {
         scoreUnseenLabel(p.index, p.productionPrediction, p.candidatePrediction, success)
         candidate.learn(p.features, success, weight)
+        LiveResearchArchive.captureOutcome(
+            id = p.id,
+            index = p.index,
+            timestamp = timestamp,
+            success = success,
+            exitPremium = exitPremium,
+            mfeReturn = if (p.premiumMode) p.bestPremiumReturn else p.bestDirectionalReturn,
+            maeReturn = if (p.premiumMode) p.worstPremiumReturn else p.worstDirectionalReturn,
+            netReturn = netReturn,
+            exitReason = reason,
+        )
         labelsSinceSave++
     }
 
@@ -335,10 +333,6 @@ object MetaBrainRuntime {
 
     private fun predictedClass(p: Double): Boolean = p >= 0.50
 
-    /**
-     * Explicit-market inference/gate. Live training registration is OFF by default;
-     * only the dedicated dual-market research coordinator sets registerForTraining.
-     */
     @Synchronized
     fun decorate(
         index: MarketIndex,
@@ -359,6 +353,7 @@ object MetaBrainRuntime {
         totalBookPressure: Double = 0.0,
         wallPressure: Double = 0.0,
         depthLevels: Double = 0.0,
+        causalExtras: NumericalMetaBrain.CausalExtras = NumericalMetaBrain.CausalExtras(),
         registerForTraining: Boolean = false,
         trainingInstrumentKey: String? = null,
         trainingPremium: Double? = null,
@@ -391,6 +386,7 @@ object MetaBrainRuntime {
             minutesFromOpen = minutesFromOpen(timestamp),
             recentEngineWinRate = 50.0,
             recentEngineProfitFactor = 1.0,
+            causal = causalExtras,
         )
         val prodPrediction = production.predict(features)
         val candPrediction = candidate.predict(features)
@@ -402,7 +398,9 @@ object MetaBrainRuntime {
             val last = lastRegistered[dedupeKey] ?: 0L
             if (timestamp - last >= CANDIDATE_DEDUPE_MS) {
                 lastRegistered[dedupeKey] = timestamp
-                pending["$dedupeKey:$timestamp"] = Pending(
+                val id = "$dedupeKey:$timestamp"
+                pending[id] = Pending(
+                    id = id,
                     index = index,
                     features = features,
                     productionPrediction = prodPrediction,
@@ -413,6 +411,22 @@ object MetaBrainRuntime {
                     optionInstrumentKey = trainingInstrumentKey,
                     entryPremium = trainingPremium ?: 0.0,
                     lotSize = trainingLotSize,
+                )
+                LiveResearchArchive.captureObservation(
+                    id = id,
+                    index = index,
+                    engine = engine,
+                    side = side,
+                    timestamp = timestamp,
+                    instrumentKey = trainingInstrumentKey.orEmpty(),
+                    entrySpot = spot,
+                    entryPremium = trainingPremium ?: 0.0,
+                    lotSize = trainingLotSize,
+                    features = features,
+                    productionProbability = prodPrediction.probabilitySuccess,
+                    candidateProbability = candPrediction.probabilitySuccess,
+                    candidateDecision = candPrediction.decision,
+                    hyper = candidate.currentHyperParameters(),
                 )
                 trimPending(index)
             }
@@ -436,7 +450,6 @@ object MetaBrainRuntime {
         return decorated
     }
 
-    /** Legacy dashboard overload: inference/gating only; never registers training. */
     @Synchronized
     fun decorate(
         engine: EngineId,
@@ -480,18 +493,18 @@ object MetaBrainRuntime {
 
     @Synchronized
     fun installHistoricalCandidate(state: NumericalMetaBrain.ModelState, label: String): Pair<Boolean, String> {
-        if (state.weights.size != NumericalMetaBrain.FEATURE_COUNT) return false to "Historical model feature count mismatch"
+        if (state.weights.isEmpty() || state.weights.size > NumericalMetaBrain.FEATURE_COUNT) return false to "Historical model feature count mismatch"
         activeHyper = AdaptiveCandidateSearch.bounded(state.hyperParameters)
         activeAdaptive = false
         activeAdaptiveGeneration = 0
         candidateOrigin = label.trim().take(120).ifBlank { "Historical WF Champion" }
-        val installed = state.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = activeHyper)
-        candidate.restore(installed)
+        candidate.restore(state.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = activeHyper))
+        val installed = candidate.snapshot()
         candidateSeedState = installed.copy(weights = installed.weights.copyOf())
         resetLiveValidation()
         autoSearchEnabled = false
         saveLocked()
-        return true to "$candidateOrigin installed as frozen Candidate seed · collect fresh cost-aware CE/PE labels from NIFTY + SENSEX"
+        return true to "$candidateOrigin installed as frozen Candidate seed · collect fresh causal CE/PE labels from NIFTY + SENSEX"
     }
 
     @Synchronized
@@ -508,7 +521,7 @@ object MetaBrainRuntime {
             lastSavedAt, lastPromotedAt, rollbackState != null,
             candidateHistory.sortedByDescending { it.score }.take(MAX_HISTORY), candidateName(),
             activeAdaptive, activeAdaptiveGeneration, robustParent()?.score, candidateOrigin,
-            byMarket, pendingCounts, "OPTION_PREMIUM_V2",
+            byMarket, pendingCounts, "OPTION_PREMIUM_V3_CAUSAL",
         )
     }
 
@@ -767,7 +780,7 @@ object MetaBrainRuntime {
             val p = raw.split("|")
             if (p.size >= 9) {
                 val weights = p[8].split(',').map(String::toDouble).toDoubleArray()
-                if (weights.size != NumericalMetaBrain.FEATURE_COUNT) return null
+                if (weights.isEmpty() || weights.size > NumericalMetaBrain.FEATURE_COUNT) return null
                 NumericalMetaBrain.ModelState(
                     weights, p[0].toDouble(), p[1].toLong(), p[2].toLong(), NumericalMetaBrain.Mode.valueOf(p[3]),
                     NumericalMetaBrain.HyperParameters(p[4].toDouble(), p[5].toDouble(), p[6].toDouble(), p[7].toDouble()),
@@ -775,7 +788,7 @@ object MetaBrainRuntime {
             } else {
                 val old = raw.split("|", limit = 5)
                 val weights = old[4].split(',').map(String::toDouble).toDoubleArray()
-                if (weights.size != NumericalMetaBrain.FEATURE_COUNT) return null
+                if (weights.isEmpty() || weights.size > NumericalMetaBrain.FEATURE_COUNT) return null
                 NumericalMetaBrain.ModelState(weights, old[0].toDouble(), old[1].toLong(), old[2].toLong(), NumericalMetaBrain.Mode.valueOf(old[3]))
             }
         }.getOrNull()
@@ -846,7 +859,7 @@ object MetaBrainRuntime {
     private const val KEY_LAST_SAVE = "last_save"
     private const val KEY_LAST_PROMOTE = "last_promote"
     private const val KEY_LIVE_LABEL_SCHEMA = "live_label_schema"
-    private const val LIVE_LABEL_SCHEMA_VERSION = 2
+    private const val LIVE_LABEL_SCHEMA_VERSION = 3
     private const val SENSEX_SPOT_CUTOFF = 50_000.0
     private const val CANDIDATE_CONFIDENCE = 70
     private const val CANDIDATE_DEDUPE_MS = 60_000L

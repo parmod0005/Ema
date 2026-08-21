@@ -7,6 +7,7 @@ import java.time.LocalDate
 enum class HistoricalCorpusSource(val label: String) {
     UPSTOX("UPSTOX"),
     LOCAL("LOCAL"),
+    LIVE_ARCHIVE("LIVE ARCHIVE"),
     COMBINED("COMBINED"),
 }
 
@@ -33,8 +34,7 @@ data class HistoricalOptionSeries(
     val source: String,
     val candles: List<UpstoxPlusHistoricalClient.Candle>,
 ) {
-    val key: String
-        get() = "${index.name}|${expiry}|${strike}|${optionType.uppercase()}"
+    val key: String get() = "${index.name}|${expiry}|${strike}|${optionType.uppercase()}"
 }
 
 data class LocalCorpusSummary(

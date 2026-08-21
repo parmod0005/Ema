@@ -14,7 +14,12 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 
-/** Joint NIFTY+SENSEX trainer for `aiml-historical-option-row-v1` mixed corpora. */
+/**
+ * Joint NIFTY+SENSEX trainer for `aiml-historical-option-row-v1` mixed corpora.
+ * TRAIN fits model weights, early VALIDATION calibrates one shared cost-aware policy,
+ * later VALIDATION scores robustness/governance, and TEST remains locked until both
+ * markets qualify. The same calibrated thresholds must be viable on NIFTY + SENSEX.
+ */
 class JointPrelabelledHistoricalTrainer(
     private val store: AimlHistoricalOptionCorpusV1Store,
     private val productionBaseline: NumericalMetaBrain.ModelState,
@@ -89,6 +94,23 @@ class JointPrelabelledHistoricalTrainer(
         val corpusSamples = corpusSamples(meta)
         val trainStride = ceil(trainRows.toDouble() / MAX_SEARCH_TRAIN_ROWS).toInt().coerceAtLeast(1)
         val validationStride = ceil(validationRows.toDouble() / MAX_SEARCH_VALIDATION_ROWS).toInt().coerceAtLeast(1)
+
+        var sampledValidationRows = 0L
+        val sampledByMarket = MarketIndex.entries.associateWith { 0L }.toMutableMap()
+        store.forEach(AimlHistoricalOptionCorpusV1Store.Split.VALIDATION, stride = validationStride, shouldCancel = shouldCancel) { r ->
+            sampledValidationRows++
+            sampledByMarket[r.index] = (sampledByMarket[r.index] ?: 0L) + 1L
+        }
+        if (sampledValidationRows < MIN_VALIDATION_ROWS || MarketIndex.entries.any { (sampledByMarket[it] ?: 0L) < MIN_MARKET_VALIDATION_ROWS }) {
+            return result(
+                meta, monthsLabel, 0, null, false, false, null, null, null,
+                "BOTH pre-labelled validation insufficient · total $sampledValidationRows · NIFTY ${sampledByMarket[MarketIndex.NIFTY]} · SENSEX ${sampledByMarket[MarketIndex.SENSEX]} · TEST never opened.",
+            )
+        }
+        val calibrationRows = max(MIN_CALIBRATION_ROWS, (sampledValidationRows * CALIBRATION_FRACTION).toLong())
+            .coerceAtMost(sampledValidationRows - MIN_SCORING_ROWS)
+        val scoringRows = sampledValidationRows - calibrationRows
+
         val seeds = candidateHyperParameters()
         val seen = seeds.mapTo(linkedSetOf()) { HistoricalAdaptiveCandidateSearch.signature(it) }
         val evaluations = ArrayList<JointEvaluation>()
@@ -96,14 +118,35 @@ class JointPrelabelledHistoricalTrainer(
         fun batch(hypers: List<NumericalMetaBrain.HyperParameters>, generation: Int, guidance: HistoricalAdaptiveCandidateSearch.Guidance?) {
             val brains = hypers.map(::brainFromBaseline)
             var trained = 0L
-            onProgress(HistoricalCorpusTrainer.Progress(if (generation == 0) "JOINT_PRELABELLED_SEED_TRAIN" else "JOINT_PRELABELLED_G${generation}_TRAIN", 0, hypers.size, "BOTH · training ${hypers.size} candidates on original TRAIN · stride $trainStride"))
+            onProgress(
+                HistoricalCorpusTrainer.Progress(
+                    if (generation == 0) "JOINT_PRELABELLED_SEED_TRAIN" else "JOINT_PRELABELLED_G${generation}_TRAIN",
+                    0,
+                    hypers.size,
+                    "BOTH · fitting ${hypers.size} models on original TRAIN · stride $trainStride",
+                ),
+            )
             store.forEach(AimlHistoricalOptionCorpusV1Store.Split.TRAIN, stride = trainStride, shouldCancel = shouldCancel) { r ->
                 val s = sample(r)
                 brains.forEach { it.learn(s.features, s.success, s.weight) }
                 trained++
-                if (trained % 25_000L == 0L) onProgress(HistoricalCorpusTrainer.Progress("JOINT_PRELABELLED_TRAIN", (trained / 25_000L).toInt(), max(1, (MAX_SEARCH_TRAIN_ROWS / 25_000L).toInt()), "BOTH G$generation · $trained sampled TRAIN rows"))
+                if (trained % 25_000L == 0L) {
+                    onProgress(
+                        HistoricalCorpusTrainer.Progress(
+                            "JOINT_PRELABELLED_TRAIN",
+                            (trained / 25_000L).toInt(),
+                            max(1, (MAX_SEARCH_TRAIN_ROWS / 25_000L).toInt()),
+                            "BOTH G$generation · $trained sampled TRAIN rows",
+                        ),
+                    )
+                }
             }
 
+            val overallCalibration = Array(hypers.size) { BinaryTrainingPolicy.StreamingCalibration() }
+            val marketCalibration = Array(hypers.size) {
+                MarketIndex.entries.associateWith { BinaryTrainingPolicy.StreamingCalibration() }.toMutableMap()
+            }
+            val calibrated = arrayOfNulls<BinaryTrainingPolicy.CalibrationResult>(hypers.size)
             val prod = brainFromBaseline(productionBaseline.hyperParameters)
             val candidateAcc = Array(hypers.size) { Acc() }
             val candidateMarket = Array(hypers.size) { MarketIndex.entries.associateWith { Acc() }.toMutableMap() }
@@ -112,14 +155,58 @@ class JointPrelabelledHistoricalTrainer(
             val foldCandidate = Array(hypers.size) { Array(FOLDS) { Acc() } }
             val foldProd = Array(FOLDS) { Acc() }
             var used = 0L
-            val target = max(1L, min(validationRows, MAX_SEARCH_VALIDATION_ROWS))
-            onProgress(HistoricalCorpusTrainer.Progress(if (generation == 0) "JOINT_PRELABELLED_SEED_VALIDATION" else "JOINT_PRELABELLED_G${generation}_VALIDATION", 0, FOLDS, "BOTH ${guidance?.name ?: "SEED"} · scoring original VALIDATION · TEST locked"))
+            var scoringUsed = 0L
+            var policyApplied = false
+
+            onProgress(
+                HistoricalCorpusTrainer.Progress(
+                    if (generation == 0) "JOINT_PRELABELLED_SEED_CALIBRATION" else "JOINT_PRELABELLED_G${generation}_CALIBRATION",
+                    0,
+                    FOLDS,
+                    "BOTH · early VALIDATION calibrates one policy viable overall + NIFTY + SENSEX · later VALIDATION scores it · TEST locked",
+                ),
+            )
             store.forEach(AimlHistoricalOptionCorpusV1Store.Split.VALIDATION, stride = validationStride, shouldCancel = shouldCancel) { r ->
                 val s = sample(r)
+                if (used < calibrationRows) {
+                    brains.forEachIndexed { i, brain ->
+                        val p = brain.predict(s.features)
+                        overallCalibration[i].add(p.probabilitySuccess, s.success, s.net)
+                        marketCalibration[i].getValue(s.index).add(p.probabilitySuccess, s.success, s.net)
+                    }
+                    used++
+                    return@forEach
+                }
+
+                if (!policyApplied) {
+                    brains.forEachIndexed { i, brain ->
+                        val current = brain.currentHyperParameters()
+                        val result = BinaryTrainingPolicy.calibrateJoint(
+                            overall = overallCalibration[i],
+                            segments = marketCalibration[i].values,
+                            fallback = current,
+                        )
+                        calibrated[i] = result
+                        brain.configure(
+                            current.copy(takeThreshold = result.takeThreshold, rejectThreshold = result.rejectThreshold),
+                            bumpVersion = false,
+                        )
+                    }
+                    policyApplied = true
+                    onProgress(
+                        HistoricalCorpusTrainer.Progress(
+                            "JOINT_PRELABELLED_POLICY_FIXED",
+                            1,
+                            1,
+                            "BOTH shared policy fixed from early VALIDATION before scoring · later VALIDATION/TEST cannot tune it",
+                        ),
+                    )
+                }
+
                 val pp = prod.predict(s.features)
                 prodAcc.add(pp, s)
                 prodMarket.getValue(s.index).add(pp, s)
-                val fold = ((used * FOLDS) / target).toInt().coerceIn(0, FOLDS - 1)
+                val fold = ((scoringUsed * FOLDS) / max(1L, scoringRows)).toInt().coerceIn(0, FOLDS - 1)
                 foldProd[fold].add(pp, s)
                 brains.forEachIndexed { i, brain ->
                     val cp = brain.predict(s.features)
@@ -127,8 +214,19 @@ class JointPrelabelledHistoricalTrainer(
                     candidateMarket[i].getValue(s.index).add(cp, s)
                     foldCandidate[i][fold].add(cp, s)
                 }
+                scoringUsed++
                 used++
             }
+
+            if (!policyApplied) {
+                brains.forEachIndexed { i, brain ->
+                    val current = brain.currentHyperParameters()
+                    val result = BinaryTrainingPolicy.calibrateJoint(overallCalibration[i], marketCalibration[i].values, current)
+                    calibrated[i] = result
+                    brain.configure(current.copy(takeThreshold = result.takeThreshold, rejectThreshold = result.rejectThreshold), bumpVersion = false)
+                }
+            }
+
             val prodMetrics = prodAcc.metrics()
             val prodBy = prodMarket.mapValues { it.value.metrics() }
             hypers.indices.forEach { i ->
@@ -143,10 +241,22 @@ class JointPrelabelledHistoricalTrainer(
                         if (score(c, p) > 0.0) foldsWon++
                     }
                 }
-                val s = score(cm, prodMetrics) + 0.08 * ((if (foldsRun == 0) 0.0 else foldsWon.toDouble() / foldsRun) - 0.50)
+                val policy = calibrated[i]
+                val aggregateScore = score(cm, prodMetrics) +
+                    0.08 * ((if (foldsRun == 0) 0.0 else foldsWon.toDouble() / foldsRun) - 0.50) +
+                    0.10 * (policy?.score ?: 0.0)
+                val calibratedHyper = if (policy == null) hypers[i] else hypers[i].copy(
+                    takeThreshold = policy.takeThreshold,
+                    rejectThreshold = policy.rejectThreshold,
+                )
                 val summary = HistoricalCorpusTrainer.CandidateEvaluation(
-                    hypers[i], foldsRun, foldsWon, cm, prodMetrics, s,
-                    foldsRun >= 3 && foldsWon >= ceil(foldsRun * 0.75).toInt() && s > 0.0,
+                    HistoricalAdaptiveCandidateSearch.bounded(calibratedHyper),
+                    foldsRun,
+                    foldsWon,
+                    cm,
+                    prodMetrics,
+                    aggregateScore,
+                    foldsRun >= 3 && foldsWon >= ceil(foldsRun * 0.75).toInt() && aggregateScore > 0.0,
                 )
                 val cBy = candidateMarket[i].mapValues { it.value.metrics() }
                 val governance = DualMarketHistoricalGovernance.evaluateDevelopment(cm, prodMetrics, cBy, prodBy, coverage, corpusSamples)
@@ -162,24 +272,57 @@ class JointPrelabelledHistoricalTrainer(
             generation++
             val guidance = HistoricalAdaptiveCandidateSearch.guidance(parent.summary)
             val next = HistoricalAdaptiveCandidateSearch.nextBatch(parent.summary.hyperParameters, generation, seen, guidance)
-            onProgress(HistoricalCorpusTrainer.Progress("JOINT_PRELABELLED_EVOLVE", generation, HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS, "BOTH G$generation ${guidance.name} · TEST remains locked"))
+            onProgress(
+                HistoricalCorpusTrainer.Progress(
+                    "JOINT_PRELABELLED_EVOLVE",
+                    generation,
+                    HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
+                    "BOTH G$generation ${guidance.name} · model evolves; policy is recalibrated on early VALIDATION · TEST remains locked",
+                ),
+            )
             batch(next.candidates, generation, guidance)
             best = selectBest(evaluations)
         }
 
         if (best == null || !best.summary.robust || !best.governance.passed) {
-            return result(meta, monthsLabel, evaluations.size, best?.summary, false, false, null, null, null,
-                "BOTH pre-labelled adaptive search exhausted G$generation · ${best?.governance?.label ?: "CLOSED"}: ${best?.governance?.reasons?.joinToString("; ") ?: "no candidate"} · original TEST never opened.")
+            return result(
+                meta,
+                monthsLabel,
+                evaluations.size,
+                best?.summary,
+                false,
+                false,
+                null,
+                null,
+                null,
+                "BOTH pre-labelled model + policy search exhausted G$generation · ${best?.governance?.label ?: "CLOSED"}: ${best?.governance?.reasons?.joinToString("; ") ?: "no candidate"} · TRAIN fit + early VALIDATION calibration + later VALIDATION scoring · original TEST never opened.",
+            )
         }
 
         val champion = brainFromBaseline(best.summary.hyperParameters)
         var fullTrain = 0L
-        onProgress(HistoricalCorpusTrainer.Progress("JOINT_PRELABELLED_REFIT", 0, 1, "BOTH development-qualified · refitting on full original TRAIN $trainRows rows"))
+        onProgress(
+            HistoricalCorpusTrainer.Progress(
+                "JOINT_PRELABELLED_REFIT",
+                0,
+                1,
+                "BOTH development-qualified · refitting weights on full original TRAIN · calibrated shared policy frozen",
+            ),
+        )
         store.forEach(AimlHistoricalOptionCorpusV1Store.Split.TRAIN, shouldCancel = shouldCancel) { r ->
             val s = sample(r)
             champion.learn(s.features, s.success, s.weight)
             fullTrain++
-            if (fullTrain % 100_000L == 0L) onProgress(HistoricalCorpusTrainer.Progress("JOINT_PRELABELLED_REFIT", fullTrain.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), trainRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), "BOTH full TRAIN · $fullTrain/$trainRows"))
+            if (fullTrain % 100_000L == 0L) {
+                onProgress(
+                    HistoricalCorpusTrainer.Progress(
+                        "JOINT_PRELABELLED_REFIT",
+                        fullTrain.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        trainRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        "BOTH full TRAIN · $fullTrain/$trainRows · policy fixed ${"%.1f".format(best.summary.hyperParameters.takeThreshold * 100)}%/${"%.1f".format(best.summary.hyperParameters.rejectThreshold * 100)}%",
+                    ),
+                )
+            }
         }
 
         val prod = brainFromBaseline(productionBaseline.hyperParameters)
@@ -188,7 +331,7 @@ class JointPrelabelledHistoricalTrainer(
         val cMarket = MarketIndex.entries.associateWith { Acc() }.toMutableMap()
         val pMarket = MarketIndex.entries.associateWith { Acc() }.toMutableMap()
         var testUsed = 0L
-        onProgress(HistoricalCorpusTrainer.Progress("JOINT_PRELABELLED_LOCKED_TEST", 0, 1, "BOTH qualified · opening original TEST ONCE"))
+        onProgress(HistoricalCorpusTrainer.Progress("JOINT_PRELABELLED_LOCKED_TEST", 0, 1, "BOTH model + shared policy qualified · opening original TEST ONCE"))
         store.forEach(AimlHistoricalOptionCorpusV1Store.Split.TEST, shouldCancel = shouldCancel) { r ->
             val s = sample(r)
             val cp = champion.predict(s.features)
@@ -198,7 +341,16 @@ class JointPrelabelledHistoricalTrainer(
             cMarket.getValue(s.index).add(cp, s)
             pMarket.getValue(s.index).add(pp, s)
             testUsed++
-            if (testUsed % 100_000L == 0L) onProgress(HistoricalCorpusTrainer.Progress("JOINT_PRELABELLED_LOCKED_TEST", testUsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), testRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), "BOTH locked TEST · $testUsed/$testRows"))
+            if (testUsed % 100_000L == 0L) {
+                onProgress(
+                    HistoricalCorpusTrainer.Progress(
+                        "JOINT_PRELABELLED_LOCKED_TEST",
+                        testUsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        testRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        "BOTH locked TEST · $testUsed/$testRows",
+                    ),
+                )
+            }
         }
         val cm = cAcc.metrics()
         val pm = pAcc.metrics()
@@ -206,7 +358,7 @@ class JointPrelabelledHistoricalTrainer(
         val pBy = pMarket.mapValues { it.value.metrics() }
         val governance = DualMarketHistoricalGovernance.evaluateHoldout(cm, pm, cBy, pBy, coverage, corpusSamples)
         val state = if (governance.passed) champion.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW) else null
-        val note = "aiml-historical-option-row-v1 · BOTH NIFTY+SENSEX · original TRAIN/VALIDATION/TEST preserved · ${seeds.size} seeds + ${evaluations.size - seeds.size} evolved across G$generation · TEST opened once · governance ${governance.label}: ${governance.reasons.joinToString("; ")} · NIFTY test ${cBy[MarketIndex.NIFTY]?.labels ?: 0} · SENSEX test ${cBy[MarketIndex.SENSEX]?.labels ?: 0}."
+        val note = "aiml-historical-option-row-v1 · BOTH NIFTY+SENSEX · TRAIN fits weights · early VALIDATION calibrates one shared cost-aware policy viable on both markets · later VALIDATION scores governance · ${seeds.size} seeds + ${evaluations.size - seeds.size} evolved across G$generation · original TEST opened once · governance ${governance.label}: ${governance.reasons.joinToString("; ")} · NIFTY test ${cBy[MarketIndex.NIFTY]?.labels ?: 0} · SENSEX test ${cBy[MarketIndex.SENSEX]?.labels ?: 0}."
         return result(meta, monthsLabel, evaluations.size, best.summary, true, governance.passed, cm, pm, state, note)
     }
 
@@ -252,6 +404,7 @@ class JointPrelabelledHistoricalTrainer(
     }
 
     private fun selectBest(evals: List<JointEvaluation>): JointEvaluation? {
+        if (evals.isEmpty()) return null
         val passed = evals.filter { it.summary.robust && it.governance.passed }
         return (passed.ifEmpty { evals }).maxByOrNull { e ->
             var value = HistoricalAdaptiveCandidateSearch.developmentSelectionScore(e.summary)
@@ -340,6 +493,11 @@ class JointPrelabelledHistoricalTrainer(
         private const val MAX_SEARCH_TRAIN_ROWS = 300_000L
         private const val MAX_SEARCH_VALIDATION_ROWS = 200_000L
         private const val FOLDS = 4
+        private const val CALIBRATION_FRACTION = 0.35
+        private const val MIN_CALIBRATION_ROWS = 80L
+        private const val MIN_SCORING_ROWS = 120L
+        private const val MIN_VALIDATION_ROWS = MIN_CALIBRATION_ROWS + MIN_SCORING_ROWS
+        private const val MIN_MARKET_VALIDATION_ROWS = 60L
         private val IST: ZoneOffset = ZoneOffset.ofHoursMinutes(5, 30)
     }
 }

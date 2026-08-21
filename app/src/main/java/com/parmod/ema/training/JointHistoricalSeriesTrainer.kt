@@ -160,9 +160,30 @@ class JointHistoricalSeriesTrainer(
             )
         }
 
+        val embargoMs = TrainingLeakageGuard.embargoMillis(config.interval, config.labelConfig.horizonBars)
         val developmentEnd = (corpus.size * config.developmentFraction).toInt().coerceIn(config.walkForwardFolds + 2, corpus.size - 1)
-        val development = corpus.subList(0, developmentEnd)
+        val rawDevelopment = corpus.subList(0, developmentEnd)
         val holdout = corpus.subList(developmentEnd, corpus.size)
+        val development = TrainingLeakageGuard.purgeBeforeBoundary(
+            rows = rawDevelopment,
+            boundaryTimestamp = holdout.first().timestamp,
+            embargoMillis = embargoMs,
+            timestamp = { it.timestamp },
+        )
+        val devMarketMissing = MarketIndex.entries.firstOrNull { m -> development.none { it.index == m } }
+        val holdoutMarketMissing = MarketIndex.entries.firstOrNull { m -> holdout.none { it.index == m } }
+        if (development.size < config.walkForwardFolds + 2 || devMarketMissing != null || holdoutMarketMissing != null) {
+            val reason = when {
+                devMarketMissing != null -> "${devMarketMissing.name} missing from embargoed development"
+                holdoutMarketMissing != null -> "${holdoutMarketMissing.name} missing from locked holdout"
+                else -> "Leakage embargo left insufficient development evidence"
+            }
+            return result(
+                config, from, to, expiryCount, selected.size, corpus, coverage, 0, null,
+                false, false, null, null, null, errors + reason,
+                "$sourceLabel · BOTH fail-closed leakage validation blocked training; Production unchanged.",
+            )
+        }
         val seedHypers = candidateHyperParameters()
         val evaluations = ArrayList<JointEvaluation>()
         val seen = seedHypers.mapTo(linkedSetOf()) { HistoricalAdaptiveCandidateSearch.signature(it) }
@@ -175,10 +196,10 @@ class JointHistoricalSeriesTrainer(
                         if (generation == 0) "JOINT_WALK_FORWARD" else "JOINT_ADAPT_G$generation",
                         i,
                         hypers.size,
-                        if (generation == 0) "$sourceLabel BOTH · seed ${i + 1}/${hypers.size} · nested policy calibration" else "$sourceLabel BOTH · G$generation ${guidance?.name ?: "BALANCED"} · ${i + 1}/${hypers.size} · holdout untouched",
+                        if (generation == 0) "$sourceLabel BOTH · seed ${i + 1}/${hypers.size} · purged dual-market policy calibration" else "$sourceLabel BOTH · G$generation ${guidance?.name ?: "BALANCED"} · ${i + 1}/${hypers.size} · holdout untouched",
                     ),
                 )
-                evaluations += evaluateWalkForward(development, hyper, config.walkForwardFolds, coverage, corpus.size)
+                evaluations += evaluateWalkForward(development, hyper, config.walkForwardFolds, coverage, corpus.size, embargoMs)
             }
         }
 
@@ -203,7 +224,7 @@ class JointHistoricalSeriesTrainer(
                     "JOINT_EVOLVE",
                     adaptiveGenerations,
                     HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
-                    "BOTH G$adaptiveGenerations ${guidance.name} · model evolves; shared policy recalibrates on both markets inside development · holdout untouched",
+                    "BOTH G$adaptiveGenerations ${guidance.name} · model evolves; shared policy recalibrates on both markets inside purged development · holdout untouched",
                 ),
             )
             evalBatch(batch.candidates, adaptiveGenerations, guidance)
@@ -214,11 +235,11 @@ class JointHistoricalSeriesTrainer(
             return result(
                 config, from, to, expiryCount, selected.size, corpus, coverage, evaluations.size, best?.summary,
                 false, false, null, null, null, errors,
-                "$sourceLabel · BOTH joint model + policy search exhausted G$adaptiveGenerations · ${best?.governance?.label ?: "CLOSED"}: ${best?.governance?.reasons?.joinToString("; ") ?: "no candidate"} · locked holdout never opened.",
+                "$sourceLabel · BOTH joint model + policy search exhausted G$adaptiveGenerations · ${best?.governance?.label ?: "CLOSED"}: ${best?.governance?.reasons?.joinToString("; ") ?: "no candidate"} · leakage guard active · locked holdout never opened.",
             )
         }
 
-        onProgress(HistoricalCorpusTrainer.Progress("JOINT_LOCKED_HOLDOUT", 0, 1, "BOTH model + shared policy development-qualified after G$adaptiveGenerations · opening locked holdout ONCE"))
+        onProgress(HistoricalCorpusTrainer.Progress("JOINT_LOCKED_HOLDOUT", 0, 1, "BOTH model + shared policy development-qualified after G$adaptiveGenerations · opening embargoed locked holdout ONCE"))
         val champion = brainFromBaseline(best.summary.hyperParameters)
         learn(champion, development)
         val production = brainFromBaseline(productionBaseline.hyperParameters)
@@ -241,7 +262,7 @@ class JointHistoricalSeriesTrainer(
         val note = buildString {
             append("$sourceLabel · BOTH NIFTY+SENSEX joint chronological corpus · ")
             append("${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved across G$adaptiveGenerations · ")
-            append("each development fold: fit → dual-market policy calibration → forward score · locked holdout opened once · ")
+            append("every TRAIN/calibration/scoring/holdout boundary purged by ${embargoMs / 60_000L}m · locked holdout opened once · ")
             append("dual-market governance ${governance.label}: ${governance.reasons.joinToString("; ")} · ")
             append("NIFTY holdout labels ${candidateBy[MarketIndex.NIFTY]?.labels ?: 0} · SENSEX ${candidateBy[MarketIndex.SENSEX]?.labels ?: 0} · ")
             append("actual option-premium MFE/MAE · next-bar entry · historical D30 unavailable stays zero.")
@@ -326,6 +347,7 @@ class JointHistoricalSeriesTrainer(
         requestedFolds: Int,
         coverage: HistoricalCorpusTrainer.Coverage,
         corpusSamples: Int,
+        embargoMs: Long,
     ): JointEvaluation {
         val blocks = requestedFolds + 1
         val candidateTotal = Acc()
@@ -342,15 +364,27 @@ class JointHistoricalSeriesTrainer(
             val trainEnd = development.size * fold / blocks
             val validateEnd = if (fold == requestedFolds) development.size else development.size * (fold + 1) / blocks
             if (trainEnd < 20 || validateEnd <= trainEnd) continue
-            val train = development.subList(0, trainEnd)
+            val rawTrain = development.subList(0, trainEnd)
             val validation = development.subList(trainEnd, validateEnd)
             if (validation.size < MIN_FOLD_VALIDATION) continue
+            val train = TrainingLeakageGuard.purgeBeforeBoundary(rawTrain, validation.first().timestamp, embargoMs) { it.timestamp }
+            if (train.size < 20) continue
             val calibrationSize = max(MIN_FOLD_CALIBRATION, (validation.size * CALIBRATION_FRACTION).toInt())
                 .coerceAtMost(validation.size - MIN_FOLD_SCORING)
             if (calibrationSize <= 0 || validation.size - calibrationSize < MIN_FOLD_SCORING) continue
-            val calibrationSlice = validation.subList(0, calibrationSize)
+            val rawCalibration = validation.subList(0, calibrationSize)
             val scoringSlice = validation.subList(calibrationSize, validation.size)
+            val calibrationSlice = TrainingLeakageGuard.purgeBeforeBoundary(rawCalibration, scoringSlice.first().timestamp, embargoMs) { it.timestamp }
+            if (calibrationSlice.size < MIN_FOLD_CALIBRATION) continue
             if (MarketIndex.entries.any { market -> calibrationSlice.count { it.index == market } < MIN_MARKET_CALIBRATION }) continue
+            val leakage = TrainingLeakageGuard.validateOrderedSlices(
+                train = train,
+                calibration = calibrationSlice,
+                scoring = scoringSlice,
+                embargoMillis = embargoMs,
+                timestamp = { it.timestamp },
+            )
+            if (!leakage.passed) continue
 
             val candidate = brainFromBaseline(hyper)
             learn(candidate, train)

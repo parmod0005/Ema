@@ -150,14 +150,15 @@ class AdaptiveExitEngine {
         val currentGainPct = (currentPrice - entryPrice) / entryPrice * 100.0
         val atr = premiumAtr(tracker)
         val atrPct = if (atr > 0.0) atr / entryPrice * 100.0 else 0.0
+        val atrReady = tracker.bars.size >= MIN_ATR_BARS
         val fallbackStopPct = p.baselineStopPct
-        val atrStopPct = if (atrPct > 0.0) (atrPct * p.atrStopMultiple).coerceIn(p.minStopPct, p.maxStopPct) else fallbackStopPct
+        val atrStopPct = if (atrReady && atrPct > 0.0) (atrPct * p.atrStopMultiple).coerceIn(p.minStopPct, p.maxStopPct) else fallbackStopPct
         val hardFloor = entryPrice * (1.0 - p.maxStopPct / 100.0)
         val initialAdaptive = entryPrice * (1.0 - atrStopPct / 100.0)
         var stop = max(currentStopPrice, max(hardFloor, initialAdaptive))
 
         val recentStructure = recentSwingLow(tracker)
-        if (recentStructure > 0.0 && atr > 0.0) {
+        if (atrReady && recentStructure > 0.0 && atr > 0.0) {
             val structureStop = recentStructure - atr * 0.18
             // Structure is allowed to tighten risk only after price has made progress.
             if (peakPct >= 3.0) stop = max(stop, structureStop)
@@ -236,7 +237,7 @@ class AdaptiveExitEngine {
 
         val diag = buildString {
             append("ATR ")
-            append("%.1f%%".format(atrPct))
+            append(if (atrReady) "%.1f%%".format(atrPct) else "WARM")
             append(" · D30 ")
             append("%.2f".format(d30))
             append(" · ")
@@ -319,7 +320,7 @@ class AdaptiveExitEngine {
 
     private fun premiumAtr(t: Tracker): Double {
         val bars = t.bars.toList().takeLast(14)
-        if (bars.size >= 3) {
+        if (bars.size >= MIN_ATR_BARS) {
             var previousClose = bars.first().close
             val trs = mutableListOf<Double>()
             bars.forEachIndexed { i, b ->
@@ -329,8 +330,7 @@ class AdaptiveExitEngine {
             }
             if (trs.isNotEmpty()) return trs.average()
         }
-        // Tick-volatility fallback during the first few minutes. It intentionally has a
-        // floor so startup noise cannot tighten the catastrophic stop immediately.
+        // Tick-volatility fallback is used for profit trailing only during warm-up.
         return max(t.entryPrice * t.ewmaAbsReturn * 4.0, t.entryPrice * 0.015)
     }
 
@@ -391,5 +391,6 @@ class AdaptiveExitEngine {
         const val TARGET1_PARTIAL_FRACTION = 0.50
         const val FORCE_EXIT_MINUTE = 15 * 60 + 15
         private const val MAX_BARS = 30
+        private const val MIN_ATR_BARS = 3
     }
 }

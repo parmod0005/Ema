@@ -30,12 +30,19 @@ object CausalFeatureEngineering {
 
     class PrelabelledState {
         private val histories = HashMap<String, ArrayDeque<Point>>()
+        private val lastTimestamp = HashMap<String, Long>()
 
         fun observe(r: AimlHistoricalOptionCorpusV1Store.Record): NumericalMetaBrain.CausalExtras {
             val date = java.time.Instant.ofEpochMilli(r.timestampMs)
                 .atOffset(java.time.ZoneOffset.ofHoursMinutes(5, 30)).toLocalDate()
             val expiry = LocalDate.ofEpochDay(r.expiryEpochDay.toLong())
             val key = "${r.index.name}|${r.expiryEpochDay}|${r.strike}|${r.optionType}"
+            // A new training generation rewinds the same split. Reset only that contract
+            // when time moves backwards; a forward TRAIN→VALIDATION→TEST pass may safely
+            // retain past market state because those bars existed before the prediction.
+            val last = lastTimestamp[key]
+            if (last != null && r.timestampMs <= last) histories.remove(key)
+            lastTimestamp[key] = r.timestampMs
             val q = histories.getOrPut(key) { ArrayDeque() }
             q.addLast(
                 Point(
@@ -47,7 +54,20 @@ object CausalFeatureEngineering {
             while (q.size > MAX_HISTORY) q.removeFirst()
             return fromPoints(q.toList())
         }
+
+        fun clear() {
+            histories.clear()
+            lastTimestamp.clear()
+        }
     }
+
+    private val streamedState = ThreadLocal.withInitial { PrelabelledState() }
+
+    /** Convenience for synchronous streaming trainers. Auto-resets on split rewind. */
+    fun prelabelled(r: AimlHistoricalOptionCorpusV1Store.Record): NumericalMetaBrain.CausalExtras =
+        streamedState.get().observe(r)
+
+    fun resetStreamedState() = streamedState.get().clear()
 
     fun fromCandles(
         candles: List<UpstoxPlusHistoricalClient.Candle>,
@@ -112,7 +132,6 @@ object CausalFeatureEngineering {
         val p = points.last()
         val closes = points.map { it.close }
         val spots = points.map { it.spot }
-        val ranges = points.map { max(it.high - it.low, 0.0) }
         val returns = closes.zipWithNext { a, b -> if (a > 0.0) (b - a) / a else 0.0 }
         val ema9 = ema(closes, 9)
         val ema21 = ema(closes, 21)
@@ -190,8 +209,9 @@ object CausalFeatureEngineering {
     private fun rsi(values: List<Double>, period: Int): Double {
         if (values.size < 2) return 50.0
         val changes = values.zipWithNext { a, b -> b - a }.takeLast(period)
-        val gain = changes.filter { it > 0.0 }.sum() / max(changes.size, 1)
-        val loss = -changes.filter { it < 0.0 }.sum() / max(changes.size, 1)
+        val divisor = max(changes.size, 1)
+        val gain = changes.filter { it > 0.0 }.sum() / divisor
+        val loss = -changes.filter { it < 0.0 }.sum() / divisor
         if (loss <= 1e-12) return if (gain > 0.0) 100.0 else 50.0
         val rs = gain / loss
         return 100.0 - 100.0 / (1.0 + rs)
@@ -217,7 +237,6 @@ object CausalFeatureEngineering {
         }
     }
 
-    /** returns z-position and relative full 4-sigma width. */
     private fun bollinger(values: List<Double>, period: Int): Pair<Double, Double> {
         val w = values.takeLast(period)
         if (w.isEmpty()) return 0.0 to 0.0

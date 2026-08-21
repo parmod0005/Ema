@@ -31,18 +31,41 @@ object CausalFeatureEngineering {
     class PrelabelledState {
         private val histories = HashMap<String, ArrayDeque<Point>>()
         private val lastTimestamp = HashMap<String, Long>()
+        private val expiryByKey = HashMap<String, Int>()
+        private var lastGlobalTimestamp = Long.MIN_VALUE
+        private var lastCleanupEpochDay = Long.MIN_VALUE
 
         fun observe(r: AimlHistoricalOptionCorpusV1Store.Record): NumericalMetaBrain.CausalExtras {
+            // The exported corpus is contract-grouped. When the stream rewinds from the
+            // end of one contract to the beginning of the next (or a new generation),
+            // no prior contract state is useful, so release it immediately. This keeps
+            // the 11M+ row corpus bounded instead of retaining thousands of expired
+            // contract histories in Android heap.
+            if (lastGlobalTimestamp != Long.MIN_VALUE && r.timestampMs + REWIND_TOLERANCE_MS < lastGlobalTimestamp) {
+                clearInternal()
+            }
+            lastGlobalTimestamp = r.timestampMs
+
             val date = java.time.Instant.ofEpochMilli(r.timestampMs)
                 .atOffset(java.time.ZoneOffset.ofHoursMinutes(5, 30)).toLocalDate()
+            val currentDay = date.toEpochDay()
+            if (currentDay != lastCleanupEpochDay) {
+                val expired = expiryByKey.filterValues { it.toLong() < currentDay }.keys
+                expired.forEach { key ->
+                    histories.remove(key)
+                    lastTimestamp.remove(key)
+                    expiryByKey.remove(key)
+                }
+                lastCleanupEpochDay = currentDay
+            }
+
             val expiry = LocalDate.ofEpochDay(r.expiryEpochDay.toLong())
             val key = "${r.index.name}|${r.expiryEpochDay}|${r.strike}|${r.optionType}"
-            // A new training generation rewinds the same split. Reset only that contract
-            // when time moves backwards; a forward TRAIN→VALIDATION→TEST pass may safely
-            // retain past market state because those bars existed before the prediction.
             val last = lastTimestamp[key]
             if (last != null && r.timestampMs <= last) histories.remove(key)
             lastTimestamp[key] = r.timestampMs
+            expiryByKey[key] = r.expiryEpochDay
+
             val q = histories.getOrPut(key) { ArrayDeque() }
             q.addLast(
                 Point(
@@ -52,18 +75,34 @@ object CausalFeatureEngineering {
                 ),
             )
             while (q.size > MAX_HISTORY) q.removeFirst()
+
+            // Defensive upper bound for differently ordered future corpus formats.
+            if (histories.size > MAX_ACTIVE_CONTRACTS) {
+                val oldest = lastTimestamp.entries.sortedBy { it.value }.take(histories.size - MAX_ACTIVE_CONTRACTS)
+                oldest.forEach { (oldKey, _) ->
+                    histories.remove(oldKey)
+                    lastTimestamp.remove(oldKey)
+                    expiryByKey.remove(oldKey)
+                }
+            }
             return fromPoints(q.toList())
         }
 
         fun clear() {
+            clearInternal()
+            lastGlobalTimestamp = Long.MIN_VALUE
+            lastCleanupEpochDay = Long.MIN_VALUE
+        }
+
+        private fun clearInternal() {
             histories.clear()
             lastTimestamp.clear()
+            expiryByKey.clear()
         }
     }
 
     private val streamedState = ThreadLocal.withInitial { PrelabelledState() }
 
-    /** Convenience for synchronous streaming trainers. Auto-resets on split rewind. */
     fun prelabelled(r: AimlHistoricalOptionCorpusV1Store.Record): NumericalMetaBrain.CausalExtras =
         streamedState.get().observe(r)
 
@@ -91,7 +130,6 @@ object CausalFeatureEngineering {
         return fromPoints(points)
     }
 
-    /** Live helper from completed/observed premium closes and underlying closes. */
     fun fromLiveCloses(
         premiumCloses: List<Double>,
         spotCloses: List<Double>,
@@ -257,5 +295,8 @@ object CausalFeatureEngineering {
         if (current <= 0.0 || baseline <= 1e-9) 0.0 else ((current / baseline) - 1.0).coerceIn(-3.0, 3.0)
 
     private fun List<Double>.averageOrZero(): Double = if (isEmpty()) 0.0 else average()
+
     private const val MAX_HISTORY = 80
+    private const val MAX_ACTIVE_CONTRACTS = 512
+    private const val REWIND_TOLERANCE_MS = 30 * 60_000L
 }

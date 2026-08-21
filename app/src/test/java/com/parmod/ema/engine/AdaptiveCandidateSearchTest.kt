@@ -15,11 +15,19 @@ class AdaptiveCandidateSearchTest {
             val h = generated.hyperParameters
             assertTrue(h.learningRate in 0.005..0.050)
             assertTrue(h.l2 in 0.00005..0.00500)
-            assertTrue(h.takeThreshold in 0.60..0.80)
-            assertTrue(h.rejectThreshold in 0.25..0.48)
-            assertTrue(h.takeThreshold - h.rejectThreshold >= 0.079999)
+            assertTrue(h.takeThreshold in 0.25..0.90)
+            assertTrue(h.rejectThreshold in 0.05..0.60)
+            assertTrue(h.takeThreshold - h.rejectThreshold >= 0.049999)
             cursor = generated.mutationIndex + 1
         }
+    }
+
+    @Test
+    fun preserves_evidence_calibrated_historical_thresholds() {
+        val calibrated = NumericalMetaBrain.HyperParameters(0.018, 0.0007, 0.42, 0.24)
+        val bounded = AdaptiveCandidateSearch.bounded(calibrated)
+        assertEquals(0.42, bounded.takeThreshold, 1e-9)
+        assertEquals(0.24, bounded.rejectThreshold, 1e-9)
     }
 
     @Test

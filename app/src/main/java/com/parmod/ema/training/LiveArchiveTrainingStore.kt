@@ -16,7 +16,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.util.zip.GZIPInputStream
 
-/** Reads completed live observations/outcomes as exact, deduplicated training evidence. */
+/** Reads completed live observations/outcomes as exact, deduplicated, fail-closed training evidence. */
 class LiveArchiveTrainingStore(context: Context) {
     data class Record(
         val id: String,
@@ -39,7 +39,6 @@ class LiveArchiveTrainingStore(context: Context) {
     ) {
         val canonicalKey: String
             get() = "${index.name}|$instrumentKey|$observationTimestamp|${engine.name}|${side.name}"
-
         fun features(): NumericalMetaBrain.Features = ArchivedFeatureVectorAdapter.toFeatures(vector)
     }
 
@@ -71,6 +70,82 @@ class LiveArchiveTrainingStore(context: Context) {
         val exitReason: String,
     )
 
+    private class OutcomeIndex {
+        val values = LinkedHashMap<String, Outcome>()
+        private val blocked = HashSet<String>()
+        var duplicates = 0
+            private set
+        var conflicts = 0
+            private set
+
+        fun add(value: Outcome) {
+            if (value.id in blocked) return
+            val old = values[value.id]
+            when {
+                old == null -> values[value.id] = value
+                old == value -> duplicates++
+                else -> {
+                    conflicts++
+                    blocked += value.id
+                    values.remove(value.id)
+                }
+            }
+        }
+    }
+
+    private class EvidenceIndex {
+        val records = ArrayList<Record>()
+        private val byId = HashMap<String, Record>()
+        private val byCanonical = HashMap<String, Record>()
+        private val blockedIds = HashSet<String>()
+        private val blockedCanonical = HashSet<String>()
+        var duplicates = 0
+            private set
+        var conflicts = 0
+            private set
+        var migrated = 0
+            private set
+
+        fun add(value: Record) {
+            if (value.id in blockedIds || value.canonicalKey in blockedCanonical) return
+            val oldId = byId[value.id]
+            if (oldId != null) {
+                if (sameEvidence(oldId, value)) duplicates++ else rejectConflict(oldId, value)
+                return
+            }
+            val oldCanonical = byCanonical[value.canonicalKey]
+            if (oldCanonical != null) {
+                if (sameEvidence(oldCanonical, value, ignoreId = true)) duplicates++ else rejectConflict(oldCanonical, value)
+                return
+            }
+            byId[value.id] = value
+            byCanonical[value.canonicalKey] = value
+            records += value
+            if (value.migratedLegacyVector) migrated++
+        }
+
+        private fun rejectConflict(old: Record, incoming: Record) {
+            conflicts++
+            blockedIds += old.id
+            blockedIds += incoming.id
+            blockedCanonical += old.canonicalKey
+            blockedCanonical += incoming.canonicalKey
+            byId.remove(old.id)
+            byCanonical.remove(old.canonicalKey)
+            records.remove(old)
+            if (old.migratedLegacyVector) migrated--
+        }
+
+        private fun sameEvidence(a: Record, b: Record, ignoreId: Boolean = false): Boolean =
+            (ignoreId || a.id == b.id) &&
+                a.index == b.index && a.engine == b.engine && a.side == b.side &&
+                a.observationTimestamp == b.observationTimestamp && a.outcomeTimestamp == b.outcomeTimestamp &&
+                a.instrumentKey == b.instrumentKey && a.entryPremium == b.entryPremium && a.lotSize == b.lotSize &&
+                a.vector.contentEquals(b.vector) && a.success == b.success && a.exitPremium == b.exitPremium &&
+                a.mfeReturn == b.mfeReturn && a.maeReturn == b.maeReturn && a.netReturn == b.netReturn &&
+                a.exitReason == b.exitReason
+    }
+
     private val appContext = context.applicationContext
     private val zone = ZoneId.of("Asia/Kolkata")
 
@@ -85,73 +160,59 @@ class LiveArchiveTrainingStore(context: Context) {
         val sessions = sessionsRoot().listFiles()?.filter(File::isDirectory)?.sortedBy { it.name }.orEmpty()
         if (sessions.isEmpty()) return emptyResult()
 
-        val outcomes = LinkedHashMap<String, Outcome>()
-        var incompatible = 0
+        val outcomes = OutcomeIndex()
+        var incompatibleRows = 0
         sessions.forEachIndexed { i, dir ->
             if (shouldCancel()) error("Training cancelled")
             outcomeFiles(dir).forEach { file ->
                 readLines(file) { line ->
                     if (shouldCancel()) error("Training cancelled")
-                    val o = runCatching { JSONObject(line) }.getOrNull() ?: return@readLines
-                    val parsed = parseOutcome(o) ?: return@readLines
-                    val old = outcomes[parsed.id]
-                    if (old == null) outcomes[parsed.id] = parsed
-                    else if (old != parsed) incompatible++
+                    val json = runCatching { JSONObject(line) }.getOrNull()
+                    val parsed = json?.let(::parseOutcome)
+                    if (parsed == null) incompatibleRows++ else outcomes.add(parsed)
                 }
             }
             if ((i + 1) % 10 == 0) onProgress("LIVE ARCHIVE · outcomes indexed ${i + 1}/${sessions.size} sessions")
         }
 
-        val records = ArrayList<Record>()
-        val ids = HashSet<String>()
-        val canonical = HashSet<String>()
-        var duplicates = 0
-        var conflicts = incompatible
-        var incompatibleRows = 0
-        var migrated = 0
-
+        val evidence = EvidenceIndex()
         sessions.forEachIndexed { i, dir ->
             if (shouldCancel()) error("Training cancelled")
             val compact = File(dir, COMPACT_FILE)
             if (compactIsFresh(dir, compact)) {
                 readLines(compact) { line ->
+                    if (shouldCancel()) error("Training cancelled")
                     val record = runCatching { parseCompact(JSONObject(line)) }.getOrNull()
-                    if (record == null) incompatibleRows++
-                    else addDeduplicated(record, ids, canonical, records).also { code ->
-                        if (code == 1) duplicates++ else if (code == 2) conflicts++
-                        if (record.migratedLegacyVector && code == 0) migrated++
-                    }
+                    if (record == null) incompatibleRows++ else evidence.add(record)
                 }
             } else {
                 observationFiles(dir).forEach { file ->
                     readLines(file) { line ->
                         if (shouldCancel()) error("Training cancelled")
-                        val o = runCatching { JSONObject(line) }.getOrNull() ?: run {
+                        val json = runCatching { JSONObject(line) }.getOrNull()
+                        if (json == null) {
                             incompatibleRows++
                             return@readLines
                         }
-                        val id = o.optString("id")
-                        val outcome = outcomes[id] ?: return@readLines
-                        val record = runCatching { parseObservation(o, outcome) }.getOrNull()
-                        if (record == null) incompatibleRows++
-                        else addDeduplicated(record, ids, canonical, records).also { code ->
-                            if (code == 1) duplicates++ else if (code == 2) conflicts++
-                            if (record.migratedLegacyVector && code == 0) migrated++
-                        }
+                        val outcome = outcomes.values[json.optString("id")] ?: return@readLines
+                        val record = runCatching { parseObservation(json, outcome) }.getOrNull()
+                        if (record == null) incompatibleRows++ else evidence.add(record)
                     }
                 }
             }
-            if ((i + 1) % 10 == 0) onProgress("LIVE ARCHIVE · replay indexed ${i + 1}/${sessions.size} sessions · ${records.size} unique labels")
+            if ((i + 1) % 10 == 0) onProgress("LIVE ARCHIVE · replay indexed ${i + 1}/${sessions.size} sessions · ${evidence.records.size} unique labels")
         }
 
-        records.sortBy { it.observationTimestamp }
-        if (records.isEmpty()) return LoadResult(emptyList(), Summary(0, duplicates, conflicts, incompatibleRows, migrated, 0L, 0L, 0, 0))
-        val latest = records.last().observationTimestamp
+        evidence.records.sortBy { it.observationTimestamp }
+        val duplicates = outcomes.duplicates + evidence.duplicates
+        val conflicts = outcomes.conflicts + evidence.conflicts
+        if (evidence.records.isEmpty()) return LoadResult(emptyList(), Summary(0, duplicates, conflicts, incompatibleRows, evidence.migrated, 0L, 0L, 0, 0))
+        val latest = evidence.records.last().observationTimestamp
         val latestDate = Instant.ofEpochMilli(latest).atZone(zone).toLocalDate()
         val cutoff = if (months == PrelabelledTrainingWindowPlan.FULL) Long.MIN_VALUE
         else latestDate.minusMonths(months.toLong()).atStartOfDay(zone).toInstant().toEpochMilli()
-        val filtered = records.filter { it.index in markets && it.observationTimestamp >= cutoff }
-        if (filtered.isEmpty()) return LoadResult(emptyList(), Summary(0, duplicates, conflicts, incompatibleRows, migrated, 0L, 0L, 0, 0))
+        val filtered = evidence.records.filter { it.index in markets && it.observationTimestamp >= cutoff }
+        if (filtered.isEmpty()) return LoadResult(emptyList(), Summary(0, duplicates, conflicts, incompatibleRows, 0, 0L, 0L, 0, 0))
         return LoadResult(
             filtered,
             Summary(
@@ -169,32 +230,26 @@ class LiveArchiveTrainingStore(context: Context) {
     }
 
     fun allCompletedForSession(sessionDir: File): List<Record> {
-        val outcomes = LinkedHashMap<String, Outcome>()
+        val outcomes = OutcomeIndex()
         outcomeFiles(sessionDir).forEach { file ->
-            readLines(file) { line ->
-                runCatching { parseOutcome(JSONObject(line)) }.getOrNull()?.let { outcomes.putIfAbsent(it.id, it) }
-            }
+            readLines(file) { line -> runCatching { parseOutcome(JSONObject(line)) }.getOrNull()?.let(outcomes::add) }
         }
-        val records = ArrayList<Record>()
-        val ids = HashSet<String>()
-        val canonical = HashSet<String>()
+        val evidence = EvidenceIndex()
         observationFiles(sessionDir).forEach { file ->
             readLines(file) { line ->
-                val o = runCatching { JSONObject(line) }.getOrNull() ?: return@readLines
-                val outcome = outcomes[o.optString("id")] ?: return@readLines
-                val record = runCatching { parseObservation(o, outcome) }.getOrNull() ?: return@readLines
-                addDeduplicated(record, ids, canonical, records)
+                val json = runCatching { JSONObject(line) }.getOrNull() ?: return@readLines
+                val outcome = outcomes.values[json.optString("id")] ?: return@readLines
+                runCatching { parseObservation(json, outcome) }.getOrNull()?.let(evidence::add)
             }
         }
-        return records.sortedBy { it.observationTimestamp }
+        return evidence.records.sortedBy { it.observationTimestamp }
     }
 
     internal fun sessionsRoot(): File = File(appContext.filesDir, "vardhani_live_research_archive/v1/sessions").apply { mkdirs() }
 
     private fun compactIsFresh(dir: File, compact: File): Boolean {
         if (!compact.isFile) return false
-        val manifestFile = File(dir, COMPACTION_MANIFEST)
-        val manifest = runCatching { JSONObject(manifestFile.readText(Charsets.UTF_8)) }.getOrNull() ?: return false
+        val manifest = runCatching { JSONObject(File(dir, COMPACTION_MANIFEST).readText(Charsets.UTF_8)) }.getOrNull() ?: return false
         if (!manifest.optBoolean("verified", false)) return false
         if (manifest.optInt("feature_schema", 0) > NumericalMetaBrain.FEATURE_SCHEMA_VERSION) return false
         if (manifest.optString("compact_sha256") != sha256(compact)) return false
@@ -215,7 +270,7 @@ class LiveArchiveTrainingStore(context: Context) {
         val engine = enumValue<EngineId>(o.optString("engine")) ?: return null
         val side = enumValue<PositionSide>(o.optString("side")) ?: return null
         val a = o.optJSONArray("features") ?: return null
-        if (a.length() !in NumericalMetaBrain.LEGACY_FEATURE_COUNT..NumericalMetaBrain.FEATURE_COUNT) return null
+        if (a.length() != NumericalMetaBrain.LEGACY_FEATURE_COUNT && a.length() != NumericalMetaBrain.FEATURE_COUNT) return null
         val raw = DoubleArray(a.length()) { a.optDouble(it, Double.NaN) }
         if (raw.any { !it.isFinite() }) return null
         val vector = ArchivedFeatureVectorAdapter.normalizeLegacy(raw)
@@ -238,7 +293,7 @@ class LiveArchiveTrainingStore(context: Context) {
             maeReturn = outcome.maeReturn,
             netReturn = outcome.netReturn,
             exitReason = outcome.exitReason,
-            migratedLegacyVector = raw.size < NumericalMetaBrain.FEATURE_COUNT,
+            migratedLegacyVector = raw.size == NumericalMetaBrain.LEGACY_FEATURE_COUNT,
         ).takeIf { it.observationTimestamp > 0L && it.outcomeTimestamp >= it.observationTimestamp && it.entryPremium > 0.0 && it.lotSize > 0 }
     }
 
@@ -262,7 +317,7 @@ class LiveArchiveTrainingStore(context: Context) {
         val featureSchema = o.optInt("feature_schema", 0)
         if (featureSchema <= 0 || featureSchema > NumericalMetaBrain.FEATURE_SCHEMA_VERSION) return null
         val a = o.optJSONArray("features") ?: return null
-        if (a.length() !in NumericalMetaBrain.LEGACY_FEATURE_COUNT..NumericalMetaBrain.FEATURE_COUNT) return null
+        if (a.length() != NumericalMetaBrain.LEGACY_FEATURE_COUNT && a.length() != NumericalMetaBrain.FEATURE_COUNT) return null
         val raw = DoubleArray(a.length()) { a.optDouble(it, Double.NaN) }
         if (raw.any { !it.isFinite() }) return null
         val vector = ArchivedFeatureVectorAdapter.normalizeLegacy(raw)
@@ -288,22 +343,12 @@ class LiveArchiveTrainingStore(context: Context) {
             maeReturn = o.optDouble("mae_return"),
             netReturn = o.optDouble("net_return"),
             exitReason = o.optString("exit_reason"),
-            migratedLegacyVector = raw.size < NumericalMetaBrain.FEATURE_COUNT,
+            migratedLegacyVector = raw.size == NumericalMetaBrain.LEGACY_FEATURE_COUNT,
         ).takeIf {
             it.id.isNotBlank() && it.observationTimestamp > 0 && it.outcomeTimestamp >= it.observationTimestamp &&
                 it.entryPremium > 0.0 && it.lotSize > 0 && it.exitPremium.isFinite() && it.mfeReturn.isFinite() &&
                 it.maeReturn.isFinite() && it.netReturn.isFinite() && it.vector.all(Double::isFinite)
         }
-    }
-
-    private fun addDeduplicated(record: Record, ids: MutableSet<String>, canonical: MutableSet<String>, output: MutableList<Record>): Int {
-        if (!ids.add(record.id)) return 1
-        if (!canonical.add(record.canonicalKey)) {
-            ids.remove(record.id)
-            return 2
-        }
-        output += record
-        return 0
     }
 
     private inline fun <reified T : Enum<T>> enumValue(value: String): T? = runCatching { enumValueOf<T>(value) }.getOrNull()

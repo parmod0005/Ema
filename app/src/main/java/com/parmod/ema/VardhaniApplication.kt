@@ -18,22 +18,32 @@ class VardhaniApplication : Application() {
         LiveResearchArchive.initialize(this)
         MetaBrainRuntime.initialize(this)
         DualMarketLiveTrainingCoordinator.initialize(this)
-        publishAiLabShortcut()
+        publishResearchShortcuts()
     }
 
-    private fun publishAiLabShortcut() {
+    private fun publishResearchShortcuts() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N_MR1) return
         val shortcutManager = getSystemService(ShortcutManager::class.java) ?: return
-        val intent = Intent(this, MetaBrainLabActivity::class.java).apply {
+        val aiIntent = Intent(this, MetaBrainLabActivity::class.java).apply {
             action = Intent.ACTION_VIEW
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        val shortcut = ShortcutInfo.Builder(this, "vardhani_ai_lab")
+        val backupIntent = Intent(this, ResearchArchiveActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val ai = ShortcutInfo.Builder(this, "vardhani_ai_lab")
             .setShortLabel("AI LAB")
             .setLongLabel("VARDHANI AI LAB")
             .setIcon(Icon.createWithResource(this, R.drawable.vardhani_logo))
-            .setIntent(intent)
+            .setIntent(aiIntent)
             .build()
-        shortcutManager.dynamicShortcuts = listOf(shortcut)
+        val backup = ShortcutInfo.Builder(this, "vardhani_research_backup")
+            .setShortLabel("RESEARCH BACKUP")
+            .setLongLabel("VARDHANI RESEARCH BACKUP")
+            .setIcon(Icon.createWithResource(this, R.drawable.vardhani_logo))
+            .setIntent(backupIntent)
+            .build()
+        shortcutManager.dynamicShortcuts = listOf(ai, backup)
     }
 }

@@ -6,6 +6,7 @@ import com.parmod.ema.data.UpstoxIntradayCandleClient
 import com.parmod.ema.data.UpstoxLiveClient
 import com.parmod.ema.data.UpstoxOptionDiscoveryClient
 import com.parmod.ema.engine.MetaBrainRuntime
+import com.parmod.ema.engine.NumericalMetaBrain
 import com.parmod.ema.model.EngineId
 import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.OptionQuote
@@ -18,19 +19,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.temporal.ChronoUnit
 import kotlin.math.abs
 
-/**
- * Process-lifetime read-only dual-market AI research coordinator.
- *
- * NIFTY and SENSEX are bootstrapped/subscribed concurrently. Every market owns its
- * tick/V7.6/D30 state. The coordinator is the only live-training registrar, which
- * prevents the visible dashboard from duplicating observations. Each registered
- * observation is bound to a fresh CE/PE instrument and is later labelled from that
- * exact option's premium ticks through MetaBrainRuntime.observeOptionPremium().
- */
+/** Process-lifetime read-only dual-market AI research coordinator. */
 object DualMarketLiveTrainingCoordinator {
     data class MarketReport(
         val index: MarketIndex,
@@ -68,6 +63,9 @@ object DualMarketLiveTrainingCoordinator {
         val instrumentKey: String,
         val premium: Double,
         val lotSize: Int,
+        val strike: Double,
+        val volume: Long,
+        val oi: Long,
     )
 
     private class MarketRuntime(
@@ -85,6 +83,7 @@ object DualMarketLiveTrainingCoordinator {
         val micro = MarketMicrostructureResearch()
         val v76Core = MarketV76ResearchCore()
         val bars = ArrayDeque<MarketV76ResearchCore.Bar>().apply { warmBars.takeLast(5000).forEach(::addLast) }
+        val premiumMinuteCloses = mutableMapOf<String, LinkedHashMap<Long, Double>>()
         var working: WorkingMinute? = null
         var ticks: Long = 0L
         var lastTickMillis: Long = 0L
@@ -115,6 +114,7 @@ object DualMarketLiveTrainingCoordinator {
     fun initialize(context: Context) {
         if (initialized) return
         appContext = context.applicationContext
+        LiveResearchArchive.initialize(appContext)
         initialized = true
         watcherJob = ProcessTradingScope.scope.launch { watchLoop() }
     }
@@ -138,14 +138,7 @@ object DualMarketLiveTrainingCoordinator {
                 error = r.error,
             )
         }
-        return Report(
-            initialized = initialized,
-            running = activeTokenFingerprint != 0,
-            connected = connected,
-            message = message,
-            lastBootstrapMillis = lastBootstrapMillis,
-            markets = reports,
-        )
+        return Report(initialized, activeTokenFingerprint != 0, connected, message, lastBootstrapMillis, reports)
     }
 
     private suspend fun watchLoop() {
@@ -191,16 +184,7 @@ object DualMarketLiveTrainingCoordinator {
                 val nowMinute = System.currentTimeMillis() / 60_000L
                 val bars = warm.asSequence()
                     .filter { it.time.toInstant().toEpochMilli() / 60_000L < nowMinute }
-                    .map {
-                        MarketV76ResearchCore.Bar(
-                            timestamp = it.time.toInstant().toEpochMilli(),
-                            open = it.open,
-                            high = it.high,
-                            low = it.low,
-                            close = it.close,
-                            volume = it.volume,
-                        )
-                    }
+                    .map { MarketV76ResearchCore.Bar(it.time.toInstant().toEpochMilli(), it.open, it.high, it.low, it.close, it.volume) }
                     .toList()
                 MarketRuntime(index, expiry, snapshot.underlyingKey, lotSizes, snapshot.spot, snapshot.options, bars)
             }
@@ -218,18 +202,13 @@ object DualMarketLiveTrainingCoordinator {
                 override fun onOpen() {
                     synchronized(this@DualMarketLiveTrainingCoordinator) {
                         connected = true
-                        message = "LIVE AI RESEARCH · NIFTY + SENSEX simultaneous · OPTION_PREMIUM_V2 · D30 requested"
+                        message = "LIVE AI RESEARCH · NIFTY + SENSEX · CAUSAL V2 · ARCHIVE ON · D30 requested"
                     }
                 }
-
                 override fun onTick(tick: DualMarketResearchTickStream.Tick) = applyTick(tick)
-
                 override fun onError(message: String) {
-                    synchronized(this@DualMarketLiveTrainingCoordinator) {
-                        this@DualMarketLiveTrainingCoordinator.message = message.take(180)
-                    }
+                    synchronized(this@DualMarketLiveTrainingCoordinator) { this@DualMarketLiveTrainingCoordinator.message = message.take(180) }
                 }
-
                 override fun onClosed() {
                     synchronized(this@DualMarketLiveTrainingCoordinator) {
                         connected = false
@@ -239,16 +218,11 @@ object DualMarketLiveTrainingCoordinator {
             },
         )
 
-        // Any pending label bound to the old option universe is intentionally discarded.
-        // Model weights/validation are preserved; only unresolved transient observations reset.
         MarketIndex.entries.forEach(MetaBrainRuntime::resetSession)
         synchronized(this) {
-            runtimes.clear()
-            runtimes.putAll(built)
-            underlyingToMarket.clear()
-            underlyingToMarket.putAll(underlyings)
-            optionToMarket.clear()
-            optionToMarket.putAll(options)
+            runtimes.clear(); runtimes.putAll(built)
+            underlyingToMarket.clear(); underlyingToMarket.putAll(underlyings)
+            optionToMarket.clear(); optionToMarket.putAll(options)
             activeTokenFingerprint = token.hashCode()
             activeDate = today
             lastBootstrapMillis = System.currentTimeMillis()
@@ -270,6 +244,10 @@ object DualMarketLiveTrainingCoordinator {
         val underlyingMarket = underlyingToMarket[tick.instrumentKey]
         if (underlyingMarket != null) {
             val price = tick.ltp ?: return
+            LiveResearchArchive.captureTick(
+                underlyingMarket, tick.instrumentKey, "UNDERLYING", timestamp, price,
+                tick.oi, tick.volume, tick.bid, tick.ask, tick.totalBuyQty, tick.totalSellQty, emptyList(),
+            )
             onUnderlyingTick(runtimes[underlyingMarket] ?: return, price, timestamp)
             return
         }
@@ -277,8 +255,10 @@ object DualMarketLiveTrainingCoordinator {
         val runtime = runtimes[optionMarket] ?: return
         val premium = tick.ltp
         if (premium != null && premium > 0.0) {
+            ingestPremiumMinute(runtime, tick.instrumentKey, premium, timestamp)
             MetaBrainRuntime.observeOptionPremium(optionMarket, tick.instrumentKey, premium, timestamp)
         }
+        val oldQuote = runtime.chain.firstOrNull { it.instrumentKey == tick.instrumentKey }
         runtime.chain = runtime.chain.map { q ->
             if (q.instrumentKey != tick.instrumentKey) q else q.copy(
                 ltp = premium ?: q.ltp,
@@ -304,6 +284,22 @@ object DualMarketLiveTrainingCoordinator {
             totalSellQty = tick.totalSellQty,
             depth = tick.depth.map { MarketMicrostructureResearch.DepthLevel(it.bidPrice, it.bidQty, it.askPrice, it.askQty) },
         )
+        val step = if (runtime.index == MarketIndex.NIFTY) 50.0 else 100.0
+        val nearAtm = oldQuote != null && abs(oldQuote.strike - runtime.spot) <= step * 1.5
+        LiveResearchArchive.captureTick(
+            index = optionMarket,
+            instrumentKey = tick.instrumentKey,
+            kind = "OPTION",
+            timestamp = timestamp,
+            ltp = premium,
+            oi = tick.oi,
+            volume = tick.volume,
+            bid = tick.bid,
+            ask = tick.ask,
+            totalBuyQty = tick.totalBuyQty,
+            totalSellQty = tick.totalSellQty,
+            depth = if (nearAtm) tick.depth.map { LiveResearchArchive.DepthRow(it.bidPrice, it.bidQty, it.askPrice, it.askQty) } else emptyList(),
+        )
     }
 
     private fun onUnderlyingTick(runtime: MarketRuntime, price: Double, timestamp: Long) {
@@ -313,7 +309,6 @@ object DualMarketLiveTrainingCoordinator {
         runtime.lastTickMillis = maxOf(runtime.lastTickMillis, timestamp)
         runtime.tickCore.ingest(price, timestamp)
         runtime.micro.ingestSpot(price, timestamp)
-        // Premium-bound pending observations ignore this; retained only as explicit fallback compatibility.
         MetaBrainRuntime.observeSpot(runtime.index, price, timestamp)
         ingestMinute(runtime, price, timestamp)
         if (timestamp - runtime.lastTickEvaluationMillis >= TICK_EVALUATION_INTERVAL_MS) {
@@ -355,6 +350,7 @@ object DualMarketLiveTrainingCoordinator {
             totalBookPressure = quality.totalBookPressure,
             wallPressure = quality.wallPressure,
             depthLevels = quality.depthLevels.toDouble(),
+            causalExtras = training?.let { liveCausal(runtime, it, timestamp) } ?: NumericalMetaBrain.CausalExtras(),
             registerForTraining = training != null,
             trainingInstrumentKey = training?.instrumentKey,
             trainingPremium = training?.premium,
@@ -370,14 +366,13 @@ object DualMarketLiveTrainingCoordinator {
             w == null -> runtime.working = WorkingMinute(minute, price, price, price, price)
             minute < w.minute -> return
             minute == w.minute -> {
-                w.high = maxOf(w.high, price)
-                w.low = minOf(w.low, price)
-                w.close = price
-                w.ticks++
+                w.high = maxOf(w.high, price); w.low = minOf(w.low, price); w.close = price; w.ticks++
             }
             else -> {
-                runtime.bars.addLast(MarketV76ResearchCore.Bar(w.minute * 60_000L, w.open, w.high, w.low, w.close, w.ticks))
+                val bar = MarketV76ResearchCore.Bar(w.minute * 60_000L, w.open, w.high, w.low, w.close, w.ticks)
+                runtime.bars.addLast(bar)
                 while (runtime.bars.size > 5000) runtime.bars.removeFirst()
+                LiveResearchArchive.captureMinuteBar(runtime.index, bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume)
                 runtime.working = WorkingMinute(minute, price, price, price, price)
                 evaluateV76(runtime)
             }
@@ -417,6 +412,7 @@ object DualMarketLiveTrainingCoordinator {
             totalBookPressure = quality.totalBookPressure,
             wallPressure = quality.wallPressure,
             depthLevels = quality.depthLevels.toDouble(),
+            causalExtras = training?.let { liveCausal(runtime, it, evaluation.signalTimeMillis) } ?: NumericalMetaBrain.CausalExtras(),
             registerForTraining = training != null,
             trainingInstrumentKey = training?.instrumentKey,
             trainingPremium = training?.premium,
@@ -425,7 +421,38 @@ object DualMarketLiveTrainingCoordinator {
         runtime.lastSignalMillis = maxOf(runtime.lastSignalMillis, evaluation.signalTimeMillis)
     }
 
-    /** Nearest fresh option on the engine side; stale snapshot prices never seed labels. */
+    private fun ingestPremiumMinute(runtime: MarketRuntime, instrumentKey: String, premium: Double, timestamp: Long) {
+        val minute = timestamp / 60_000L
+        val map = runtime.premiumMinuteCloses.getOrPut(instrumentKey) { linkedMapOf() }
+        map[minute] = premium
+        while (map.size > 90) map.remove(map.keys.first())
+    }
+
+    private fun liveCausal(runtime: MarketRuntime, contract: TrainingContract, timestamp: Long): NumericalMetaBrain.CausalExtras {
+        val premiumCloses = runtime.premiumMinuteCloses[contract.instrumentKey]?.values?.toList().orEmpty()
+        val spotCloses = buildList {
+            runtime.bars.takeLast(79).forEach { add(it.close) }
+            runtime.working?.close?.let(::add)
+        }
+        val step = if (runtime.index == MarketIndex.NIFTY) 50.0 else 100.0
+        val moneyness = if (step > 0.0) (contract.strike - runtime.spot) / step else 0.0
+        val date = Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate()
+        val expiry = runCatching { LocalDate.parse(runtime.expiry) }.getOrNull()
+        val dte = expiry?.let { ChronoUnit.DAYS.between(date, it).coerceAtLeast(0L).toDouble() } ?: 0.0
+        return CausalFeatureEngineering.fromLiveCloses(
+            premiumCloses = premiumCloses,
+            spotCloses = spotCloses,
+            currentOpen = contract.premium,
+            currentHigh = contract.premium,
+            currentLow = contract.premium,
+            currentClose = contract.premium,
+            currentVolume = contract.volume.toDouble(),
+            currentOi = contract.oi.toDouble(),
+            moneynessSteps = moneyness,
+            daysToExpiry = dte,
+        )
+    }
+
     private fun trainingContract(runtime: MarketRuntime, side: PositionSide, timestamp: Long): TrainingContract? {
         val quote = runtime.chain.asSequence()
             .filter { it.type == side.name && it.instrumentKey.isNotBlank() && it.ltp > 0.0 && it.lastTickMillis > 0L }
@@ -434,7 +461,7 @@ object DualMarketLiveTrainingCoordinator {
             ?: return null
         val lot = runtime.lotSizes[quote.instrumentKey] ?: return null
         if (lot <= 0) return null
-        return TrainingContract(quote.instrumentKey, quote.ltp, lot)
+        return TrainingContract(quote.instrumentKey, quote.ltp, lot, quote.strike, quote.volume, quote.openInterest)
     }
 
     @Synchronized
@@ -449,12 +476,7 @@ object DualMarketLiveTrainingCoordinator {
 
     @Synchronized
     private fun stopFeed(reason: String) {
-        stream?.disconnect()
-        stream = null
-        connected = false
-        activeTokenFingerprint = 0
-        activeDate = null
-        message = reason
+        stream?.disconnect(); stream = null; connected = false; activeTokenFingerprint = 0; activeDate = null; message = reason
         MarketIndex.entries.forEach(MetaBrainRuntime::resetSession)
     }
 

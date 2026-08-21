@@ -23,8 +23,12 @@ class NumericalMetaBrain(
         val rejectThreshold: Double = DEFAULT_REJECT_THRESHOLD,
     ) {
         fun sanitized(): HyperParameters {
-            val take = takeThreshold.coerceIn(0.51, 0.90)
-            val reject = rejectThreshold.coerceIn(0.10, 0.49).coerceAtMost(take - 0.02)
+            // Probability cutoffs are policy parameters, not a statement that profitable
+            // trades must have >50% win probability. Historical research calibrates these
+            // cutoffs on development-only cost-adjusted outcomes. Live/manual profiles can
+            // still remain conservative at their configured values.
+            val take = takeThreshold.coerceIn(0.25, 0.90)
+            val reject = rejectThreshold.coerceIn(0.05, 0.60).coerceAtMost(take - 0.05)
             return copy(
                 learningRate = learningRate.coerceIn(0.001, 0.10),
                 l2 = l2.coerceIn(0.0, 0.02),
@@ -70,7 +74,7 @@ class NumericalMetaBrain(
             optionFlow.coerceIn(-1.0, 1.0),
             acceleration.coerceIn(-3.0, 3.0) / 3.0,
             (extensionAtr / 6.0).coerceIn(0.0, 2.0),
-            depthImbalance.coerceIn(-1.0, 1.0),
+            depthImalanceSafe(depthImbalance),
             micropricePressure.coerceIn(-1.0, 1.0),
             totalBookPressure.coerceIn(-1.0, 1.0),
             wallPressure.coerceIn(-1.0, 1.0),
@@ -79,6 +83,8 @@ class NumericalMetaBrain(
             (recentEngineWinRate / 100.0).coerceIn(0.0, 1.0),
             min(recentEngineProfitFactor, 3.0) / 3.0,
         )
+
+        private fun depthImalanceSafe(value: Double): Double = value.coerceIn(-1.0, 1.0)
     }
 
     data class Prediction(

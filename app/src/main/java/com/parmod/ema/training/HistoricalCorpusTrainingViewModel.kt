@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.parmod.ema.backtest.UpstoxPlusHistoricalClient
 import com.parmod.ema.data.LocalCredentialVault
 import com.parmod.ema.engine.MetaBrainRuntime
+import com.parmod.ema.engine.NumericalMetaBrain
 import com.parmod.ema.model.MarketIndex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,6 +43,9 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         val prelabelledTrainRows: Long = 0,
         val prelabelledValidationRows: Long = 0,
         val prelabelledTestRows: Long = 0,
+        val checkpointAvailable: Boolean = false,
+        val liveArchiveRecords: Int = 0,
+        val liveArchiveDuplicates: Int = 0,
     ) {
         val progress: Float get() = if (total <= 0) 0f else (completed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
         val importProgress: Float get() = if (importTotal <= 0) 0f else (importCompleted.toFloat() / importTotal.toFloat()).coerceIn(0f, 1f)
@@ -52,8 +56,13 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
     private val upstoxCacheDirectory = File(application.filesDir, "upstox_backtest_cache/v1")
     private val localStore = StreamingLocalHistoricalCorpusStore(application)
     private val prelabelledStore = AimlHistoricalOptionCorpusV1Store(application)
+    private val checkpointStore = HistoricalTrainingCheckpointStore(application)
+    private val liveArchiveStore = LiveArchiveTrainingStore(application)
     private val summaryPrefs = application.getSharedPreferences(PREFS, 0)
     private val initialPrelabelled = prelabelledStore.ready()
+
+    init { LiveResearchArchive.initialize(application) }
+
     private val _state = MutableStateFlow(
         loadLastSummary(application).copy(
             localSummary = effectiveLocalSummary(),
@@ -69,48 +78,35 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
 
     fun selectMonths(months: Int) {
         if (busy() || months !in PrelabelledTrainingWindowPlan.ALLOWED_MONTHS) return
-        val label = PrelabelledTrainingWindowPlan.label(months)
         _state.value = _state.value.copy(
-            selectedMonths = months,
-            result = null,
-            installedCandidate = false,
-            error = null,
-            message = if (prelabelledStore.ready()) {
-                "$label selected · fresh chronological TRAIN/calibration/scoring/locked-TEST roles will be derived from timestamps"
-            } else {
-                "$label ${_state.value.selectedMarketScope.label} research window selected · caches reused"
-            },
+            selectedMonths = months, result = null, installedCandidate = false, error = null,
+            checkpointAvailable = checkpointFor(_state.value.selectedMarketScope, months),
+            message = "${PrelabelledTrainingWindowPlan.label(months)} ${_state.value.selectedMarketScope.label} research window selected · chronological roles + ${PrelabelledTrainingWindowPlan.EMBARGO_MINUTES}m embargo",
         )
     }
 
-    fun selectIndex(index: MarketIndex) =
-        selectMarketScope(if (index == MarketIndex.NIFTY) HistoricalMarketScope.NIFTY else HistoricalMarketScope.SENSEX)
+    fun selectIndex(index: MarketIndex) = selectMarketScope(if (index == MarketIndex.NIFTY) HistoricalMarketScope.NIFTY else HistoricalMarketScope.SENSEX)
 
     fun selectMarketScope(scope: HistoricalMarketScope) {
         if (busy()) return
         _state.value = _state.value.copy(
             selectedMarketScope = scope,
             selectedIndex = scope.singleIndexOrNull() ?: _state.value.selectedIndex,
-            result = null,
-            installedCandidate = false,
-            error = null,
-            message = if (scope == HistoricalMarketScope.BOTH) {
-                "BOTH selected · one shared Candidate and one shared chronological window for NIFTY + SENSEX"
-            } else "${scope.label} historical AI corpus selected",
+            result = null, installedCandidate = false, error = null,
+            checkpointAvailable = checkpointFor(scope, _state.value.selectedMonths),
+            message = if (scope == HistoricalMarketScope.BOTH) "BOTH selected · one shared Candidate and shared timestamps for NIFTY + SENSEX" else "${scope.label} historical AI corpus selected",
         )
     }
 
     fun selectSource(source: HistoricalCorpusSource) {
         if (busy()) return
         _state.value = _state.value.copy(
-            selectedSource = source,
-            result = null,
-            installedCandidate = false,
-            error = null,
+            selectedSource = source, result = null, installedCandidate = false, error = null,
             message = when (source) {
                 HistoricalCorpusSource.UPSTOX -> "Upstox Plus expired-option corpus selected"
-                HistoricalCorpusSource.LOCAL -> if (prelabelledStore.ready()) "Pre-labelled LOCAL corpus selected · timestamp roles will be re-derived" else "Local imported corpus selected · no Upstox token required"
-                HistoricalCorpusSource.COMBINED -> if (prelabelledStore.ready()) "COMBINED selected · chronological pre-labelled champion + Upstox refinement" else "Combined corpus selected · local + Upstox deduplicated"
+                HistoricalCorpusSource.LOCAL -> if (prelabelledStore.ready()) "Pre-labelled LOCAL corpus selected · timestamp roles re-derived" else "Local imported corpus selected · no Upstox token required"
+                HistoricalCorpusSource.LIVE_ARCHIVE -> "LIVE ARCHIVE selected · exact saved feature vectors + actual resolved outcomes · no broker token required"
+                HistoricalCorpusSource.COMBINED -> "COMBINED selected · historical/local + LIVE ARCHIVE + Upstox refinement with source-level dedupe"
             },
         )
     }
@@ -138,27 +134,20 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                             else -> _state.value.selectedMarketScope
                         }
                         _state.value = _state.value.copy(
-                            isImporting = false,
-                            stage = if (ready) "IMPORT_COMPLETE" else "IMPORT_ERROR",
+                            isImporting = false, stage = if (ready) "IMPORT_COMPLETE" else "IMPORT_ERROR",
                             selectedSource = if (ready) HistoricalCorpusSource.LOCAL else _state.value.selectedSource,
-                            selectedMarketScope = scope,
-                            selectedIndex = scope.singleIndexOrNull() ?: _state.value.selectedIndex,
+                            selectedMarketScope = scope, selectedIndex = scope.singleIndexOrNull() ?: _state.value.selectedIndex,
                             selectedMonths = if (ready) 12 else _state.value.selectedMonths,
-                            localSummary = imported.summary,
-                            importCompleted = uris.size,
-                            importTotal = uris.size,
+                            localSummary = imported.summary, importCompleted = uris.size, importTotal = uris.size,
                             importMessage = imported.message,
-                            message = if (ready) "Pre-labelled corpus ready · ${scope.label} · choose 1M/3M/6M/12M/FULL; roles derive from timestamps" else imported.message,
-                            error = imported.summary.errors.lastOrNull(),
-                            prelabelledCorpusReady = ready,
-                            prelabelledTrainRows = imported.trainRows,
-                            prelabelledValidationRows = imported.validationRows,
-                            prelabelledTestRows = imported.testRows,
+                            message = if (ready) "Pre-labelled corpus ready · ${scope.label} · 1M/3M/6M/12M/FULL roles derive from timestamps" else imported.message,
+                            error = imported.summary.errors.lastOrNull(), prelabelledCorpusReady = ready,
+                            prelabelledTrainRows = imported.trainRows, prelabelledValidationRows = imported.validationRows, prelabelledTestRows = imported.testRows,
+                            checkpointAvailable = false,
                         )
                         return@launch
                     }
                 }
-
                 val summary = withContext(Dispatchers.IO) {
                     localStore.importUris(
                         uris = uris,
@@ -168,32 +157,23 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                 }
                 val autoScope = if (summary.bothMarketsPresent) HistoricalMarketScope.BOTH else _state.value.selectedMarketScope
                 _state.value = _state.value.copy(
-                    isImporting = false,
-                    stage = "IMPORT_COMPLETE",
+                    isImporting = false, stage = "IMPORT_COMPLETE",
                     selectedSource = if (summary.trainable) HistoricalCorpusSource.LOCAL else _state.value.selectedSource,
-                    selectedMarketScope = autoScope,
-                    localSummary = summary,
-                    importCompleted = uris.size,
-                    importTotal = uris.size,
+                    selectedMarketScope = autoScope, localSummary = summary,
+                    importCompleted = uris.size, importTotal = uris.size,
                     importMessage = "Import complete · ${summary.optionContracts} option contracts · ${summary.rowsAccepted} accepted rows",
                     message = if (summary.trainable) "Local raw-candle corpus ready · ${autoScope.label}" else "Import finished but no trainable CE/PE contracts were found",
-                    error = null,
-                    prelabelledCorpusReady = prelabelledStore.ready(),
+                    error = null, prelabelledCorpusReady = prelabelledStore.ready(), checkpointAvailable = false,
                 )
             } catch (error: Throwable) {
-                val cancelled = cancelled(error)
+                val wasCancelled = cancelled(error)
                 _state.value = _state.value.copy(
-                    isImporting = false,
-                    stage = if (cancelled) "IMPORT_CANCELLED" else "IMPORT_ERROR",
-                    importMessage = if (cancelled) "Import cancelled safely · active corpus retained" else "Import stopped safely · previous active corpus retained",
-                    localSummary = effectiveLocalSummary(),
-                    error = if (cancelled) null else (error.message ?: error::class.java.simpleName).take(300),
+                    isImporting = false, stage = if (wasCancelled) "IMPORT_CANCELLED" else "IMPORT_ERROR",
+                    importMessage = if (wasCancelled) "Import cancelled safely · active corpus retained" else "Import stopped safely · previous active corpus retained",
+                    localSummary = effectiveLocalSummary(), error = if (wasCancelled) null else (error.message ?: error::class.java.simpleName).take(300),
                     prelabelledCorpusReady = prelabelledStore.ready(),
                 )
-            } finally {
-                cancelRequested = false
-                job = null
-            }
+            } finally { cancelRequested = false; job = null }
         }
     }
 
@@ -206,92 +186,61 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         val token = vault.read().upstoxAccessToken.trim()
         val prelabelledReady = prelabelledStore.ready()
 
-        if (source != HistoricalCorpusSource.LOCAL && token.isBlank()) {
-            _state.value = _state.value.copy(error = "Save a valid Upstox access token first, or choose LOCAL corpus")
+        if (source in setOf(HistoricalCorpusSource.UPSTOX, HistoricalCorpusSource.COMBINED) && token.isBlank()) {
+            _state.value = _state.value.copy(error = "Save a valid Upstox access token first, or choose LOCAL / LIVE ARCHIVE")
             return
         }
-        if (source != HistoricalCorpusSource.UPSTOX && !effectiveLocalSummary().trainable) {
-            _state.value = _state.value.copy(error = "Import a trainable CE/PE local corpus first, or choose UPSTOX source")
+        if (source == HistoricalCorpusSource.LOCAL && !effectiveLocalSummary().trainable) {
+            _state.value = _state.value.copy(error = "Import a trainable CE/PE local corpus first")
             return
         }
-        if (scope == HistoricalMarketScope.BOTH && source != HistoricalCorpusSource.UPSTOX && !effectiveLocalSummary().bothMarketsPresent) {
-            _state.value = _state.value.copy(error = "BOTH historical training requires NIFTY and SENSEX in the local corpus")
+        if (source == HistoricalCorpusSource.COMBINED && !effectiveLocalSummary().trainable && !prelabelledReady) {
+            _state.value = _state.value.copy(error = "COMBINED requires a trainable local/pre-labelled corpus in addition to LIVE ARCHIVE/Upstox")
             return
         }
-        if (months == PrelabelledTrainingWindowPlan.FULL && !prelabelledReady && source != HistoricalCorpusSource.UPSTOX) {
-            _state.value = _state.value.copy(error = "FULL raw-local streaming is not enabled yet; choose 1M/3M/6M/12M or use the pre-labelled/UPSTOX source")
+        if (scope == HistoricalMarketScope.BOTH && source in setOf(HistoricalCorpusSource.LOCAL, HistoricalCorpusSource.COMBINED) && !effectiveLocalSummary().bothMarketsPresent) {
+            _state.value = _state.value.copy(error = "BOTH local/combined training requires NIFTY and SENSEX in the local corpus")
+            return
+        }
+        if (months == PrelabelledTrainingWindowPlan.FULL && !prelabelledReady && source in setOf(HistoricalCorpusSource.LOCAL, HistoricalCorpusSource.COMBINED)) {
+            _state.value = _state.value.copy(error = "FULL raw-local streaming is not enabled; use pre-labelled, LIVE ARCHIVE, UPSTOX or a shorter raw-local window")
             return
         }
 
         cancelRequested = false
         _state.value = _state.value.copy(
-            isRunning = true,
-            stage = "STARTING",
-            completed = 0,
-            total = 0,
-            result = null,
-            installedCandidate = false,
-            error = null,
-            message = "Starting ${source.label} ${scope.label} $label historical AI research · Production frozen…",
+            isRunning = true, stage = "STARTING", completed = 0, total = 0, result = null,
+            installedCandidate = false, error = null,
+            checkpointAvailable = checkpointFor(scope, months),
+            message = "Starting ${source.label} ${scope.label} $label AI research · Production frozen${if (checkpointFor(scope, months)) " · compatible checkpoint will resume" else ""}",
         )
 
         job = viewModelScope.launch {
             var client: UpstoxPlusHistoricalClient? = null
             try {
                 val result = withContext(Dispatchers.IO) {
-                    when {
-                        scope == HistoricalMarketScope.BOTH && prelabelledReady && source == HistoricalCorpusSource.LOCAL -> runJointPrelabelled(months)
-                        scope == HistoricalMarketScope.BOTH && prelabelledReady && source == HistoricalCorpusSource.COMBINED -> {
-                            val historical = runJointPrelabelled(months)
-                            val champion = historical.championState
-                            if (champion == null) historical.copy(note = historical.note + " · Upstox refinement skipped because joint pre-labelled governance did not pass.")
-                            else {
-                                val pair = loadSeries(HistoricalCorpusSource.UPSTOX, scope, months)
-                                client = pair.second
-                                val merged = HistoricalSeriesMerger.merge(pair.first)
-                                if (merged.isEmpty()) historical.copy(note = historical.note + " · No Upstox BOTH-market refinement series available.")
+                    when (source) {
+                        HistoricalCorpusSource.LIVE_ARCHIVE -> runLiveArchive(scope, months, MetaBrainRuntime.productionSnapshotForResearch())
+                        HistoricalCorpusSource.LOCAL -> if (prelabelledReady) {
+                            if (scope == HistoricalMarketScope.BOTH) runJointPrelabelled(months) else runPrelabelled(scope.singleIndexOrNull() ?: error("Invalid scope"), months)
+                        } else if (scope == HistoricalMarketScope.BOTH) runJointRawOrUpstox(HistoricalCorpusSource.LOCAL, months).first else runSingleRawOrUpstox(HistoricalCorpusSource.LOCAL, scope.singleIndexOrNull() ?: error("Invalid scope"), months).first
+                        HistoricalCorpusSource.UPSTOX -> if (scope == HistoricalMarketScope.BOTH) runJointRawOrUpstox(source, months).also { client = it.second }.first else runSingleRawOrUpstox(source, scope.singleIndexOrNull() ?: error("Invalid scope"), months).also { client = it.second }.first
+                        HistoricalCorpusSource.COMBINED -> {
+                            if (prelabelledReady) {
+                                val historical = if (scope == HistoricalMarketScope.BOTH) runJointPrelabelled(months) else runPrelabelled(scope.singleIndexOrNull() ?: error("Invalid scope"), months)
+                                val archived = refineWithLiveArchive(historical, scope, months)
+                                val base = archived.championState ?: historical.championState
+                                if (base == null) archived.copy(note = archived.note + " · Upstox refinement skipped because no development-qualified base Candidate exists.")
                                 else {
-                                    val refined = JointHistoricalSeriesTrainer(champion).run(
-                                        series = merged,
-                                        config = HistoricalCorpusTrainer.Config(months = months.toLong()),
-                                        sourceLabel = "COMBINED UPSTOX BOTH REFINEMENT",
-                                        onProgress = { publishProgress(it, client) },
-                                        shouldCancel = { cancelRequested },
-                                    )
-                                    if (refined.championState != null) refined.copy(note = historical.note + " · Upstox BOTH refinement also passed. " + refined.note)
-                                    else historical.copy(errors = historical.errors + refined.errors, note = historical.note + " · Upstox BOTH refinement did not clear governance; pre-labelled champion retained.")
+                                    val pair = loadSeries(HistoricalCorpusSource.UPSTOX, scope, months); client = pair.second
+                                    val merged = HistoricalSeriesMerger.merge(pair.first)
+                                    if (merged.isEmpty()) archived.copy(note = archived.note + " · No Upstox refinement series available.")
+                                    else refineWithSeries(archived, base, scope, months, merged, pair.second)
                                 }
-                            }
-                        }
-                        scope == HistoricalMarketScope.BOTH -> runJointRawOrUpstox(source, months).also { client = it.second }.first
-                        else -> {
-                            val index = scope.singleIndexOrNull() ?: error("Invalid single-market scope")
-                            when {
-                                prelabelledReady && source == HistoricalCorpusSource.LOCAL -> runPrelabelled(index, months)
-                                prelabelledReady && source == HistoricalCorpusSource.COMBINED -> {
-                                    val historical = runPrelabelled(index, months)
-                                    val champion = historical.championState
-                                    if (champion == null) historical.copy(note = historical.note + " · Upstox refinement skipped because pre-labelled governance did not pass.")
-                                    else {
-                                        val pair = loadSeries(HistoricalCorpusSource.UPSTOX, scope, months)
-                                        client = pair.second
-                                        val merged = HistoricalSeriesMerger.merge(pair.first)
-                                        if (merged.isEmpty()) historical.copy(note = historical.note + " · No Upstox refinement series available.")
-                                        else {
-                                            val refined = HistoricalSeriesTrainer(champion).run(
-                                                index = index,
-                                                series = merged,
-                                                config = HistoricalCorpusTrainer.Config(months = months.toLong()),
-                                                sourceLabel = "COMBINED UPSTOX REFINEMENT",
-                                                onProgress = { publishProgress(it, client) },
-                                                shouldCancel = { cancelRequested },
-                                            )
-                                            if (refined.championState != null) refined.copy(note = historical.note + " · Upstox refinement also passed. " + refined.note)
-                                            else historical.copy(errors = historical.errors + refined.errors, note = historical.note + " · Upstox refinement did not clear governance; pre-labelled champion retained.")
-                                        }
-                                    }
-                                }
-                                else -> runSingleRawOrUpstox(source, index, months).also { client = it.second }.first
+                            } else {
+                                val raw = if (scope == HistoricalMarketScope.BOTH) runJointRawOrUpstox(HistoricalCorpusSource.COMBINED, months).also { client = it.second }.first
+                                else runSingleRawOrUpstox(HistoricalCorpusSource.COMBINED, scope.singleIndexOrNull() ?: error("Invalid scope"), months).also { client = it.second }.first
+                                refineWithLiveArchive(raw, scope, months)
                             }
                         }
                     }
@@ -308,107 +257,110 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                     else -> "Historical research complete · Production unchanged"
                 }
                 _state.value = _state.value.copy(
-                    isRunning = false,
-                    stage = "COMPLETE",
-                    completed = _state.value.total.coerceAtLeast(_state.value.completed),
-                    message = finalMessage,
-                    result = result,
-                    installedCandidate = installed,
-                    error = result.errors.lastOrNull()?.take(220),
-                    cacheHits = stats.cacheHits,
-                    networkRequests = stats.requests,
-                    localSummary = effectiveLocalSummary(),
-                    prelabelledCorpusReady = prelabelledStore.ready(),
+                    isRunning = false, stage = "COMPLETE", completed = _state.value.total.coerceAtLeast(_state.value.completed),
+                    message = finalMessage, result = result, installedCandidate = installed,
+                    error = result.errors.lastOrNull()?.take(220), cacheHits = stats.cacheHits, networkRequests = stats.requests,
+                    localSummary = effectiveLocalSummary(), prelabelledCorpusReady = prelabelledStore.ready(),
+                    checkpointAvailable = checkpointFor(scope, months),
                 )
                 saveSummary(_state.value)
             } catch (error: Throwable) {
-                val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
-                val wasCancelled = cancelled(error)
+                val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats(); val wasCancelled = cancelled(error)
                 _state.value = _state.value.copy(
-                    isRunning = false,
-                    stage = if (wasCancelled) "CANCELLED" else "ERROR",
-                    message = if (wasCancelled) "Training stopped safely · corpus retained" else "Historical AI training stopped safely · corpus retained",
+                    isRunning = false, stage = if (wasCancelled) "CANCELLED" else "ERROR",
+                    message = if (wasCancelled) "Training stopped safely · compatible checkpoint/corpus retained" else "Historical AI training stopped safely · corpus/checkpoint retained",
                     error = if (wasCancelled) null else (error.message ?: error::class.java.simpleName).take(300),
-                    cacheHits = stats.cacheHits,
-                    networkRequests = stats.requests,
-                    localSummary = effectiveLocalSummary(),
-                    prelabelledCorpusReady = prelabelledStore.ready(),
+                    cacheHits = stats.cacheHits, networkRequests = stats.requests, localSummary = effectiveLocalSummary(),
+                    prelabelledCorpusReady = prelabelledStore.ready(), checkpointAvailable = checkpointFor(scope, months),
                 )
-            } finally {
-                cancelRequested = false
-                job = null
-            }
+            } finally { cancelRequested = false; job = null }
         }
     }
 
     private fun runPrelabelled(index: MarketIndex, months: Int): HistoricalCorpusTrainer.Result =
         AimlHistoricalOptionCorpusV1Trainer(prelabelledStore, MetaBrainRuntime.productionSnapshotForResearch()).run(
-            index = index,
-            monthsLabel = months.toLong(),
-            onProgress = { publishProgress(it, null) },
-            shouldCancel = { cancelRequested },
+            index = index, monthsLabel = months.toLong(), onProgress = { publishProgress(it, null) }, shouldCancel = { cancelRequested }, checkpointStore = checkpointStore,
         )
 
     private fun runJointPrelabelled(months: Int): HistoricalCorpusTrainer.Result =
         JointPrelabelledHistoricalTrainer(prelabelledStore, MetaBrainRuntime.productionSnapshotForResearch()).run(
-            monthsLabel = months.toLong(),
-            onProgress = { publishProgress(it, null) },
-            shouldCancel = { cancelRequested },
+            monthsLabel = months.toLong(), onProgress = { publishProgress(it, null) }, shouldCancel = { cancelRequested }, checkpointStore = checkpointStore,
         )
+
+    private fun runLiveArchive(scope: HistoricalMarketScope, months: Int, baseline: NumericalMetaBrain.ModelState): HistoricalCorpusTrainer.Result {
+        _state.value = _state.value.copy(stage = "LIVE_ARCHIVE_INDEX", message = "Indexing preserved live observations/outcomes · exact-ID + canonical dedupe…")
+        val markets = scope.singleIndexOrNull()?.let(::setOf) ?: MarketIndex.entries.toSet()
+        val loaded = liveArchiveStore.load(months, markets, { cancelRequested }) { msg -> _state.value = _state.value.copy(stage = "LIVE_ARCHIVE_INDEX", message = msg) }
+        _state.value = _state.value.copy(liveArchiveRecords = loaded.summary.records, liveArchiveDuplicates = loaded.summary.duplicatesRemoved)
+        return LiveArchiveHistoricalTrainer(baseline).run(
+            records = loaded.records, scope = scope, months = months,
+            sourceLabel = "LIVE ARCHIVE ${PrelabelledTrainingWindowPlan.label(months)}",
+            onProgress = { publishProgress(it, null) }, shouldCancel = { cancelRequested },
+        ).let { r ->
+            r.copy(note = r.note + " · Replay ${loaded.summary.records} unique · duplicates ${loaded.summary.duplicatesRemoved} · conflicts ${loaded.summary.conflictsRejected} · incompatible ${loaded.summary.incompatibleRejected} · migrated legacy vectors ${loaded.summary.legacyVectorsMigrated}.")
+        }
+    }
+
+    private fun refineWithLiveArchive(base: HistoricalCorpusTrainer.Result, scope: HistoricalMarketScope, months: Int): HistoricalCorpusTrainer.Result {
+        val champion = base.championState ?: return base.copy(note = base.note + " · LIVE ARCHIVE refinement skipped because no qualified base Candidate exists.")
+        val archived = runLiveArchive(scope, months, champion)
+        return if (archived.championState != null) archived.copy(note = base.note + " · LIVE ARCHIVE refinement PASS. " + archived.note)
+        else base.copy(errors = (base.errors + archived.errors).distinct(), note = base.note + " · LIVE ARCHIVE refinement did not clear governance; base Candidate retained. " + archived.note)
+    }
+
+    private fun refineWithSeries(
+        baseResult: HistoricalCorpusTrainer.Result,
+        baseline: NumericalMetaBrain.ModelState,
+        scope: HistoricalMarketScope,
+        months: Int,
+        series: List<HistoricalOptionSeries>,
+        client: UpstoxPlusHistoricalClient?,
+    ): HistoricalCorpusTrainer.Result {
+        val refined = if (scope == HistoricalMarketScope.BOTH) JointHistoricalSeriesTrainer(baseline).run(
+            series = series,
+            config = HistoricalCorpusTrainer.Config(months = months.toLong()),
+            sourceLabel = "COMBINED UPSTOX BOTH REFINEMENT",
+            onProgress = { publishProgress(it, client) }, shouldCancel = { cancelRequested },
+        ) else HistoricalSeriesTrainer(baseline).run(
+            index = scope.singleIndexOrNull() ?: error("Invalid scope"), series = series,
+            config = HistoricalCorpusTrainer.Config(months = months.toLong()),
+            sourceLabel = "COMBINED UPSTOX REFINEMENT",
+            onProgress = { publishProgress(it, client) }, shouldCancel = { cancelRequested },
+        )
+        return if (refined.championState != null) refined.copy(note = baseResult.note + " · Upstox refinement PASS. " + refined.note)
+        else baseResult.copy(errors = (baseResult.errors + refined.errors).distinct(), note = baseResult.note + " · Upstox refinement did not clear governance; prior Candidate retained. " + refined.note)
+    }
 
     private fun runSingleRawOrUpstox(source: HistoricalCorpusSource, index: MarketIndex, months: Int): Pair<HistoricalCorpusTrainer.Result, UpstoxPlusHistoricalClient?> {
         val pair = loadSeries(source, if (index == MarketIndex.NIFTY) HistoricalMarketScope.NIFTY else HistoricalMarketScope.SENSEX, months)
-        val merged = HistoricalSeriesMerger.merge(pair.first)
-        if (merged.isEmpty()) error("No trainable ${index.name} option series available from ${source.label}")
-        val trained = HistoricalSeriesTrainer(MetaBrainRuntime.productionSnapshotForResearch()).run(
-            index = index,
-            series = merged,
-            config = HistoricalCorpusTrainer.Config(months = months.toLong()),
-            sourceLabel = "${source.label} ${PrelabelledTrainingWindowPlan.label(months)}",
-            onProgress = { publishProgress(it, pair.second) },
-            shouldCancel = { cancelRequested },
-        )
-        return trained to pair.second
+        val merged = HistoricalSeriesMerger.merge(pair.first); if (merged.isEmpty()) error("No trainable ${index.name} option series available from ${source.label}")
+        return HistoricalSeriesTrainer(MetaBrainRuntime.productionSnapshotForResearch()).run(
+            index = index, series = merged, config = HistoricalCorpusTrainer.Config(months = months.toLong()),
+            sourceLabel = "${source.label} ${PrelabelledTrainingWindowPlan.label(months)}", onProgress = { publishProgress(it, pair.second) }, shouldCancel = { cancelRequested },
+        ) to pair.second
     }
 
     private fun runJointRawOrUpstox(source: HistoricalCorpusSource, months: Int): Pair<HistoricalCorpusTrainer.Result, UpstoxPlusHistoricalClient?> {
-        val pair = loadSeries(source, HistoricalMarketScope.BOTH, months)
-        val merged = HistoricalSeriesMerger.merge(pair.first)
+        val pair = loadSeries(source, HistoricalMarketScope.BOTH, months); val merged = HistoricalSeriesMerger.merge(pair.first)
         if (merged.none { it.index == MarketIndex.NIFTY } || merged.none { it.index == MarketIndex.SENSEX }) error("BOTH historical research requires trainable NIFTY and SENSEX option series")
-        val trained = JointHistoricalSeriesTrainer(MetaBrainRuntime.productionSnapshotForResearch()).run(
-            series = merged,
-            config = HistoricalCorpusTrainer.Config(months = months.toLong()),
-            sourceLabel = "${source.label} ${PrelabelledTrainingWindowPlan.label(months)}",
-            onProgress = { publishProgress(it, pair.second) },
-            shouldCancel = { cancelRequested },
-        )
-        return trained to pair.second
+        return JointHistoricalSeriesTrainer(MetaBrainRuntime.productionSnapshotForResearch()).run(
+            series = merged, config = HistoricalCorpusTrainer.Config(months = months.toLong()),
+            sourceLabel = "${source.label} ${PrelabelledTrainingWindowPlan.label(months)}", onProgress = { publishProgress(it, pair.second) }, shouldCancel = { cancelRequested },
+        ) to pair.second
     }
 
     private fun loadSeries(source: HistoricalCorpusSource, scope: HistoricalMarketScope, months: Int): Pair<List<HistoricalOptionSeries>, UpstoxPlusHistoricalClient?> {
-        var client: UpstoxPlusHistoricalClient? = null
-        var series = emptyList<HistoricalOptionSeries>()
-        val errors = mutableListOf<String>()
+        var client: UpstoxPlusHistoricalClient? = null; var series = emptyList<HistoricalOptionSeries>(); val errors = mutableListOf<String>()
         val markets = scope.singleIndexOrNull()?.let(::listOf) ?: MarketIndex.entries.toList()
-        if (source == HistoricalCorpusSource.LOCAL || source == HistoricalCorpusSource.COMBINED) {
+        if (source in setOf(HistoricalCorpusSource.LOCAL, HistoricalCorpusSource.COMBINED)) {
             require(months != PrelabelledTrainingWindowPlan.FULL) { "FULL raw-local streaming is not enabled" }
-            markets.forEach { index ->
-                series += localStore.loadSeriesWindow(index, months)
-                _state.value = _state.value.copy(stage = "LOCAL_READY", message = "Local ${scope.label} corpus · ${series.size} contracts streamed")
-            }
+            markets.forEach { index -> series += localStore.loadSeriesWindow(index, months); _state.value = _state.value.copy(stage = "LOCAL_READY", message = "Local ${scope.label} corpus · ${series.size} contracts streamed") }
         }
-        if (source == HistoricalCorpusSource.UPSTOX || source == HistoricalCorpusSource.COMBINED) {
-            val token = vault.read().upstoxAccessToken.trim()
-            client = UpstoxPlusHistoricalClient(accessToken = token, cacheDirectory = upstoxCacheDirectory)
+        if (source in setOf(HistoricalCorpusSource.UPSTOX, HistoricalCorpusSource.COMBINED)) {
+            val token = vault.read().upstoxAccessToken.trim(); client = UpstoxPlusHistoricalClient(accessToken = token, cacheDirectory = upstoxCacheDirectory)
             markets.forEach { index ->
-                val loaded = UpstoxCorpusSeriesLoader(client).load(
-                    index = index,
-                    months = months.toLong(),
-                    onProgress = { publishProgress(it, client) },
-                    shouldCancel = { cancelRequested },
-                )
-                series += loaded.series
-                errors += loaded.errors
+                val loaded = UpstoxCorpusSeriesLoader(client).load(index = index, months = months.toLong(), onProgress = { publishProgress(it, client) }, shouldCancel = { cancelRequested })
+                series += loaded.series; errors += loaded.errors
             }
         }
         if (errors.isNotEmpty()) _state.value = _state.value.copy(message = "${_state.value.message} · source warnings ${errors.size}")
@@ -418,22 +370,13 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
     private fun publishProgress(progress: HistoricalCorpusTrainer.Progress, client: UpstoxPlusHistoricalClient?) {
         val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats()
         _state.value = _state.value.copy(
-            isRunning = true,
-            stage = progress.stage,
-            completed = progress.completed,
-            total = progress.total,
+            isRunning = true, stage = progress.stage, completed = progress.completed, total = progress.total,
             message = if (client == null) progress.message else "${progress.message} · cache ${stats.cacheHits} · network ${stats.requests}",
-            cacheHits = stats.cacheHits,
-            networkRequests = stats.requests,
-            error = null,
+            cacheHits = stats.cacheHits, networkRequests = stats.requests, error = null,
         )
     }
 
-    fun cancel() {
-        if (job?.isActive != true) return
-        cancelRequested = true
-        _state.value = _state.value.copy(message = "Cancel requested · finishing current read safely…", importMessage = "Cancel requested…")
-    }
+    fun cancel() { if (job?.isActive == true) { cancelRequested = true; _state.value = _state.value.copy(message = "Cancel requested · finishing current read safely…", importMessage = "Cancel requested…") } }
 
     fun clearUpstoxCache() {
         if (busy()) return
@@ -441,19 +384,12 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
             .onSuccess { _state.value = _state.value.copy(cacheHits = 0, networkRequests = 0, message = "Upstox historical candle cache cleared", error = null) }
             .onFailure { _state.value = _state.value.copy(error = "Could not clear Upstox cache: ${it.message}") }
     }
-
     fun clearHistoricalCache() = clearUpstoxCache()
 
     fun clearLocalCorpus() {
         if (busy()) return
-        runCatching { prelabelledStore.clear(); localStore.clear() }
-            .onSuccess {
-                _state.value = _state.value.copy(
-                    localSummary = LocalCorpusSummary(), selectedSource = HistoricalCorpusSource.UPSTOX,
-                    message = "Local historical corpus cleared · Production/Candidate unchanged", error = null,
-                    prelabelledCorpusReady = false, prelabelledTrainRows = 0, prelabelledValidationRows = 0, prelabelledTestRows = 0,
-                )
-            }
+        runCatching { prelabelledStore.clear(); localStore.clear(); checkpointStore.clearAll() }
+            .onSuccess { _state.value = _state.value.copy(localSummary = LocalCorpusSummary(), selectedSource = HistoricalCorpusSource.UPSTOX, message = "Local corpus + incompatible training checkpoints cleared · Production/Candidate unchanged", error = null, prelabelledCorpusReady = false, prelabelledTrainRows = 0, prelabelledValidationRows = 0, prelabelledTestRows = 0, checkpointAvailable = false) }
             .onFailure { _state.value = _state.value.copy(error = "Could not clear local corpus: ${it.message}") }
     }
 
@@ -461,59 +397,45 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         if (busy()) return
         val ready = prelabelledStore.ready()
         _state.value = _state.value.copy(
-            localSummary = effectiveLocalSummary(),
-            prelabelledCorpusReady = ready,
+            localSummary = effectiveLocalSummary(), prelabelledCorpusReady = ready,
             prelabelledTrainRows = if (ready) prelabelledStore.rows(AimlHistoricalOptionCorpusV1Store.Split.TRAIN) else 0L,
             prelabelledValidationRows = if (ready) prelabelledStore.rows(AimlHistoricalOptionCorpusV1Store.Split.VALIDATION) else 0L,
             prelabelledTestRows = if (ready) prelabelledStore.rows(AimlHistoricalOptionCorpusV1Store.Split.TEST) else 0L,
+            checkpointAvailable = checkpointFor(_state.value.selectedMarketScope, _state.value.selectedMonths),
         )
     }
 
+    private fun checkpointFor(scope: HistoricalMarketScope, months: Int): Boolean = when (scope) {
+        HistoricalMarketScope.BOTH -> checkpointStore.has("joint_both", months)
+        HistoricalMarketScope.NIFTY -> checkpointStore.has("single_NIFTY", months)
+        HistoricalMarketScope.SENSEX -> checkpointStore.has("single_SENSEX", months)
+    }
     private fun effectiveLocalSummary(): LocalCorpusSummary = if (prelabelledStore.ready()) prelabelledStore.summary() else localStore.summary()
     private fun busy(): Boolean = job?.isActive == true || _state.value.isRunning || _state.value.isImporting
     private fun cancelled(error: Throwable): Boolean = cancelRequested || error is kotlinx.coroutines.CancellationException || error.message?.contains("cancel", true) == true
 
     private fun saveSummary(state: UiState) {
         val r = state.result ?: return
-        summaryPrefs.edit()
-            .putInt("months", state.selectedMonths)
-            .putString("index", state.selectedIndex.name)
-            .putString("scope", state.selectedMarketScope.name)
-            .putString("source", state.selectedSource.name)
-            .putInt("samples", r.corpusSamples)
-            .putBoolean("holdout_opened", r.lockedHoldoutOpened)
-            .putBoolean("holdout_passed", r.lockedHoldoutPassed)
-            .putBoolean("installed", state.installedCandidate)
-            .putString("message", state.message)
-            .apply()
+        summaryPrefs.edit().putInt("months", state.selectedMonths).putString("index", state.selectedIndex.name)
+            .putString("scope", state.selectedMarketScope.name).putString("source", state.selectedSource.name)
+            .putInt("samples", r.corpusSamples).putBoolean("holdout_opened", r.lockedHoldoutOpened)
+            .putBoolean("holdout_passed", r.lockedHoldoutPassed).putBoolean("installed", state.installedCandidate)
+            .putString("message", state.message).apply()
     }
 
-    override fun onCleared() {
-        cancelRequested = true
-        super.onCleared()
-    }
+    override fun onCleared() { cancelRequested = true; super.onCleared() }
 
     companion object {
         private const val PREFS = "vardhani_historical_ai_training_summary"
-
         private fun loadLastSummary(application: Application): UiState {
-            val p = application.getSharedPreferences(PREFS, 0)
-            if (!p.contains("samples")) return UiState()
+            val p = application.getSharedPreferences(PREFS, 0); if (!p.contains("samples")) return UiState()
             val index = runCatching { MarketIndex.valueOf(p.getString("index", "NIFTY") ?: "NIFTY") }.getOrDefault(MarketIndex.NIFTY)
             val scope = runCatching { HistoricalMarketScope.valueOf(p.getString("scope", null) ?: if (index == MarketIndex.NIFTY) "NIFTY" else "SENSEX") }.getOrDefault(HistoricalMarketScope.BOTH)
             val source = runCatching { HistoricalCorpusSource.valueOf(p.getString("source", "UPSTOX") ?: "UPSTOX") }.getOrDefault(HistoricalCorpusSource.UPSTOX)
             val months = p.getInt("months", 1).takeIf { it in PrelabelledTrainingWindowPlan.ALLOWED_MONTHS } ?: 1
-            val samples = p.getInt("samples", 0)
-            val passed = p.getBoolean("holdout_passed", false)
-            val installed = p.getBoolean("installed", false)
-            return UiState(
-                selectedMonths = months,
-                selectedIndex = index,
-                selectedMarketScope = scope,
-                selectedSource = source,
-                message = "Last ${source.label} ${scope.label} ${PrelabelledTrainingWindowPlan.label(months)}: $samples samples · holdout ${if (passed) "PASS" else "not passed"}${if (installed) " · Candidate installed" else ""}",
-                installedCandidate = installed,
-            )
+            val samples = p.getInt("samples", 0); val passed = p.getBoolean("holdout_passed", false); val installed = p.getBoolean("installed", false)
+            return UiState(selectedMonths = months, selectedIndex = index, selectedMarketScope = scope, selectedSource = source,
+                message = "Last ${source.label} ${scope.label} ${PrelabelledTrainingWindowPlan.label(months)}: $samples samples · holdout ${if (passed) "PASS" else "not passed"}${if (installed) " · Candidate installed" else ""}", installedCandidate = installed)
         }
     }
 }

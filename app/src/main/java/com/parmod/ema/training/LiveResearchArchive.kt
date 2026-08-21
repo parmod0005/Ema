@@ -27,9 +27,9 @@ import java.util.zip.ZipOutputStream
  * Append-only live research archive designed to survive normal APK upgrades and be
  * portable across uninstall/signature/device changes via explicit ZIP export/import.
  *
- * Raw transport is intentionally sampled to one row/second/instrument. Completed 1m
- * bars, every registered AI observation and every resolved premium outcome are stored
- * separately. Schema + app + feature versions make later migration explicit.
+ * Underlyings are sampled once/second; option research snapshots are sampled every
+ * five seconds to control phone storage. Completed 1m bars, every registered AI
+ * observation and every resolved outcome are stored separately.
  */
 object LiveResearchArchive {
     data class Summary(
@@ -84,7 +84,8 @@ object LiveResearchArchive {
         if (!initialized || instrumentKey.isBlank() || timestamp <= 0L) return
         val sampleKey = "${index.name}|$instrumentKey"
         val last = lastTickWrite[sampleKey] ?: 0L
-        if (timestamp - last < TICK_SAMPLE_MS) return
+        val interval = if (kind == "UNDERLYING") UNDERLYING_SAMPLE_MS else OPTION_SAMPLE_MS
+        if (timestamp - last < interval) return
         lastTickWrite[sampleKey] = timestamp
         val row = base("vardhani-live-tick-v$ARCHIVE_SCHEMA", timestamp)
             .put("market", index.name)
@@ -216,7 +217,6 @@ object LiveResearchArchive {
         )
     }
 
-    /** Portable backup. Caller owns the SAF/MediaStore OutputStream. */
     @Synchronized
     fun exportZip(output: OutputStream) {
         check(initialized) { "LiveResearchArchive is not initialized" }
@@ -247,11 +247,6 @@ object LiveResearchArchive {
         }
     }
 
-    /**
-     * Imports a portable archive without overwriting an existing session file. Identical
-     * files are skipped by SHA-256; conflicting files receive an imported suffix, so no
-     * older session can be silently destroyed.
-     */
     @Synchronized
     fun importZip(input: InputStream): Int {
         check(initialized) { "LiveResearchArchive is not initialized" }
@@ -344,7 +339,8 @@ object LiveResearchArchive {
     }
 
     private const val ARCHIVE_SCHEMA = 1
-    private const val TICK_SAMPLE_MS = 1_000L
+    private const val UNDERLYING_SAMPLE_MS = 1_000L
+    private const val OPTION_SAMPLE_MS = 5_000L
     private const val MAX_ARCHIVED_DEPTH = 30
     private const val MAX_IMPORT_ENTRIES = 10_000
     private const val MAX_IMPORTED_FILE_BYTES = 2L * 1024 * 1024 * 1024

@@ -1,6 +1,8 @@
 package com.parmod.ema.training
 
 import com.parmod.ema.backtest.UpstoxPlusHistoricalClient
+import com.parmod.ema.engine.NumericalMetaBrain
+import java.time.LocalDate
 import kotlin.math.max
 
 /**
@@ -36,6 +38,9 @@ object HistoricalPremiumLabeler {
         signalIndex: Int,
         lotSize: Int,
         config: Config = Config(),
+        expiry: LocalDate? = null,
+        moneynessSteps: Double = 0.0,
+        spotAtSignal: Double = 0.0,
     ): Outcome? {
         require(config.horizonBars >= 1)
         require(config.targetReturn > 0.0)
@@ -44,13 +49,33 @@ object HistoricalPremiumLabeler {
         require(config.flatRoundTripCost >= 0.0)
         if (signalIndex < 0 || signalIndex + 1 >= candles.size) return null
 
+        // Build and scope model features BEFORE any bar after signalIndex is inspected.
+        // The next NumericalMetaBrain.Features constructed on this synchronous path
+        // consumes this context exactly once.
+        val signalDate = candles[signalIndex].time.toLocalDate()
+        NumericalMetaBrain.setThreadCausalExtras(
+            CausalFeatureEngineering.fromCandles(
+                candles = candles,
+                index = signalIndex,
+                expiry = expiry ?: signalDate,
+                moneynessSteps = moneynessSteps,
+                spot = spotAtSignal,
+            ),
+        )
+
         val entryIndex = signalIndex + 1
         val rawEntry = candles[entryIndex].open
-        if (!rawEntry.isFinite() || rawEntry <= 0.0) return null
+        if (!rawEntry.isFinite() || rawEntry <= 0.0) {
+            NumericalMetaBrain.clearThreadCausalExtras()
+            return null
+        }
         val quantity = lotSize.coerceAtLeast(1)
         val lastIndex = minOf(candles.lastIndex, entryIndex + config.horizonBars - 1)
         val future = candles.subList(entryIndex, lastIndex + 1)
-        if (future.isEmpty()) return null
+        if (future.isEmpty()) {
+            NumericalMetaBrain.clearThreadCausalExtras()
+            return null
+        }
 
         val target = rawEntry * (1.0 + config.targetReturn)
         val stop = rawEntry * (1.0 - config.stopReturn)
@@ -66,7 +91,6 @@ object HistoricalPremiumLabeler {
             val stopHit = candle.low <= stop
             val targetHit = candle.high >= target
             if (stopHit) {
-                // Conservative ordering: STOP wins when the same candle also hits target.
                 reason = ExitReason.STOP
                 rawExit = stop
                 barsObserved = offset + 1

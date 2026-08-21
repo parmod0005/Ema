@@ -10,7 +10,14 @@ import com.parmod.ema.model.TrendDirection
 import kotlin.math.max
 import kotlin.math.pow
 
-/** Persistent on-device Numerical Meta Brain runtime with historical + live adaptive Candidate research. */
+/**
+ * Persistent VARDHANI numerical Meta Brain.
+ *
+ * V4 makes market identity explicit throughout live training. NIFTY spot updates can
+ * only resolve NIFTY pending labels and SENSEX updates can only resolve SENSEX labels.
+ * Dedupe/status/validation are market-scoped while Production/Candidate remain one
+ * shared numerical model with MarketIndex encoded in the feature vector.
+ */
 object MetaBrainRuntime {
     private const val HISTORICAL_PRIOR_SAMPLES = 71L
     private const val HISTORICAL_PRIOR_BIAS = 0.2001902471
@@ -38,6 +45,7 @@ object MetaBrainRuntime {
         val samples: Long,
         val modelVersion: Long,
         val lastUpdated: Long,
+        val market: MarketIndex = MarketIndex.NIFTY,
     )
 
     data class ValidationStats(
@@ -74,6 +82,8 @@ object MetaBrainRuntime {
         val hyperParameters: NumericalMetaBrain.HyperParameters = profile.hyper,
         val adaptiveGeneration: Int = 0,
         val adaptive: Boolean = false,
+        val niftyLabels: Long = 0L,
+        val sensexLabels: Long = 0L,
     ) {
         val displayName: String
             get() = if (adaptive) "Adaptive G$adaptiveGeneration · ${profile.title}" else profile.title
@@ -103,9 +113,12 @@ object MetaBrainRuntime {
         val candidateGeneration: Int,
         val bestArchivedScore: Double?,
         val candidateOrigin: String,
+        val validationByMarket: Map<MarketIndex, ValidationStats> = emptyMap(),
+        val pendingByMarket: Map<MarketIndex, Int> = emptyMap(),
     )
 
     private data class Pending(
+        val index: MarketIndex,
         val features: NumericalMetaBrain.Features,
         val productionPrediction: NumericalMetaBrain.Prediction,
         val candidatePrediction: NumericalMetaBrain.Prediction,
@@ -120,9 +133,13 @@ object MetaBrainRuntime {
     private val candidate = newHistoricalBrain()
     private var rollbackState: NumericalMetaBrain.ModelState? = null
     private var validation = ValidationStats()
+    private val validationByMarket = mutableMapOf(
+        MarketIndex.NIFTY to ValidationStats(),
+        MarketIndex.SENSEX to ValidationStats(),
+    )
     private val pending = linkedMapOf<String, Pending>()
     private val lastRegistered = mutableMapOf<String, Long>()
-    private val statusByEngine = mutableMapOf<EngineId, Status>()
+    private val statusByMarketEngine = mutableMapOf<Pair<MarketIndex, EngineId>, Status>()
     private val candidateHistory = mutableListOf<CandidateResult>()
     private var activeProfile = CandidateProfile.BALANCED
     private var activeHyper = CandidateProfile.BALANCED.hyper
@@ -151,17 +168,9 @@ object MetaBrainRuntime {
         readModel(prefs.getString(KEY_PRODUCTION, null))?.let { production.restore(it) }
         readModel(prefs.getString(KEY_CANDIDATE, null))?.let { candidate.restore(it) }
         readModel(prefs.getString(KEY_ROLLBACK, null))?.let { rollbackState = it }
-        validation = ValidationStats(
-            labels = prefs.getLong("v_labels", 0L),
-            productionCorrect = prefs.getLong("v_pc", 0L),
-            candidateCorrect = prefs.getLong("v_cc", 0L),
-            productionBrierSum = prefs.getString("v_pb", null)?.toDoubleOrNull() ?: 0.0,
-            candidateBrierSum = prefs.getString("v_cb", null)?.toDoubleOrNull() ?: 0.0,
-            candidateTake = prefs.getLong("v_take", 0L),
-            candidateTakeWins = prefs.getLong("v_take_w", 0L),
-            candidateReject = prefs.getLong("v_reject", 0L),
-            candidateRejectLosses = prefs.getLong("v_reject_l", 0L),
-        )
+        validation = readValidation(prefs, "v")
+        validationByMarket[MarketIndex.NIFTY] = readValidation(prefs, "v_nifty")
+        validationByMarket[MarketIndex.SENSEX] = readValidation(prefs, "v_sensex")
         activeProfile = runCatching { CandidateProfile.valueOf(prefs.getString(KEY_PROFILE, null) ?: "BALANCED") }
             .getOrDefault(CandidateProfile.BALANCED)
         activeAdaptive = prefs.getBoolean(KEY_ACTIVE_ADAPTIVE, false)
@@ -181,18 +190,34 @@ object MetaBrainRuntime {
         initialized = true
     }
 
+    /** Clears all transient live labels. Model weights and validation remain intact. */
     @Synchronized
     fun resetSession() {
         pending.clear()
         lastRegistered.clear()
     }
 
+    /** Clears only one market's transient state, preserving the other market. */
     @Synchronized
-    fun observeSpot(price: Double, timestamp: Long) {
-        if (price <= 0.0) return
-        val iterator = pending.values.iterator()
+    fun resetSession(index: MarketIndex) {
+        pending.entries.removeAll { it.value.index == index }
+        val prefix = "${index.name}:"
+        lastRegistered.keys.removeAll { it.startsWith(prefix) }
+    }
+
+    /** Legacy single-market overload retained for existing UI code. */
+    @Synchronized
+    fun observeSpot(price: Double, timestamp: Long) = observeSpot(inferMarket(price), price, timestamp)
+
+    /** Resolve only labels belonging to the supplied market. */
+    @Synchronized
+    fun observeSpot(index: MarketIndex, price: Double, timestamp: Long) {
+        if (price <= 0.0 || timestamp <= 0L) return
+        val iterator = pending.entries.iterator()
         while (iterator.hasNext()) {
-            val p = iterator.next()
+            val entry = iterator.next()
+            val p = entry.value
+            if (p.index != index || timestamp < p.createdAt) continue
             val sign = if (p.side == PositionSide.CE) 1.0 else -1.0
             val directional = sign * (price - p.entrySpot) / max(p.entrySpot, 1.0)
             p.bestDirectionalReturn = max(p.bestDirectionalReturn, directional)
@@ -207,39 +232,56 @@ object MetaBrainRuntime {
                     failureBarrier -> false
                     else -> directional >= TIMEOUT_SUCCESS_RETURN
                 }
-                scoreUnseenLabel(p.productionPrediction, p.candidatePrediction, success)
+                scoreUnseenLabel(index, p.productionPrediction, p.candidatePrediction, success)
                 candidate.learn(p.features, success, if (successBarrier || failureBarrier) 1.25 else 0.75)
                 labelsSinceSave++
                 iterator.remove()
-                if (labelsSinceSave >= AUTO_SAVE_EVERY_LABELS) saveLocked()
             }
         }
+        if (labelsSinceSave >= AUTO_SAVE_EVERY_LABELS) saveLocked()
         maybeAutoRotateCandidate()
     }
 
-    private fun scoreUnseenLabel(prod: NumericalMetaBrain.Prediction, cand: NumericalMetaBrain.Prediction, success: Boolean) {
+    private fun scoreUnseenLabel(
+        index: MarketIndex,
+        prod: NumericalMetaBrain.Prediction,
+        cand: NumericalMetaBrain.Prediction,
+        success: Boolean,
+    ) {
+        validation = addValidation(validation, prod, cand, success)
+        validationByMarket[index] = addValidation(validationByMarket[index] ?: ValidationStats(), prod, cand, success)
+    }
+
+    private fun addValidation(
+        current: ValidationStats,
+        prod: NumericalMetaBrain.Prediction,
+        cand: NumericalMetaBrain.Prediction,
+        success: Boolean,
+    ): ValidationStats {
         val y = if (success) 1.0 else 0.0
         val pc = predictedClass(prod.probabilitySuccess) == success
         val cc = predictedClass(cand.probabilitySuccess) == success
         val candTake = cand.decision == NumericalMetaBrain.Decision.TAKE
         val candReject = cand.decision == NumericalMetaBrain.Decision.REJECT
-        validation = validation.copy(
-            labels = validation.labels + 1,
-            productionCorrect = validation.productionCorrect + if (pc) 1 else 0,
-            candidateCorrect = validation.candidateCorrect + if (cc) 1 else 0,
-            productionBrierSum = validation.productionBrierSum + (prod.probabilitySuccess - y).pow(2),
-            candidateBrierSum = validation.candidateBrierSum + (cand.probabilitySuccess - y).pow(2),
-            candidateTake = validation.candidateTake + if (candTake) 1 else 0,
-            candidateTakeWins = validation.candidateTakeWins + if (candTake && success) 1 else 0,
-            candidateReject = validation.candidateReject + if (candReject) 1 else 0,
-            candidateRejectLosses = validation.candidateRejectLosses + if (candReject && !success) 1 else 0,
+        return current.copy(
+            labels = current.labels + 1,
+            productionCorrect = current.productionCorrect + if (pc) 1 else 0,
+            candidateCorrect = current.candidateCorrect + if (cc) 1 else 0,
+            productionBrierSum = current.productionBrierSum + (prod.probabilitySuccess - y).pow(2),
+            candidateBrierSum = current.candidateBrierSum + (cand.probabilitySuccess - y).pow(2),
+            candidateTake = current.candidateTake + if (candTake) 1 else 0,
+            candidateTakeWins = current.candidateTakeWins + if (candTake && success) 1 else 0,
+            candidateReject = current.candidateReject + if (candReject) 1 else 0,
+            candidateRejectLosses = current.candidateRejectLosses + if (candReject && !success) 1 else 0,
         )
     }
 
     private fun predictedClass(p: Double): Boolean = p >= 0.50
 
+    /** Explicit-market entry point used by dual-market live research. */
     @Synchronized
     fun decorate(
+        index: MarketIndex,
         engine: EngineId,
         raw: SignalSnapshot,
         spot: Double,
@@ -263,32 +305,54 @@ object MetaBrainRuntime {
             raw.trend == TrendDirection.BEARISH -> PositionSide.PE
             else -> return raw
         }
-        val index = if (spot >= SENSEX_SPOT_CUTOFF) MarketIndex.SENSEX else MarketIndex.NIFTY
+        if (spot <= 0.0 || timestamp <= 0L) return raw
         val features = NumericalMetaBrain.Features(
-            engine, index, side, raw.confidence.toDouble(),
-            directionScore.coerceIn(0.0, 60.0), entryQualityScore.coerceIn(0.0, 40.0),
-            orderFlow, relativeActivity, oiImpulse, optionFlow, acceleration, extensionAtr,
-            depthImbalance, micropricePressure, totalBookPressure, wallPressure, depthLevels,
-            minutesFromOpen(timestamp), 50.0, 1.0,
+            engine = engine,
+            index = index,
+            side = side,
+            engineConfidence = raw.confidence.toDouble(),
+            directionScore = directionScore.coerceIn(0.0, 60.0),
+            entryQualityScore = entryQualityScore.coerceIn(0.0, 40.0),
+            orderFlow = orderFlow,
+            relativeActivity = relativeActivity,
+            oiImpulse = oiImpulse,
+            optionFlow = optionFlow,
+            acceleration = acceleration,
+            extensionAtr = extensionAtr,
+            depthImbalance = depthImbalance,
+            micropricePressure = micropricePressure,
+            totalBookPressure = totalBookPressure,
+            wallPressure = wallPressure,
+            depthLevels = depthLevels,
+            minutesFromOpen = minutesFromOpen(timestamp),
+            recentEngineWinRate = 50.0,
+            recentEngineProfitFactor = 1.0,
         )
         val prodPrediction = production.predict(features)
         val candPrediction = candidate.predict(features)
-        statusByEngine[engine] = Status(
-            engine, candPrediction.confidence, candPrediction.decision,
-            candPrediction.samplesLearned, candPrediction.modelVersion, timestamp,
+        statusByMarketEngine[index to engine] = Status(
+            engine = engine,
+            probability = candPrediction.confidence,
+            decision = candPrediction.decision,
+            samples = candPrediction.samplesLearned,
+            modelVersion = candPrediction.modelVersion,
+            lastUpdated = timestamp,
+            market = index,
         )
 
-        if (raw.confidence >= CANDIDATE_CONFIDENCE && spot > 0.0) {
-            val dedupeKey = "${engine.name}:${side.name}"
+        if (raw.confidence >= CANDIDATE_CONFIDENCE) {
+            val dedupeKey = "${index.name}:${engine.name}:${side.name}"
             val last = lastRegistered[dedupeKey] ?: 0L
             if (timestamp - last >= CANDIDATE_DEDUPE_MS) {
                 lastRegistered[dedupeKey] = timestamp
-                pending["$dedupeKey:$timestamp"] = Pending(features, prodPrediction, candPrediction, side, spot, timestamp)
-                while (pending.size > MAX_PENDING) pending.remove(pending.keys.first())
+                pending["$dedupeKey:$timestamp"] = Pending(
+                    index, features, prodPrediction, candPrediction, side, spot, timestamp,
+                )
+                trimPending(index)
             }
         }
 
-        val metaReason = "META ${if (gateEnabled) "GATE" else "SHADOW"} ${candPrediction.confidence}% ${candPrediction.decision.name} · ${candidateName()} · learned ${candPrediction.samplesLearned}"
+        val metaReason = "META ${if (gateEnabled) "GATE" else "SHADOW"} ${index.name} ${candPrediction.confidence}% ${candPrediction.decision.name} · ${candidateName()} · learned ${candPrediction.samplesLearned}"
         var decorated = raw.copy(
             reasons = (raw.reasons + metaReason).takeLast(10),
             setup = "${raw.setup} · AI ${candPrediction.confidence}%",
@@ -303,13 +367,55 @@ object MetaBrainRuntime {
                 stopLoss = null,
                 target = null,
                 setup = "${raw.setup} · AI GATE REJECT ${prodPrediction.confidence}%",
-                reasons = (decorated.reasons + "Production meta-model rejected candidate; downstream re-arm blocked").takeLast(10),
+                reasons = (decorated.reasons + "Production meta-model rejected ${index.name} candidate; downstream re-arm blocked").takeLast(10),
             )
         }
         return decorated
     }
 
-    @Synchronized fun status(engine: EngineId): Status? = statusByEngine[engine]
+    /** Legacy overload. New research code must pass MarketIndex explicitly. */
+    @Synchronized
+    fun decorate(
+        engine: EngineId,
+        raw: SignalSnapshot,
+        spot: Double,
+        timestamp: Long,
+        directionScore: Double,
+        entryQualityScore: Double,
+        orderFlow: Double = 0.0,
+        relativeActivity: Double = 1.0,
+        oiImpulse: Double = 0.0,
+        optionFlow: Double = 0.0,
+        acceleration: Double = 0.0,
+        extensionAtr: Double = 0.0,
+        depthImbalance: Double = 0.0,
+        micropricePressure: Double = 0.0,
+        totalBookPressure: Double = 0.0,
+        wallPressure: Double = 0.0,
+        depthLevels: Double = 0.0,
+    ): SignalSnapshot = decorate(
+        index = inferMarket(spot), engine = engine, raw = raw, spot = spot, timestamp = timestamp,
+        directionScore = directionScore, entryQualityScore = entryQualityScore, orderFlow = orderFlow,
+        relativeActivity = relativeActivity, oiImpulse = oiImpulse, optionFlow = optionFlow,
+        acceleration = acceleration, extensionAtr = extensionAtr, depthImbalance = depthImbalance,
+        micropricePressure = micropricePressure, totalBookPressure = totalBookPressure,
+        wallPressure = wallPressure, depthLevels = depthLevels,
+    )
+
+    private fun trimPending(index: MarketIndex) {
+        while (pending.values.count { it.index == index } > MAX_PENDING_PER_MARKET) {
+            val key = pending.entries.firstOrNull { it.value.index == index }?.key ?: break
+            pending.remove(key)
+        }
+        while (pending.size > MAX_PENDING_TOTAL) pending.remove(pending.keys.first())
+    }
+
+    @Synchronized
+    fun status(engine: EngineId): Status? = statusByMarketEngine.values
+        .filter { it.engine == engine }
+        .maxByOrNull { it.lastUpdated }
+
+    @Synchronized fun status(index: MarketIndex, engine: EngineId): Status? = statusByMarketEngine[index to engine]
     @Synchronized fun availableProfiles(): List<CandidateProfile> = CandidateProfile.entries.toList()
     @Synchronized fun productionSnapshotForResearch(): NumericalMetaBrain.ModelState = production.snapshot()
 
@@ -319,15 +425,12 @@ object MetaBrainRuntime {
         activeHyper = AdaptiveCandidateSearch.bounded(state.hyperParameters)
         activeAdaptive = false
         activeAdaptiveGeneration = 0
-        candidateOrigin = label.trim().take(96).ifBlank { "Historical WF Champion" }
+        candidateOrigin = label.trim().take(120).ifBlank { "Historical WF Champion" }
         candidate.restore(state.copy(mode = NumericalMetaBrain.Mode.SHADOW, hyperParameters = activeHyper))
-        validation = ValidationStats()
-        pending.clear()
-        lastRegistered.clear()
-        labelsSinceSave = 0
+        resetLiveValidation()
         autoSearchEnabled = false
         saveLocked()
-        return true to "$candidateOrigin installed as Candidate only · collect fresh live unseen labels before promotion"
+        return true to "$candidateOrigin installed as Candidate only · collect fresh NIFTY + SENSEX unseen labels before promotion"
     }
 
     @Synchronized
@@ -335,6 +438,8 @@ object MetaBrainRuntime {
         val (eligible, reason) = promotionEligibility()
         val ps = production.snapshot()
         val cs = candidate.snapshot()
+        val byMarket = MarketIndex.entries.associateWith { validationByMarket[it] ?: ValidationStats() }
+        val pendingCounts = MarketIndex.entries.associateWith { market -> pending.values.count { it.index == market } }
         return LabReport(
             initialized = initialized,
             persistent = appContext != null,
@@ -359,6 +464,8 @@ object MetaBrainRuntime {
             candidateGeneration = activeAdaptiveGeneration,
             bestArchivedScore = robustParent()?.score,
             candidateOrigin = candidateOrigin,
+            validationByMarket = byMarket,
+            pendingByMarket = pendingCounts,
         )
     }
 
@@ -369,7 +476,7 @@ object MetaBrainRuntime {
         autoSearchEnabled = enabled
         saveLocked()
         return true to if (enabled) {
-            "Adaptive candidate search enabled · failures will evolve around the best archived candidate"
+            "Adaptive candidate search enabled · evaluation waits for balanced NIFTY + SENSEX live evidence"
         } else {
             "Adaptive candidate search disabled"
         }
@@ -418,7 +525,13 @@ object MetaBrainRuntime {
                 hyperParameters = activeHyper,
             ),
         )
+        resetLiveValidation()
+    }
+
+    private fun resetLiveValidation() {
         validation = ValidationStats()
+        validationByMarket[MarketIndex.NIFTY] = ValidationStats()
+        validationByMarket[MarketIndex.SENSEX] = ValidationStats()
         pending.clear()
         lastRegistered.clear()
         labelsSinceSave = 0
@@ -441,12 +554,17 @@ object MetaBrainRuntime {
         resetCandidateFromProduction(activeHyper)
         saveLocked()
         val source = parent?.displayName ?: "${parentProfile.title} seed"
-        return true to "Started ${candidateName()} around best parent $source · Production remains frozen"
+        return true to "Started ${candidateName()} around best dual-market parent $source · Production remains frozen"
     }
 
     private fun robustParent(): CandidateResult? {
+        val balanced = candidateHistory.filter {
+            it.labels >= MIN_VALIDATION_LABELS &&
+                it.niftyLabels >= MIN_MARKET_VALIDATION_LABELS &&
+                it.sensexLabels >= MIN_MARKET_VALIDATION_LABELS
+        }
         val validated = candidateHistory.filter { it.labels >= MIN_VALIDATION_LABELS }
-        return (validated.ifEmpty { candidateHistory }).maxByOrNull { it.score }
+        return (balanced.ifEmpty { validated.ifEmpty { candidateHistory } }).maxByOrNull { it.score }
     }
 
     private fun candidateName(): String = when {
@@ -458,10 +576,14 @@ object MetaBrainRuntime {
     private fun archiveCurrentCandidate() {
         if (validation.labels <= 0) return
         val (passed, _) = promotionEligibility()
+        val nifty = validationByMarket[MarketIndex.NIFTY] ?: ValidationStats()
+        val sensex = validationByMarket[MarketIndex.SENSEX] ?: ValidationStats()
+        val balancePenalty = if (validation.labels <= 0) 0.0 else
+            kotlin.math.abs(nifty.labels - sensex.labels).toDouble() / validation.labels * 0.08
         val score = (validation.candidateAccuracy - validation.productionAccuracy) +
             (validation.productionBrier - validation.candidateBrier) +
             0.20 * (validation.takePrecision - 0.50) +
-            0.10 * (validation.rejectPrecision - 0.50)
+            0.10 * (validation.rejectPrecision - 0.50) - balancePenalty
         candidateHistory += CandidateResult(
             finishedAt = System.currentTimeMillis(),
             profile = activeProfile,
@@ -477,12 +599,14 @@ object MetaBrainRuntime {
             hyperParameters = candidate.snapshot().hyperParameters,
             adaptiveGeneration = activeAdaptiveGeneration,
             adaptive = activeAdaptive,
+            niftyLabels = nifty.labels,
+            sensexLabels = sensex.labels,
         )
         while (candidateHistory.size > MAX_HISTORY) candidateHistory.removeAt(0)
     }
 
     private fun maybeAutoRotateCandidate() {
-        if (!autoSearchEnabled || validation.labels < AUTO_EVALUATE_LABELS) return
+        if (!autoSearchEnabled || !enoughBalancedEvidenceForEvaluation()) return
         val (eligible, _) = promotionEligibility()
         if (eligible) {
             autoSearchEnabled = false
@@ -490,6 +614,11 @@ object MetaBrainRuntime {
         } else {
             startAdaptiveCandidate(archiveCurrent = true)
         }
+    }
+
+    private fun enoughBalancedEvidenceForEvaluation(): Boolean {
+        if (validation.labels < AUTO_EVALUATE_LABELS) return false
+        return MarketIndex.entries.all { (validationByMarket[it]?.labels ?: 0L) >= MIN_MARKET_VALIDATION_LABELS }
     }
 
     @Synchronized
@@ -500,12 +629,10 @@ object MetaBrainRuntime {
         rollbackState = production.snapshot()
         production.restore(candidate.snapshot().copy(mode = if (gateEnabled) NumericalMetaBrain.Mode.GATE else NumericalMetaBrain.Mode.SHADOW))
         lastPromotedAt = System.currentTimeMillis()
-        validation = ValidationStats()
-        pending.clear()
-        lastRegistered.clear()
+        resetLiveValidation()
         autoSearchEnabled = false
         saveLocked()
-        return true to "${candidateName()} promoted to frozen production model"
+        return true to "${candidateName()} promoted to frozen production model after balanced NIFTY + SENSEX validation"
     }
 
     @Synchronized
@@ -536,25 +663,56 @@ object MetaBrainRuntime {
     }
 
     private fun promotionEligibility(): Pair<Boolean, String> {
-        if (validation.labels < MIN_VALIDATION_LABELS) return false to "Need ${MIN_VALIDATION_LABELS - validation.labels} more unseen labels"
+        if (validation.labels < MIN_VALIDATION_LABELS) {
+            return false to "Need ${MIN_VALIDATION_LABELS - validation.labels} more total unseen live labels"
+        }
+        for (market in MarketIndex.entries) {
+            val m = validationByMarket[market] ?: ValidationStats()
+            if (m.labels < MIN_MARKET_VALIDATION_LABELS) {
+                return false to "${market.name} needs ${MIN_MARKET_VALIDATION_LABELS - m.labels} more unseen labels"
+            }
+            if (m.candidateTake < MIN_MARKET_ACTION_SAMPLES) {
+                return false to "${market.name} needs ${MIN_MARKET_ACTION_SAMPLES - m.candidateTake} more TAKE decisions"
+            }
+            if (m.candidateReject < MIN_MARKET_ACTION_SAMPLES) {
+                return false to "${market.name} needs ${MIN_MARKET_ACTION_SAMPLES - m.candidateReject} more REJECT decisions"
+            }
+            if (m.takePrecision < MIN_MARKET_ACTION_PRECISION) {
+                return false to "${market.name} TAKE precision ${pct(m.takePrecision)} below ${pct(MIN_MARKET_ACTION_PRECISION)}"
+            }
+            if (m.rejectPrecision < MIN_MARKET_ACTION_PRECISION) {
+                return false to "${market.name} REJECT precision ${pct(m.rejectPrecision)} below ${pct(MIN_MARKET_ACTION_PRECISION)}"
+            }
+            val marketAccGain = m.candidateAccuracy - m.productionAccuracy
+            val marketBrierGain = m.productionBrier - m.candidateBrier
+            if (marketAccGain < -MAX_MARKET_ACCURACY_REGRESSION && marketBrierGain < -MAX_MARKET_BRIER_REGRESSION) {
+                return false to "${market.name} candidate materially regresses Production"
+            }
+        }
+        if (validation.candidateTake < MIN_ACTION_SAMPLES) {
+            return false to "Need ${MIN_ACTION_SAMPLES - validation.candidateTake} more TAKE decisions"
+        }
+        if (validation.candidateReject < MIN_ACTION_SAMPLES) {
+            return false to "Need ${MIN_ACTION_SAMPLES - validation.candidateReject} more REJECT decisions"
+        }
         val accuracyGain = validation.candidateAccuracy - validation.productionAccuracy
         val brierGain = validation.productionBrier - validation.candidateBrier
         if (accuracyGain < MIN_ACCURACY_GAIN && brierGain < MIN_BRIER_GAIN) {
-            return false to "Candidate has not beaten production accuracy/calibration"
+            return false to "Candidate has not beaten Production accuracy/calibration"
         }
-        if (validation.candidateTake >= MIN_ACTION_SAMPLES && validation.takePrecision < MIN_TAKE_PRECISION) {
+        if (validation.takePrecision < MIN_TAKE_PRECISION) {
             return false to "TAKE precision ${pct(validation.takePrecision)} below ${pct(MIN_TAKE_PRECISION)}"
         }
-        if (validation.candidateReject >= MIN_ACTION_SAMPLES && validation.rejectPrecision < MIN_REJECT_PRECISION) {
+        if (validation.rejectPrecision < MIN_REJECT_PRECISION) {
             return false to "REJECT precision ${pct(validation.rejectPrecision)} below ${pct(MIN_REJECT_PRECISION)}"
         }
-        return true to "PASS · candidate beats frozen production on unseen live labels"
+        return true to "PASS · balanced NIFTY + SENSEX Candidate beats frozen Production on unseen live labels"
     }
 
     private fun saveLocked(): Boolean {
         val prefs = prefs() ?: return false
         val now = System.currentTimeMillis()
-        prefs.edit()
+        val edit = prefs.edit()
             .putString(KEY_PRODUCTION, writeModel(production.snapshot()))
             .putString(KEY_CANDIDATE, writeModel(candidate.snapshot()))
             .putString(KEY_ROLLBACK, rollbackState?.let(::writeModel))
@@ -569,19 +727,41 @@ object MetaBrainRuntime {
             .putBoolean(KEY_GATE, gateEnabled)
             .putLong(KEY_LAST_SAVE, now)
             .putLong(KEY_LAST_PROMOTE, lastPromotedAt)
-            .putLong("v_labels", validation.labels)
-            .putLong("v_pc", validation.productionCorrect)
-            .putLong("v_cc", validation.candidateCorrect)
-            .putString("v_pb", validation.productionBrierSum.toString())
-            .putString("v_cb", validation.candidateBrierSum.toString())
-            .putLong("v_take", validation.candidateTake)
-            .putLong("v_take_w", validation.candidateTakeWins)
-            .putLong("v_reject", validation.candidateReject)
-            .putLong("v_reject_l", validation.candidateRejectLosses)
-            .apply()
+        writeValidation(edit, "v", validation)
+        writeValidation(edit, "v_nifty", validationByMarket[MarketIndex.NIFTY] ?: ValidationStats())
+        writeValidation(edit, "v_sensex", validationByMarket[MarketIndex.SENSEX] ?: ValidationStats())
+        edit.apply()
         lastSavedAt = now
         labelsSinceSave = 0
         return true
+    }
+
+    private fun readValidation(prefs: android.content.SharedPreferences, prefix: String): ValidationStats = ValidationStats(
+        labels = prefs.getLong("${prefix}_labels", 0L),
+        productionCorrect = prefs.getLong("${prefix}_pc", 0L),
+        candidateCorrect = prefs.getLong("${prefix}_cc", 0L),
+        productionBrierSum = prefs.getString("${prefix}_pb", null)?.toDoubleOrNull() ?: 0.0,
+        candidateBrierSum = prefs.getString("${prefix}_cb", null)?.toDoubleOrNull() ?: 0.0,
+        candidateTake = prefs.getLong("${prefix}_take", 0L),
+        candidateTakeWins = prefs.getLong("${prefix}_take_w", 0L),
+        candidateReject = prefs.getLong("${prefix}_reject", 0L),
+        candidateRejectLosses = prefs.getLong("${prefix}_reject_l", 0L),
+    )
+
+    private fun writeValidation(
+        edit: android.content.SharedPreferences.Editor,
+        prefix: String,
+        v: ValidationStats,
+    ) {
+        edit.putLong("${prefix}_labels", v.labels)
+            .putLong("${prefix}_pc", v.productionCorrect)
+            .putLong("${prefix}_cc", v.candidateCorrect)
+            .putString("${prefix}_pb", v.productionBrierSum.toString())
+            .putString("${prefix}_cb", v.candidateBrierSum.toString())
+            .putLong("${prefix}_take", v.candidateTake)
+            .putLong("${prefix}_take_w", v.candidateTakeWins)
+            .putLong("${prefix}_reject", v.candidateReject)
+            .putLong("${prefix}_reject_l", v.candidateRejectLosses)
     }
 
     private fun prefs() = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -644,7 +824,7 @@ object MetaBrainRuntime {
                 r.takePrecision, r.rejectPrecision, r.passed, r.score,
                 r.hyperParameters.learningRate, r.hyperParameters.l2,
                 r.hyperParameters.takeThreshold, r.hyperParameters.rejectThreshold,
-                r.adaptiveGeneration, r.adaptive,
+                r.adaptiveGeneration, r.adaptive, r.niftyLabels, r.sensexLabels,
             ).joinToString(",")
         }
 
@@ -676,6 +856,8 @@ object MetaBrainRuntime {
                     hyperParameters = hyper,
                     adaptiveGeneration = if (p.size >= 17) p[15].toInt() else 0,
                     adaptive = if (p.size >= 17) p[16].toBoolean() else false,
+                    niftyLabels = if (p.size >= 19) p[17].toLong() else 0L,
+                    sensexLabels = if (p.size >= 19) p[18].toLong() else 0L,
                 )
             }.getOrNull()
         }
@@ -686,6 +868,9 @@ object MetaBrainRuntime {
         val ist = (totalMinutesUtc + 330L) % (24L * 60L)
         return (ist - (9L * 60L + 15L)).coerceAtLeast(0L).toDouble()
     }
+
+    private fun inferMarket(spot: Double): MarketIndex =
+        if (spot >= SENSEX_SPOT_CUTOFF) MarketIndex.SENSEX else MarketIndex.NIFTY
 
     private fun pct(v: Double) = "%.1f%%".format(v * 100.0)
 
@@ -711,14 +896,20 @@ object MetaBrainRuntime {
     private const val SUCCESS_RETURN = 0.0012
     private const val FAILURE_RETURN = 0.0008
     private const val TIMEOUT_SUCCESS_RETURN = 0.00045
-    private const val MAX_PENDING = 256
+    private const val MAX_PENDING_PER_MARKET = 256
+    private const val MAX_PENDING_TOTAL = 512
     private const val AUTO_SAVE_EVERY_LABELS = 5
     private const val AUTO_EVALUATE_LABELS = 150L
     private const val MAX_HISTORY = 24
-    private const val MIN_VALIDATION_LABELS = 100L
-    private const val MIN_ACTION_SAMPLES = 15L
+    private const val MIN_VALIDATION_LABELS = 150L
+    private const val MIN_MARKET_VALIDATION_LABELS = 50L
+    private const val MIN_ACTION_SAMPLES = 20L
+    private const val MIN_MARKET_ACTION_SAMPLES = 5L
     private const val MIN_ACCURACY_GAIN = 0.015
     private const val MIN_BRIER_GAIN = 0.005
     private const val MIN_TAKE_PRECISION = 0.55
     private const val MIN_REJECT_PRECISION = 0.55
+    private const val MIN_MARKET_ACTION_PRECISION = 0.50
+    private const val MAX_MARKET_ACCURACY_REGRESSION = 0.01
+    private const val MAX_MARKET_BRIER_REGRESSION = 0.003
 }

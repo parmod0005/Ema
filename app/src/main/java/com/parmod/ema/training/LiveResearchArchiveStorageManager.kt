@@ -105,16 +105,27 @@ class LiveResearchArchiveStorageManager(context: Context) {
                 if (!date.isBefore(cutoff)) return@forEach
                 val manifest = readManifest(session) ?: return@forEach
                 if (!manifest.optBoolean("verified", false) || manifest.optBoolean("high_value", false)) return@forEach
-                if (!File(session, LiveArchiveTrainingStore.COMPACT_FILE).isFile) return@forEach
+                val compactFile = File(session, LiveArchiveTrainingStore.COMPACT_FILE)
+                if (!compactFile.isFile || manifest.optString("compact_sha256") != sha256(compactFile)) return@forEach
+                if (manifest.optString("observation_sources_sha256") != sourceSetHash(session, "observations")) return@forEach
+                if (manifest.optString("outcome_sources_sha256") != sourceSetHash(session, "outcomes")) return@forEach
+
+                var sessionPruned = false
                 session.listFiles()?.filter { it.isFile && it.name.startsWith("ticks") && (it.name.endsWith(".ndjson.gz") || it.name.endsWith(".ndjson")) }?.forEach { raw ->
-                    if (raw.delete()) { pruned++; prefs.edit().putLong(KEY_PRUNED, prefs.getLong(KEY_PRUNED, 0L) + 1L).apply() }
+                    if (raw.delete()) {
+                        pruned++
+                        sessionPruned = true
+                        prefs.edit().putLong(KEY_PRUNED, prefs.getLong(KEY_PRUNED, 0L) + 1L).apply()
+                    }
                 }
-                if (pruned > 0) updateManifestPruned(session)
-                bytes = archiveBytes(); free = archiveRoot().usableSpace
+                if (sessionPruned) updateManifestPruned(session)
+                bytes = archiveBytes()
+                free = archiveRoot().usableSpace
             }
         }
 
-        bytes = archiveBytes(); free = archiveRoot().usableSpace
+        bytes = archiveBytes()
+        free = archiveRoot().usableSpace
         val rawEnabled = bytes <= p.quotaBytes && (free <= 0L || free >= p.minimumFreeBytes)
         val message = when {
             !rawEnabled && free in 1 until p.minimumFreeBytes -> "STORAGE PROTECTION ACTIVE · raw tick/D30 capture paused; compact labels/outcomes continue"
@@ -129,7 +140,8 @@ class LiveResearchArchiveStorageManager(context: Context) {
     }
 
     fun status(): Status {
-        val p = policy(); val root = archiveRoot()
+        val p = policy()
+        val root = archiveRoot()
         return Status(
             policy = p,
             archiveBytes = archiveBytes(),
@@ -150,7 +162,15 @@ class LiveResearchArchiveStorageManager(context: Context) {
     private fun ensureTrainingCompact(session: File): CompactResult {
         val existing = readManifest(session)
         val compactFile = File(session, LiveArchiveTrainingStore.COMPACT_FILE)
-        if (existing?.optBoolean("verified", false) == true && compactFile.isFile && existing.optString("compact_sha256") == sha256(compactFile)) {
+        val currentObservationHash = sourceSetHash(session, "observations")
+        val currentOutcomeHash = sourceSetHash(session, "outcomes")
+        if (
+            existing?.optBoolean("verified", false) == true &&
+            compactFile.isFile &&
+            existing.optString("compact_sha256") == sha256(compactFile) &&
+            existing.optString("observation_sources_sha256") == currentObservationHash &&
+            existing.optString("outcome_sources_sha256") == currentOutcomeHash
+        ) {
             return CompactResult(false, true, existing.optLong("records"), existing.optBoolean("high_value"))
         }
 
@@ -160,7 +180,8 @@ class LiveResearchArchiveStorageManager(context: Context) {
         if (temp.exists()) temp.delete()
         GZIPOutputStream(BufferedOutputStream(FileOutputStream(temp), BUFFER)).bufferedWriter(Charsets.UTF_8, BUFFER).use { writer ->
             records.forEach { r ->
-                val features = org.json.JSONArray(); r.vector.forEach(features::put)
+                val features = org.json.JSONArray()
+                r.vector.forEach(features::put)
                 writer.append(
                     JSONObject()
                         .put("schema", LiveArchiveTrainingStore.COMPACT_SCHEMA)
@@ -175,9 +196,18 @@ class LiveResearchArchiveStorageManager(context: Context) {
             }
         }
         val verifiedCount = countGzipLines(temp)
-        if (verifiedCount != records.size.toLong()) { temp.delete(); return CompactResult(false, false, 0L, false) }
-        if (compactFile.exists() && !compactFile.delete()) { temp.delete(); return CompactResult(false, false, 0L, false) }
-        if (!temp.renameTo(compactFile)) { temp.delete(); return CompactResult(false, false, 0L, false) }
+        if (verifiedCount != records.size.toLong()) {
+            temp.delete()
+            return CompactResult(false, false, 0L, false)
+        }
+        if (compactFile.exists() && !compactFile.delete()) {
+            temp.delete()
+            return CompactResult(false, false, 0L, false)
+        }
+        if (!temp.renameTo(compactFile)) {
+            temp.delete()
+            return CompactResult(false, false, 0L, false)
+        }
 
         val high = isHighValue(records)
         val manifest = JSONObject()
@@ -187,8 +217,8 @@ class LiveResearchArchiveStorageManager(context: Context) {
             .put("records", records.size)
             .put("feature_schema", com.parmod.ema.engine.NumericalMetaBrain.FEATURE_SCHEMA_VERSION)
             .put("compact_sha256", sha256(compactFile))
-            .put("observation_sources_sha256", sourceSetHash(session, "observations"))
-            .put("outcome_sources_sha256", sourceSetHash(session, "outcomes"))
+            .put("observation_sources_sha256", currentObservationHash)
+            .put("outcome_sources_sha256", currentOutcomeHash)
             .put("high_value", high)
             .put("raw_pruned", false)
         writeAtomic(File(session, LiveArchiveTrainingStore.COMPACTION_MANIFEST), manifest.toString(2))
@@ -200,13 +230,24 @@ class LiveResearchArchiveStorageManager(context: Context) {
         session.listFiles()?.filter { it.isFile && it.name.startsWith("ticks") && it.name.endsWith(".ndjson") }?.forEach { source ->
             val target = File(source.parentFile, source.name + ".gz")
             if (target.isFile) {
-                if (sha256(source) == sha256UncompressedGzip(target)) { source.delete(); return@forEach }
+                if (sha256(source) == sha256UncompressedGzip(target)) {
+                    source.delete()
+                    return@forEach
+                }
                 target.delete()
             }
             val temp = File(target.parentFile, target.name + ".tmp")
-            GZIPOutputStream(BufferedOutputStream(FileOutputStream(temp), BUFFER)).use { out -> FileInputStream(source).buffered(BUFFER).use { it.copyTo(out, BUFFER) } }
-            if (sha256(source) != sha256UncompressedGzip(temp)) { temp.delete(); return@forEach }
-            if (!temp.renameTo(target)) { temp.delete(); return@forEach }
+            GZIPOutputStream(BufferedOutputStream(FileOutputStream(temp), BUFFER)).use { out ->
+                FileInputStream(source).buffered(BUFFER).use { it.copyTo(out, BUFFER) }
+            }
+            if (sha256(source) != sha256UncompressedGzip(temp)) {
+                temp.delete()
+                return@forEach
+            }
+            if (!temp.renameTo(target)) {
+                temp.delete()
+                return@forEach
+            }
             if (source.delete()) count++
         }
         return count
@@ -228,13 +269,19 @@ class LiveResearchArchiveStorageManager(context: Context) {
         writeAtomic(file, o.toString(2))
     }
 
-    private fun countHighValueSessions(): Int = store.sessionsRoot().listFiles()?.count { readManifest(it)?.optBoolean("high_value", false) == true } ?: 0
-    private fun countCompactRecords(): Long = store.sessionsRoot().listFiles()?.sumOf { readManifest(it)?.takeIf { m -> m.optBoolean("verified", false) }?.optLong("records") ?: 0L } ?: 0L
+    private fun countHighValueSessions(): Int =
+        store.sessionsRoot().listFiles()?.count { readManifest(it)?.optBoolean("high_value", false) == true } ?: 0
+
+    private fun countCompactRecords(): Long =
+        store.sessionsRoot().listFiles()?.sumOf { readManifest(it)?.takeIf { m -> m.optBoolean("verified", false) }?.optLong("records") ?: 0L } ?: 0L
 
     private fun countGzipLines(file: File): Long {
         var count = 0L
         BufferedReader(InputStreamReader(GZIPInputStream(FileInputStream(file), BUFFER), Charsets.UTF_8), BUFFER).use { reader ->
-            while (true) { val line = reader.readLine() ?: break; if (line.isNotBlank()) count++ }
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isNotBlank()) count++
+            }
         }
         return count
     }
@@ -242,7 +289,8 @@ class LiveResearchArchiveStorageManager(context: Context) {
     private fun sourceSetHash(session: File, prefix: String): String {
         val md = MessageDigest.getInstance("SHA-256")
         session.listFiles()?.filter { it.isFile && it.name.startsWith(prefix) && it.name.endsWith(".ndjson") }?.sortedBy { it.name }?.forEach { file ->
-            md.update(file.name.toByteArray(Charsets.UTF_8)); md.update(sha256(file).toByteArray(Charsets.UTF_8))
+            md.update(file.name.toByteArray(Charsets.UTF_8))
+            md.update(sha256(file).toByteArray(Charsets.UTF_8))
         }
         return md.digest().hex()
     }
@@ -251,17 +299,29 @@ class LiveResearchArchiveStorageManager(context: Context) {
     private fun archiveBytes(): Long = archiveRoot().walkTopDown().filter(File::isFile).sumOf(File::length)
 
     private fun writeAtomic(file: File, value: String) {
-        file.parentFile?.mkdirs(); val temp = File(file.parentFile, file.name + ".tmp")
+        file.parentFile?.mkdirs()
+        val temp = File(file.parentFile, file.name + ".tmp")
         temp.writeText(value, Charsets.UTF_8)
-        if (file.exists() && !file.delete()) { temp.delete(); error("Could not replace ${file.name}") }
-        if (!temp.renameTo(file)) { temp.delete(); error("Could not commit ${file.name}") }
+        if (file.exists() && !file.delete()) {
+            temp.delete()
+            error("Could not replace ${file.name}")
+        }
+        if (!temp.renameTo(file)) {
+            temp.delete()
+            error("Could not commit ${file.name}")
+        }
     }
 
     private fun sha256(file: File): String = FileInputStream(file).use(::sha256)
     private fun sha256UncompressedGzip(file: File): String = GZIPInputStream(BufferedInputStream(FileInputStream(file), BUFFER)).use(::sha256)
     private fun sha256(input: InputStream): String {
-        val md = MessageDigest.getInstance("SHA-256"); val buffer = ByteArray(BUFFER)
-        while (true) { val n = input.read(buffer); if (n <= 0) break; md.update(buffer, 0, n) }
+        val md = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(BUFFER)
+        while (true) {
+            val n = input.read(buffer)
+            if (n <= 0) break
+            md.update(buffer, 0, n)
+        }
         return md.digest().hex()
     }
     private fun ByteArray.hex(): String = joinToString("") { "%02x".format(it) }

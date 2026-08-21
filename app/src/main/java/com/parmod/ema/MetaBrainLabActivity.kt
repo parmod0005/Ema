@@ -24,6 +24,7 @@ import com.parmod.ema.training.HistoricalCandidateGovernance
 import com.parmod.ema.training.HistoricalCorpusSource
 import com.parmod.ema.training.HistoricalCorpusTrainingViewModel
 import com.parmod.ema.training.HistoricalMarketScope
+import com.parmod.ema.training.PrelabelledTrainingWindowPlan
 import kotlinx.coroutines.delay
 import java.text.DateFormat
 import java.util.Date
@@ -119,11 +120,7 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
             }
         }
 
-        HistoricalTrainingCard(
-            state = training,
-            vm = trainingVm,
-            onImport = { corpusPicker.launch(arrayOf("*/*")) },
-        )
+        HistoricalTrainingCard(training, trainingVm) { corpusPicker.launch(arrayOf("*/*")) }
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -251,8 +248,8 @@ private fun MetaBrainLabScreen(trainingVm: HistoricalCorpusTrainingViewModel = v
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("TRAINING VALIDITY / FEATURE COVERAGE", fontWeight = FontWeight.Bold)
-                Text("Historical: completed-bar/no-lookahead features · next-bar option execution · actual premium MFE/MAE · conservative stop-first ambiguity · slippage + ₹70.80 round-trip brokerage/GST · chronological walk-forward · action-aware adaptive generations · locked holdout opened once.", style = MaterialTheme.typography.bodySmall)
-                Text("BOTH mode: NIFTY and SENSEX are merged chronologically into one shared Candidate; development and final governance require meaningful evidence from each market. One market cannot overwrite the other.", style = MaterialTheme.typography.bodySmall)
+                Text("Historical: completed-bar/no-lookahead features · actual 1M/3M/6M/12M/FULL timestamp windows · derived 70/15/15 fit/development/locked-test roles · 6-minute purge/embargo around 5-minute future labels · policy frozen before scoring/TEST · next-bar option execution · conservative stop-first ambiguity · slippage + ₹70.80 round-trip brokerage/GST.", style = MaterialTheme.typography.bodySmall)
+                Text("BOTH mode: NIFTY and SENSEX use the same time boundaries and one shared Candidate/policy; development and final governance require meaningful evidence from each market. One market cannot use dates that are holdout dates for the other.", style = MaterialTheme.typography.bodySmall)
                 Text("Live: dedicated process-lifetime read-only D30 feed · independent NIFTY/SENSEX engine/microstructure/pending state · per-market dedupe · per-market validation quotas · stale/out-of-order integrity filtering · automatic reconnect/expiry/ATM-universe refresh.", style = MaterialTheme.typography.bodySmall)
                 Text("Historical D30 is never fabricated when absent. Fresh live D30 supplies depth imbalance, microprice, TBQ/TSQ pressure, walls, OI/option flow and activity when Upstox provides it.", style = MaterialTheme.typography.bodySmall)
             }
@@ -300,7 +297,7 @@ private fun HistoricalTrainingCard(
                         LabMetric("Deduped", local.duplicatesRemoved.toString(), Modifier.weight(1f))
                     }
                     Text("CE ${local.ceContracts} · PE ${local.peContracts} · files ${local.filesImported} · supported ${local.supportedFiles}", style = MaterialTheme.typography.labelSmall)
-                    if (state.prelabelledCorpusReady) Text("Pre-labelled splits · TRAIN ${state.prelabelledTrainRows} · VALIDATION ${state.prelabelledValidationRows} · TEST ${state.prelabelledTestRows}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall)
+                    if (state.prelabelledCorpusReady) Text("Storage shards · original TRAIN ${state.prelabelledTrainRows} · VALIDATION ${state.prelabelledValidationRows} · TEST ${state.prelabelledTestRows} · model roles are re-derived by timestamp", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall)
                     if (local.fromDate != null || local.toDate != null) Text("Coverage ${local.fromDate ?: "?"} → ${local.toDate ?: "?"}", style = MaterialTheme.typography.labelSmall)
                     if (local.inferredLotSizeContracts > 0) Text("⚠ ${local.inferredLotSizeContracts} contract(s) use inferred lot size", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
                     local.warnings.takeLast(3).forEach { Text("⚠ $it", style = MaterialTheme.typography.labelSmall) }
@@ -325,9 +322,9 @@ private fun HistoricalTrainingCard(
                     TrainingChoice(scope.label, state.selectedMarketScope == scope, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectMarketScope(scope) }
                 }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                listOf(1, 3, 6, 12).forEach { months ->
-                    TrainingChoice("${months}M", state.selectedMonths == months, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectMonths(months) }
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf(1, 3, 6, 12, PrelabelledTrainingWindowPlan.FULL).forEach { months ->
+                    TrainingChoice(PrelabelledTrainingWindowPlan.label(months), state.selectedMonths == months, Modifier.weight(1f), !state.isRunning && !state.isImporting) { vm.selectMonths(months) }
                 }
             }
 
@@ -337,7 +334,7 @@ private fun HistoricalTrainingCard(
                 Text(state.message, style = MaterialTheme.typography.labelSmall)
                 OutlinedButton(vm::cancel, Modifier.fillMaxWidth()) { Text("CANCEL TRAINING SAFELY") }
             } else if (!state.isImporting) {
-                Button(vm::runOrResume, Modifier.fillMaxWidth()) { Text("RUN / RESUME ${state.selectedSource.label} ${state.selectedMarketScope.label} HISTORICAL AI TRAINING") }
+                Button(vm::runOrResume, Modifier.fillMaxWidth()) { Text("RUN / RESUME ${state.selectedSource.label} ${state.selectedMarketScope.label} ${state.windowLabel} HISTORICAL AI TRAINING") }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     OutlinedButton(vm::clearUpstoxCache, Modifier.weight(1f)) { Text("CLEAR UPSTOX CACHE", fontSize = 8.sp) }
                     LabMetric("Cache", state.cacheHits.toString(), Modifier.weight(1f))
@@ -349,7 +346,7 @@ private fun HistoricalTrainingCard(
             state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
             state.result?.let { r ->
                 HorizontalDivider()
-                Text("RESULT · ${state.selectedMarketScope.label}", fontWeight = FontWeight.Bold)
+                Text("RESULT · ${state.selectedMarketScope.label} · ${state.windowLabel} · ${r.fromDate}→${r.toDate}", fontWeight = FontWeight.Bold)
                 Row {
                     LabMetric("Samples", r.corpusSamples.toString(), Modifier.weight(1f))
                     LabMetric("Contracts", r.contractsDownloaded.toString(), Modifier.weight(1f))

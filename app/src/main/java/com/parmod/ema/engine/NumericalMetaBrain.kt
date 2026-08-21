@@ -35,11 +35,6 @@ class NumericalMetaBrain(
         }
     }
 
-    /**
-     * Causal feature extension. Every field must be known at or before the prediction
-     * timestamp. Fields are appended to the legacy vector so older 21-weight models can
-     * migrate safely with zero weights for new dimensions.
-     */
     data class CausalExtras(
         val premiumReturn1: Double = 0.0,
         val premiumReturn3: Double = 0.0,
@@ -86,10 +81,9 @@ class NumericalMetaBrain(
         val minutesFromOpen: Double,
         val recentEngineWinRate: Double,
         val recentEngineProfitFactor: Double,
-        val causal: CausalExtras = CausalExtras(),
+        val causal: CausalExtras = consumeThreadCausalExtras(),
     ) {
         fun vector(): DoubleArray = doubleArrayOf(
-            // Legacy v1 dimensions. Never reorder these.
             1.0,
             engine.ordinal / 2.0,
             index.ordinal.toDouble(),
@@ -111,7 +105,6 @@ class NumericalMetaBrain(
             (minutesFromOpen / 375.0).coerceIn(0.0, 1.2),
             (recentEngineWinRate / 100.0).coerceIn(0.0, 1.0),
             min(recentEngineProfitFactor, 3.0) / 3.0,
-            // Causal feature schema v2.
             causal.premiumReturn1.coerceIn(-0.50, 0.50) * 2.0,
             causal.premiumReturn3.coerceIn(-0.75, 0.75) / 0.75,
             causal.premiumReturn5.coerceIn(-1.00, 1.00),
@@ -175,7 +168,6 @@ class NumericalMetaBrain(
 
     fun currentHyperParameters(): HyperParameters = hyperParameters
 
-    /** Accepts legacy v1 weights and zero-initialises newly appended causal features. */
     fun loadHistoricalPrior(priorWeights: DoubleArray, priorBias: Double, priorSamples: Long) {
         require(priorWeights.isNotEmpty() && priorWeights.size <= FEATURE_COUNT)
         weights.fill(0.0)
@@ -186,7 +178,6 @@ class NumericalMetaBrain(
         resetBalanceCounters()
     }
 
-    /** Backward-compatible restore for every prior VARDHANI numerical feature schema. */
     fun restore(state: ModelState) {
         require(state.weights.isNotEmpty() && state.weights.size <= FEATURE_COUNT)
         weights.fill(0.0)
@@ -252,6 +243,17 @@ class NumericalMetaBrain(
         const val DEFAULT_L2 = 0.0005
         const val DEFAULT_TAKE_THRESHOLD = 0.66
         const val DEFAULT_REJECT_THRESHOLD = 0.42
+
+        private val threadCausal = ThreadLocal<CausalExtras?>()
+
+        /** Set only for one synchronous historical sample; Features consumes and clears it. */
+        fun setThreadCausalExtras(value: CausalExtras) { threadCausal.set(value) }
+        fun clearThreadCausalExtras() { threadCausal.remove() }
+        private fun consumeThreadCausalExtras(): CausalExtras {
+            val value = threadCausal.get() ?: CausalExtras()
+            threadCausal.remove()
+            return value
+        }
 
         private const val BALANCE_SMOOTHING = 12L
         private const val MIN_CLASS_WEIGHT = 0.70

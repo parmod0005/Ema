@@ -1,20 +1,22 @@
 package com.parmod.ema.training
 
 import com.parmod.ema.engine.NumericalMetaBrain
-import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
  * Shared binary-training policy for historical/live research.
  *
- * It addresses two common failure modes in trading classifiers:
- * 1) majority-class collapse (high accuracy by rejecting everything), and
- * 2) arbitrary probability cutoffs that are unrelated to cost-adjusted trade value.
- *
- * Class weights are derived from the fitting partition only. Decision thresholds are
- * calibrated on a later development/calibration partition only. Forward validation
- * and locked holdout data are never used to fit weights or thresholds.
+ * Industrial research rules:
+ * - class weights are estimated from fitting data only;
+ * - TAKE/REJECT thresholds are calibrated on a later development slice only;
+ * - calibration optimizes cost-adjusted TAKE expectancy, not raw accuracy;
+ * - joint calibration can require the same policy to work on every market segment;
+ * - forward scoring and locked holdout data are never used to fit weights or thresholds.
  */
 object BinaryTrainingPolicy {
     data class Balance(
@@ -41,6 +43,120 @@ object BinaryTrainingPolicy {
         val rejectPrecision: Double,
         val score: Double,
         val viable: Boolean,
+        val expectedContribution: Double = 0.0,
+    )
+
+    /**
+     * Fixed-size streaming probability histogram. A multi-million-row validation split
+     * therefore costs a few small arrays instead of millions of Prediction objects.
+     */
+    class StreamingCalibration {
+        private val counts = LongArray(PROBABILITY_BINS)
+        private val wins = LongArray(PROBABILITY_BINS)
+        private val net = DoubleArray(PROBABILITY_BINS)
+        private var cached: Prefix? = null
+        var labels: Long = 0L
+            private set
+
+        fun add(probability: Double, success: Boolean, netReturn: Double) {
+            val p = probability.coerceIn(0.0, 1.0)
+            val bin = (p * LAST_BIN).roundToInt().coerceIn(0, LAST_BIN)
+            counts[bin]++
+            if (success) wins[bin]++
+            net[bin] += netReturn
+            labels++
+            cached = null
+        }
+
+        fun add(point: CalibrationPoint) = add(point.probability, point.success, point.netReturn)
+
+        fun evaluate(
+            takeThreshold: Double,
+            rejectThreshold: Double,
+            minimumTake: Int = requiredActions(labels.toInt()),
+            minimumReject: Int = requiredActions(labels.toInt()),
+            minimumTakePrecision: Double = HistoricalCandidateGovernance.MIN_TAKE_PRECISION,
+            minimumRejectPrecision: Double = HistoricalCandidateGovernance.MIN_REJECT_PRECISION,
+        ): CalibrationResult {
+            val take = takeThreshold.coerceIn(MIN_TAKE_THRESHOLD, MAX_TAKE_THRESHOLD)
+            val reject = rejectThreshold.coerceIn(MIN_REJECT_THRESHOLD, MAX_REJECT_THRESHOLD)
+                .coerceAtMost(take - MIN_THRESHOLD_GAP)
+            val p = prefix()
+            val takeBin = ceil(take * LAST_BIN).toInt().coerceIn(0, LAST_BIN)
+            val rejectBin = floor(reject * LAST_BIN).toInt().coerceIn(0, LAST_BIN)
+
+            val beforeTake = if (takeBin <= 0) 0L else p.count[takeBin - 1]
+            val beforeTakeWins = if (takeBin <= 0) 0L else p.wins[takeBin - 1]
+            val beforeTakeNet = if (takeBin <= 0) 0.0 else p.net[takeBin - 1]
+            val takeCount = (p.count[LAST_BIN] - beforeTake).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            val takeWins = (p.wins[LAST_BIN] - beforeTakeWins).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            val takeNet = p.net[LAST_BIN] - beforeTakeNet
+            val rejectCount = p.count[rejectBin].coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            val rejectWins = p.wins[rejectBin].coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            val rejectLosses = rejectCount - rejectWins
+
+            val takePrecision = if (takeCount == 0) 0.0 else takeWins.toDouble() / takeCount
+            val takeAverageNet = if (takeCount == 0) 0.0 else takeNet / takeCount
+            val rejectPrecision = if (rejectCount == 0) 0.0 else rejectLosses.toDouble() / rejectCount
+            val minTake = minimumTake.coerceAtLeast(1)
+            val minReject = minimumReject.coerceAtLeast(1)
+            val takeEvidence = min(takeCount.toDouble() / minTake, 1.0)
+            val rejectEvidence = min(rejectCount.toDouble() / minReject, 1.0)
+            val expectedContribution = if (labels <= 0L) 0.0 else takeNet / labels
+            val viable = takeCount >= minTake && rejectCount >= minReject &&
+                takePrecision >= minimumTakePrecision &&
+                rejectPrecision >= minimumRejectPrecision &&
+                takeAverageNet > 0.0
+
+            // Trading utility dominates. Accuracy is deliberately absent because a
+            // reject-only classifier can have excellent accuracy while never trading.
+            val utility = 8.0 * expectedContribution +
+                0.55 * (takePrecision - minimumTakePrecision) +
+                0.18 * (rejectPrecision - minimumRejectPrecision) +
+                0.10 * takeEvidence + 0.04 * rejectEvidence +
+                0.30 * takeAverageNet
+            val starvationPenalty = 0.80 * (1.0 - takeEvidence) + 0.15 * (1.0 - rejectEvidence)
+            val viabilityBonus = if (viable) 2.0 else 0.0
+            val score = utility + viabilityBonus - starvationPenalty
+
+            return CalibrationResult(
+                takeThreshold = take,
+                rejectThreshold = reject,
+                takeSamples = takeCount,
+                takePrecision = takePrecision,
+                takeAverageNetReturn = takeAverageNet,
+                rejectSamples = rejectCount,
+                rejectPrecision = rejectPrecision,
+                score = score,
+                viable = viable,
+                expectedContribution = expectedContribution,
+            )
+        }
+
+        private fun prefix(): Prefix {
+            cached?.let { return it }
+            val c = LongArray(PROBABILITY_BINS)
+            val w = LongArray(PROBABILITY_BINS)
+            val n = DoubleArray(PROBABILITY_BINS)
+            var runningCount = 0L
+            var runningWins = 0L
+            var runningNet = 0.0
+            for (i in 0..LAST_BIN) {
+                runningCount += counts[i]
+                runningWins += wins[i]
+                runningNet += net[i]
+                c[i] = runningCount
+                w[i] = runningWins
+                n[i] = runningNet
+            }
+            return Prefix(c, w, n).also { cached = it }
+        }
+    }
+
+    private data class Prefix(
+        val count: LongArray,
+        val wins: LongArray,
+        val net: DoubleArray,
     )
 
     fun balance(positives: Long, negatives: Long): Balance {
@@ -50,10 +166,10 @@ object BinaryTrainingPolicy {
         if (total <= 0L || p == 0L || n == 0L) {
             return Balance(p, n, 1.0, 1.0, if (total == 0L) 0.5 else p.toDouble() / total)
         }
-        // Inverse-frequency weights with conservative clipping. Mean contribution of
-        // each class is approximately equal without allowing rare labels to explode.
-        val rawPositive = total.toDouble() / (2.0 * p)
-        val rawNegative = total.toDouble() / (2.0 * n)
+        // Square-root inverse-frequency weighting is intentionally milder than full
+        // inverse-frequency reweighting, preserving probability calibration better.
+        val rawPositive = sqrt(total.toDouble() / (2.0 * p))
+        val rawNegative = sqrt(total.toDouble() / (2.0 * n))
         val positiveWeight = rawPositive.coerceIn(MIN_CLASS_WEIGHT, MAX_CLASS_WEIGHT)
         val negativeWeight = rawNegative.coerceIn(MIN_CLASS_WEIGHT, MAX_CLASS_WEIGHT)
         return Balance(p, n, positiveWeight, negativeWeight, p.toDouble() / total)
@@ -71,124 +187,123 @@ object BinaryTrainingPolicy {
         return (baseWeight * classWeight).coerceIn(0.10, 5.0)
     }
 
-    /**
-     * Chooses TAKE/REJECT cutoffs from the probability distribution observed on a
-     * development calibration slice. Threshold candidates are probability quantiles,
-     * so a well-ranked but conservatively calibrated model is not forced into zero TAKEs.
-     * A threshold is considered viable only when TAKE average net return is positive.
-     */
     fun calibrate(
         points: List<CalibrationPoint>,
         fallback: NumericalMetaBrain.HyperParameters,
         minimumTake: Int = requiredActions(points.size),
         minimumReject: Int = requiredActions(points.size),
     ): CalibrationResult {
-        if (points.size < MIN_CALIBRATION_POINTS) {
-            return evaluateThresholds(points, fallback.takeThreshold, fallback.rejectThreshold, minimumTake, minimumReject)
-        }
-        val probabilities = points.map { it.probability.coerceIn(0.0, 1.0) }.sorted()
-        val takeCandidates = linkedSetOf<Double>()
-        val rejectCandidates = linkedSetOf<Double>()
-        TAKE_QUANTILES.forEach { q -> takeCandidates += quantile(probabilities, q) }
-        REJECT_QUANTILES.forEach { q -> rejectCandidates += quantile(probabilities, q) }
-        // Keep the configured thresholds in the search as anchors.
-        takeCandidates += fallback.takeThreshold
-        rejectCandidates += fallback.rejectThreshold
-
-        var best: CalibrationResult? = null
-        for (takeRaw in takeCandidates) {
-            val take = takeRaw.coerceIn(MIN_TAKE_THRESHOLD, MAX_TAKE_THRESHOLD)
-            for (rejectRaw in rejectCandidates) {
-                val reject = rejectRaw.coerceIn(MIN_REJECT_THRESHOLD, MAX_REJECT_THRESHOLD)
-                if (reject > take - MIN_THRESHOLD_GAP) continue
-                val candidate = evaluateThresholds(points, take, reject, minimumTake, minimumReject)
-                if (best == null || candidate.score > best!!.score) best = candidate
-            }
-        }
-        return best ?: evaluateThresholds(points, fallback.takeThreshold, fallback.rejectThreshold, minimumTake, minimumReject)
+        val stream = StreamingCalibration()
+        points.forEach(stream::add)
+        return calibrate(stream, fallback, minimumTake, minimumReject)
     }
+
+    fun calibrate(
+        stream: StreamingCalibration,
+        fallback: NumericalMetaBrain.HyperParameters,
+        minimumTake: Int = requiredActions(stream.labels.toInt()),
+        minimumReject: Int = requiredActions(stream.labels.toInt()),
+    ): CalibrationResult = selectPolicy(
+        overall = stream,
+        segments = emptyList(),
+        fallback = fallback,
+        minimumTake = minimumTake,
+        minimumReject = minimumReject,
+    )
+
+    /** Same TAKE/REJECT policy must satisfy the overall stream and every segment. */
+    fun calibrateJoint(
+        overall: StreamingCalibration,
+        segments: Collection<StreamingCalibration>,
+        fallback: NumericalMetaBrain.HyperParameters,
+        minimumTake: Int = requiredActions(overall.labels.toInt()),
+        minimumReject: Int = requiredActions(overall.labels.toInt()),
+    ): CalibrationResult = selectPolicy(overall, segments.toList(), fallback, minimumTake, minimumReject)
 
     fun applyCalibration(
         brain: NumericalMetaBrain,
-        points: List<CalibrationPoint>,
-        minimumTake: Int = requiredActions(points.size),
-        minimumReject: Int = requiredActions(points.size),
+        stream: StreamingCalibration,
+        minimumTake: Int = requiredActions(stream.labels.toInt()),
+        minimumReject: Int = requiredActions(stream.labels.toInt()),
     ): CalibrationResult {
         val current = brain.currentHyperParameters()
-        val result = calibrate(points, current, minimumTake, minimumReject)
-        brain.configure(
-            current.copy(
-                takeThreshold = result.takeThreshold,
-                rejectThreshold = result.rejectThreshold,
-            ),
-            bumpVersion = false,
-        )
+        val result = calibrate(stream, current, minimumTake, minimumReject)
+        brain.configure(current.copy(takeThreshold = result.takeThreshold, rejectThreshold = result.rejectThreshold), bumpVersion = false)
         return result
     }
 
-    fun requiredActions(labels: Int): Int =
-        max(MIN_ACTIONS, min(MAX_ACTIONS, kotlin.math.ceil(labels * ACTION_FRACTION).toInt()))
-
-    private fun evaluateThresholds(
-        points: List<CalibrationPoint>,
-        take: Double,
-        reject: Double,
+    private fun selectPolicy(
+        overall: StreamingCalibration,
+        segments: List<StreamingCalibration>,
+        fallback: NumericalMetaBrain.HyperParameters,
         minimumTake: Int,
         minimumReject: Int,
     ): CalibrationResult {
-        var takeCount = 0
-        var takeWins = 0
-        var takeNet = 0.0
-        var rejectCount = 0
-        var rejectLosses = 0
-        points.forEach { p ->
-            when {
-                p.probability >= take -> {
-                    takeCount++
-                    if (p.success) takeWins++
-                    takeNet += p.netReturn
+        if (overall.labels <= 0L) {
+            return overall.evaluate(fallback.takeThreshold, fallback.rejectThreshold, minimumTake, minimumReject)
+        }
+        val thresholds = policyThresholds(fallback)
+        var bestOverall: CalibrationResult? = null
+        var bestScore = Double.NEGATIVE_INFINITY
+        for (take in thresholds.first) {
+            for (reject in thresholds.second) {
+                if (reject > take - MIN_THRESHOLD_GAP) continue
+                val o = overall.evaluate(take, reject, minimumTake, minimumReject)
+                var segmentScore = 0.0
+                var segmentsViable = true
+                for (segment in segments) {
+                    val required = requiredActions(segment.labels.toInt())
+                    val s = segment.evaluate(take, reject, required, required)
+                    segmentScore += s.score
+                    if (!s.viable) segmentsViable = false
                 }
-                p.probability <= reject -> {
-                    rejectCount++
-                    if (!p.success) rejectLosses++
+                val fullyViable = o.viable && segmentsViable
+                val normalizedSegment = if (segments.isEmpty()) 0.0 else segmentScore / segments.size
+                val combined = o.score + 0.45 * normalizedSegment + if (fullyViable) 3.0 else 0.0
+                val currentBestViable = bestOverall?.viable == true
+                if ((fullyViable && !currentBestViable) || (fullyViable == currentBestViable && combined > bestScore)) {
+                    bestOverall = o.copy(viable = fullyViable, score = combined)
+                    bestScore = combined
                 }
             }
         }
-        val takePrecision = if (takeCount == 0) 0.0 else takeWins.toDouble() / takeCount
-        val takeAverageNet = if (takeCount == 0) 0.0 else takeNet / takeCount
-        val rejectPrecision = if (rejectCount == 0) 0.0 else rejectLosses.toDouble() / rejectCount
-        val takeCoverage = if (minimumTake <= 0) 1.0 else min(takeCount.toDouble() / minimumTake, 1.0)
-        val rejectCoverage = if (minimumReject <= 0) 1.0 else min(rejectCount.toDouble() / minimumReject, 1.0)
-        val viable = takeCount >= minimumTake && rejectCount >= minimumReject && takeAverageNet > 0.0
-        val starvationPenalty = 0.50 * (1.0 - takeCoverage) + 0.10 * (1.0 - rejectCoverage)
-        val quality = 0.45 * (takePrecision - 0.50) + 0.20 * (rejectPrecision - 0.50) +
-            1.75 * takeAverageNet + 0.12 * takeCoverage + 0.05 * rejectCoverage
-        val viabilityBonus = if (viable) 0.25 else 0.0
-        val score = quality + viabilityBonus - starvationPenalty - 0.01 * abs(take - reject)
-        return CalibrationResult(take, reject, takeCount, takePrecision, takeAverageNet, rejectCount, rejectPrecision, score, viable)
+        return bestOverall ?: overall.evaluate(fallback.takeThreshold, fallback.rejectThreshold, minimumTake, minimumReject)
     }
 
-    private fun quantile(sorted: List<Double>, q: Double): Double {
-        if (sorted.isEmpty()) return 0.5
-        if (sorted.size == 1) return sorted[0]
-        val pos = q.coerceIn(0.0, 1.0) * (sorted.lastIndex)
-        val lo = pos.toInt()
-        val hi = min(lo + 1, sorted.lastIndex)
-        val frac = pos - lo
-        return sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    private fun policyThresholds(fallback: NumericalMetaBrain.HyperParameters): Pair<List<Double>, List<Double>> {
+        val takes = linkedSetOf<Double>()
+        val rejects = linkedSetOf<Double>()
+        var t = MIN_TAKE_THRESHOLD
+        while (t <= MAX_TAKE_THRESHOLD + 1e-9) {
+            takes += round3(t)
+            t += THRESHOLD_STEP
+        }
+        var r = MIN_REJECT_THRESHOLD
+        while (r <= MAX_REJECT_THRESHOLD + 1e-9) {
+            rejects += round3(r)
+            r += THRESHOLD_STEP
+        }
+        takes += fallback.takeThreshold.coerceIn(MIN_TAKE_THRESHOLD, MAX_TAKE_THRESHOLD)
+        rejects += fallback.rejectThreshold.coerceIn(MIN_REJECT_THRESHOLD, MAX_REJECT_THRESHOLD)
+        return takes.sorted() to rejects.sorted()
     }
+
+    fun requiredActions(labels: Int): Int =
+        max(MIN_ACTIONS, min(MAX_ACTIONS, ceil(labels.coerceAtLeast(0) * ACTION_FRACTION).toInt()))
+
+    private fun round3(value: Double): Double = (value * 1_000.0).roundToInt() / 1_000.0
 
     const val MIN_TAKE_THRESHOLD = 0.25
     const val MAX_TAKE_THRESHOLD = 0.90
     const val MIN_REJECT_THRESHOLD = 0.05
     const val MAX_REJECT_THRESHOLD = 0.60
     const val MIN_THRESHOLD_GAP = 0.05
-    private const val MIN_CLASS_WEIGHT = 0.50
-    private const val MAX_CLASS_WEIGHT = 3.00
-    private const val MIN_CALIBRATION_POINTS = 20
+    private const val MIN_CLASS_WEIGHT = 0.70
+    private const val MAX_CLASS_WEIGHT = 1.80
     private const val ACTION_FRACTION = 0.05
     private const val MIN_ACTIONS = 5
     private const val MAX_ACTIONS = 100
-    private val TAKE_QUANTILES = doubleArrayOf(0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.93, 0.95)
-    private val REJECT_QUANTILES = doubleArrayOf(0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50)
+    private const val PROBABILITY_BINS = 201
+    private const val LAST_BIN = PROBABILITY_BINS - 1
+    private const val THRESHOLD_STEP = 0.01
 }

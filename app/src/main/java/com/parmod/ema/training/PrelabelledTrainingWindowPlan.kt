@@ -46,6 +46,24 @@ object PrelabelledTrainingWindowPlan {
         val label: String get() = label(requestedMonths)
     }
 
+    data class Analysis(
+        val windowRows: Long,
+        val trainRows: Long,
+        val calibrationRows: Long,
+        val scoringRows: Long,
+        val testRows: Long,
+        val trainByMarket: Map<MarketIndex, Long>,
+        val calibrationByMarket: Map<MarketIndex, Long>,
+        val scoringByMarket: Map<MarketIndex, Long>,
+        val testByMarket: Map<MarketIndex, Long>,
+        val coverage: HistoricalCorpusTrainer.Coverage,
+        val contracts: Int,
+        val expiries: Int,
+        val averageMfe: Double,
+        val averageMae: Double,
+        val averageNet: Double,
+    )
+
     fun build(
         store: AimlHistoricalOptionCorpusV1Store,
         months: Int,
@@ -108,29 +126,93 @@ object PrelabelledTrainingWindowPlan {
         )
     }
 
-    fun count(
+    /** One lightweight pass over the selected window; no causal indicators are built. */
+    fun analyze(
         store: AimlHistoricalOptionCorpusV1Store,
-        source: Source,
+        plan: Plan,
         shouldCancel: () -> Boolean = { false },
-    ): Long = source.splits.sumOf { split ->
-        store.count(split, shouldCancel) { source.accepts(it) }
-    }
+    ): Analysis {
+        var windowRows = 0L
+        var trainRows = 0L
+        var calibrationRows = 0L
+        var scoringRows = 0L
+        var testRows = 0L
+        var ce = 0L
+        var pe = 0L
+        var e1 = 0L
+        var e2 = 0L
+        var e3 = 0L
+        var mfe = 0.0
+        var mae = 0.0
+        var net = 0.0
+        val contracts = HashSet<String>()
+        val expiries = HashSet<Int>()
+        val trainBy = MarketIndex.entries.associateWith { 0L }.toMutableMap()
+        val calibrationBy = MarketIndex.entries.associateWith { 0L }.toMutableMap()
+        val scoringBy = MarketIndex.entries.associateWith { 0L }.toMutableMap()
+        val testBy = MarketIndex.entries.associateWith { 0L }.toMutableMap()
 
-    fun countByMarket(
-        store: AimlHistoricalOptionCorpusV1Store,
-        source: Source,
-        shouldCancel: () -> Boolean = { false },
-    ): Map<MarketIndex, Long> {
-        val out = MarketIndex.entries.associateWith { 0L }.toMutableMap()
-        source.splits.forEach { split ->
+        plan.window.splits.forEach { split ->
             store.count(split, shouldCancel) { r ->
-                if (!source.accepts(r)) false else {
-                    out[r.index] = out.getValue(r.index) + 1L
-                    true
+                if (!plan.window.accepts(r)) return@count false
+                windowRows++
+                if (r.optionType == "CE") ce++ else pe++
+                when (AimlHistoricalOptionCorpusV1Store.proxyEngine(r)) {
+                    2 -> e2++
+                    3 -> e3++
+                    else -> e1++
                 }
+                mfe += r.mfe5
+                mae += r.mae5
+                net += AimlHistoricalOptionCorpusV1Store.netReturn5(r)
+                contracts += "${r.index.name}|${r.expiryEpochDay}|${r.strike}|${r.optionType}"
+                expiries += r.expiryEpochDay
+                when {
+                    plan.train.accepts(r) -> {
+                        trainRows++
+                        trainBy[r.index] = trainBy.getValue(r.index) + 1L
+                    }
+                    plan.calibration.accepts(r) -> {
+                        calibrationRows++
+                        calibrationBy[r.index] = calibrationBy.getValue(r.index) + 1L
+                    }
+                    plan.scoring.accepts(r) -> {
+                        scoringRows++
+                        scoringBy[r.index] = scoringBy.getValue(r.index) + 1L
+                    }
+                    plan.test.accepts(r) -> {
+                        testRows++
+                        testBy[r.index] = testBy.getValue(r.index) + 1L
+                    }
+                }
+                true
             }
         }
-        return out
+        val denominator = windowRows.coerceAtLeast(1L).toDouble()
+        return Analysis(
+            windowRows = windowRows,
+            trainRows = trainRows,
+            calibrationRows = calibrationRows,
+            scoringRows = scoringRows,
+            testRows = testRows,
+            trainByMarket = trainBy,
+            calibrationByMarket = calibrationBy,
+            scoringByMarket = scoringBy,
+            testByMarket = testBy,
+            coverage = HistoricalCorpusTrainer.Coverage(
+                ceSamples = ce.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                peSamples = pe.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                engine1Samples = e1.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                engine2Samples = e2.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                engine3Samples = e3.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                nativeDepthSamples = 0,
+            ),
+            contracts = contracts.size,
+            expiries = expiries.size,
+            averageMfe = mfe / denominator,
+            averageMae = mae / denominator,
+            averageNet = net / denominator,
+        )
     }
 
     fun forEach(

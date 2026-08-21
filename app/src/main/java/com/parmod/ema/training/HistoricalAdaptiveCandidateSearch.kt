@@ -111,8 +111,6 @@ object HistoricalAdaptiveCandidateSearch {
             attempts++
         }
 
-        // Deterministic policy grid ensures zero-TAKE models explore economically
-        // meaningful probability cutoffs instead of being trapped at a 51% floor.
         var fallbackStep = 0
         while (candidates.size < CANDIDATES_PER_GENERATION && fallbackStep < 192) {
             val take = when (guidance) {
@@ -209,7 +207,7 @@ object HistoricalAdaptiveCandidateSearch {
     private const val HIST_MIN_L2 = 0.00003
     private const val HIST_MAX_L2 = 0.00800
     private const val HIST_MIN_TAKE = 0.25
-    private const val HIST_MAX_TAKE = 0.85
+    private const val HIST_MAX_TAKE = 0.90
     private const val HIST_MIN_REJECT = 0.05
     private const val HIST_MAX_REJECT = 0.60
     private const val HIST_MIN_GAP = 0.05

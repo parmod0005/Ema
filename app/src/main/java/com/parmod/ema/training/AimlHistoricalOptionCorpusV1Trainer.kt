@@ -17,10 +17,10 @@ import kotlin.math.pow
 /**
  * Candidate research over the leakage-resistant pre-labelled option corpus.
  *
- * Model weights are fitted only on TRAIN. The early chronological part of VALIDATION
- * calibrates TAKE/REJECT policy against cost-adjusted option returns; the later part
- * of VALIDATION scores walk-forward robustness/governance. TEST remains locked until
- * both stages qualify. Test results are never fed back into fitting or calibration.
+ * TRAIN fits weights. A timestamp-early VALIDATION slice calibrates policy, an
+ * embargo separates it from a later timestamp scoring slice, and TEST remains
+ * locked until development qualifies. Physical file order is never used as a proxy
+ * for chronology because imported compact files can be contract-grouped.
  */
 class AimlHistoricalOptionCorpusV1Trainer(
     private val store: AimlHistoricalOptionCorpusV1Store,
@@ -86,37 +86,75 @@ class AimlHistoricalOptionCorpusV1Trainer(
     ): HistoricalCorpusTrainer.Result {
         require(store.ready()) { "Pre-labelled historical corpus is not ready" }
         val meta = store.metadata()
-        val trainRows = store.rows(AimlHistoricalOptionCorpusV1Store.Split.TRAIN)
-        val validationRows = store.rows(AimlHistoricalOptionCorpusV1Store.Split.VALIDATION)
-        val testRows = store.rows(AimlHistoricalOptionCorpusV1Store.Split.TEST)
         val corpusMarket = meta.getProperty("market", "NIFTY")
         if ((index == MarketIndex.NIFTY && corpusMarket != "NIFTY" && corpusMarket != "MIXED") ||
             (index == MarketIndex.SENSEX && corpusMarket != "SENSEX" && corpusMarket != "MIXED")) {
             return emptyResult(index, monthsLabel, "Imported pre-labelled corpus contains $corpusMarket, not ${index.name}")
         }
 
+        val marketAccept: (AimlHistoricalOptionCorpusV1Store.Record) -> Boolean = { it.index == index }
+        var trainMin = Long.MAX_VALUE
+        var trainMax = Long.MIN_VALUE
+        val selectedTrainRows = store.count(AimlHistoricalOptionCorpusV1Store.Split.TRAIN, shouldCancel) { r ->
+            if (r.index != index) false else {
+                trainMin = minOf(trainMin, r.timestampMs)
+                trainMax = maxOf(trainMax, r.timestampMs)
+                true
+            }
+        }
+        var validationMin = Long.MAX_VALUE
+        var validationMax = Long.MIN_VALUE
+        val selectedValidationRows = store.count(AimlHistoricalOptionCorpusV1Store.Split.VALIDATION, shouldCancel) { r ->
+            if (r.index != index) false else {
+                validationMin = minOf(validationMin, r.timestampMs)
+                validationMax = maxOf(validationMax, r.timestampMs)
+                true
+            }
+        }
+        val selectedTestRows = store.count(AimlHistoricalOptionCorpusV1Store.Split.TEST, shouldCancel, marketAccept)
+        if (selectedTrainRows <= 0L || selectedValidationRows <= 0L || selectedTestRows <= 0L ||
+            trainMax == Long.MIN_VALUE || validationMax == Long.MIN_VALUE) {
+            return emptyResult(index, monthsLabel, "Selected market does not have complete TRAIN/VALIDATION/TEST evidence")
+        }
+
+        // Purge the tail of TRAIN because a 5m label on the last training bars can
+        // inspect prices that belong to VALIDATION. Keep one extra minute of safety.
+        val safeTrainEndMs = trainMax - EMBARGO_MS
+        val safeTrainAccept: (AimlHistoricalOptionCorpusV1Store.Record) -> Boolean = {
+            it.index == index && it.timestampMs <= safeTrainEndMs
+        }
+        val safeTrainRows = store.count(AimlHistoricalOptionCorpusV1Store.Split.TRAIN, shouldCancel, safeTrainAccept)
+
+        // Build time-based calibration/scoring windows. Never split VALIDATION by its
+        // physical row order because the compact corpus can be contract-grouped.
+        val validationSpan = (validationMax - validationMin).coerceAtLeast(1L)
+        val calibrationEndMs = validationMin + (validationSpan * CALIBRATION_FRACTION).toLong()
+        val scoringStartMs = calibrationEndMs + EMBARGO_MS
+        val safeValidationEndMs = validationMax - EMBARGO_MS
+        val calibrationAccept: (AimlHistoricalOptionCorpusV1Store.Record) -> Boolean = {
+            it.index == index && it.timestampMs <= calibrationEndMs
+        }
+        val scoringAccept: (AimlHistoricalOptionCorpusV1Store.Record) -> Boolean = {
+            it.index == index && it.timestampMs >= scoringStartMs && it.timestampMs <= safeValidationEndMs
+        }
+        val calibrationPhysicalRows = store.count(AimlHistoricalOptionCorpusV1Store.Split.VALIDATION, shouldCancel, calibrationAccept)
+        val scoringPhysicalRows = store.count(AimlHistoricalOptionCorpusV1Store.Split.VALIDATION, shouldCancel, scoringAccept)
+
+        val trainStride = ceil(safeTrainRows.toDouble() / MAX_SEARCH_TRAIN_ROWS).toInt().coerceAtLeast(1)
+        val validationStride = ceil((calibrationPhysicalRows + scoringPhysicalRows).toDouble() / MAX_SEARCH_VALIDATION_ROWS)
+            .toInt().coerceAtLeast(1)
+        val sampledCalibrationRows = sampledCount(calibrationPhysicalRows, validationStride)
+        val sampledScoringRows = sampledCount(scoringPhysicalRows, validationStride)
+        if (sampledCalibrationRows < MIN_CALIBRATION_ROWS || sampledScoringRows < MIN_SCORING_ROWS) {
+            return emptyResult(
+                index,
+                monthsLabel,
+                "Validation insufficient after time-causal ${EMBARGO_MINUTES}m embargo · calibration $sampledCalibrationRows · scoring $sampledScoringRows",
+            )
+        }
+
         val coverage = coverage(meta)
         val corpusSamples = corpusSamples(meta)
-        val trainStride = ceil(trainRows.toDouble() / MAX_SEARCH_TRAIN_ROWS).toInt().coerceAtLeast(1)
-        val validationStride = ceil(validationRows.toDouble() / MAX_SEARCH_VALIDATION_ROWS).toInt().coerceAtLeast(1)
-        val validationEmbargoRows = ceil(EMBARGO_MINUTES.toDouble() / validationStride.toDouble()).toLong().coerceAtLeast(1L)
-
-        // Count the selected market once so every Candidate uses exactly the same
-        // chronological calibration/scoring boundary.
-        var sampledValidationRows = 0L
-        store.forEach(
-            split = AimlHistoricalOptionCorpusV1Store.Split.VALIDATION,
-            stride = validationStride,
-            shouldCancel = shouldCancel,
-        ) { record -> if (record.index == index) sampledValidationRows++ }
-        val usableValidationRows = sampledValidationRows - 2L * validationEmbargoRows
-        if (usableValidationRows < MIN_VALIDATION_ROWS) {
-            return emptyResult(index, monthsLabel, "Need at least $MIN_VALIDATION_ROWS sampled validation rows after leakage embargo; found $usableValidationRows")
-        }
-        val calibrationRows = max(MIN_CALIBRATION_ROWS, (usableValidationRows * CALIBRATION_FRACTION).toLong())
-            .coerceAtMost(usableValidationRows - MIN_SCORING_ROWS)
-        val scoringRows = usableValidationRows - calibrationRows
-
         val seedHypers = candidateHyperParameters()
         val seen = seedHypers.mapTo(linkedSetOf()) { HistoricalAdaptiveCandidateSearch.signature(it) }
         val evaluations = ArrayList<HistoricalCorpusTrainer.CandidateEvaluation>()
@@ -135,9 +173,9 @@ class AimlHistoricalOptionCorpusV1Trainer(
                     0,
                     hypers.size,
                     if (generation == 0) {
-                        "Training ${hypers.size} seed Candidates on original TRAIN · stride $trainStride · leakage embargo active"
+                        "Training ${hypers.size} seed Candidates · safe TRAIN $safeTrainRows rows · stride $trainStride · deferred 43-feature materialization"
                     } else {
-                        "Adaptive G$generation ${guidance?.name ?: "BALANCED"} · ${hypers.size} Candidates · TRAIN only · TEST untouched"
+                        "Adaptive G$generation ${guidance?.name ?: "BALANCED"} · ${hypers.size} Candidates · safe TRAIN only · TEST untouched"
                     },
                 ),
             )
@@ -145,8 +183,8 @@ class AimlHistoricalOptionCorpusV1Trainer(
                 split = AimlHistoricalOptionCorpusV1Store.Split.TRAIN,
                 stride = trainStride,
                 shouldCancel = shouldCancel,
+                accept = safeTrainAccept,
             ) { record ->
-                if (record.index != index) return@forEach
                 val s = sample(record)
                 brains.forEach { it.learn(s.features, s.success, s.weight) }
                 searchTrainUsed++
@@ -169,69 +207,63 @@ class AimlHistoricalOptionCorpusV1Trainer(
             val foldProduction = Array(FOLDS) { Acc() }
             val production = brainFromBaseline(productionBaseline.hyperParameters)
             val calibrated = arrayOfNulls<BinaryTrainingPolicy.CalibrationResult>(hypers.size)
-            var selectedSeen = 0L
             var calibrationUsed = 0L
-            var postCalibrationEmbargo = 0L
             var scoringUsed = 0L
-            var policyApplied = false
 
             onProgress(
                 HistoricalCorpusTrainer.Progress(
                     "${stagePrefix}_CALIBRATION",
                     0,
-                    FOLDS,
-                    "Early VALIDATION calibrates cost-adjusted TAKE policy · ${EMBARGO_MINUTES}m purge bands · $calibrationRows calibration rows · $scoringRows scoring rows · TEST locked",
+                    sampledCalibrationRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    "Timestamp-early VALIDATION calibration · $sampledCalibrationRows sampled rows · ${EMBARGO_MINUTES}m embargo before scoring · TEST locked",
                 ),
             )
             store.forEach(
                 split = AimlHistoricalOptionCorpusV1Store.Split.VALIDATION,
                 stride = validationStride,
                 shouldCancel = shouldCancel,
+                accept = calibrationAccept,
             ) { record ->
-                if (record.index != index) return@forEach
-                selectedSeen++
-
-                // TRAIN -> VALIDATION purge band. No validation evidence inside this
-                // band may influence calibration or scoring.
-                if (selectedSeen <= validationEmbargoRows) return@forEach
-
                 val s = sample(record)
-                if (calibrationUsed < calibrationRows) {
-                    brains.forEachIndexed { i, brain ->
-                        val p = brain.predict(s.features)
-                        calibration[i].add(p.probabilitySuccess, s.success, s.net)
-                    }
-                    calibrationUsed++
-                    return@forEach
+                brains.forEachIndexed { i, brain ->
+                    val p = brain.predict(s.features)
+                    calibration[i].add(p.probabilitySuccess, s.success, s.net)
                 }
-
-                // Calibration labels inspect five future minutes. Purge a safety band
-                // before later VALIDATION becomes scoring evidence.
-                if (postCalibrationEmbargo < validationEmbargoRows) {
-                    postCalibrationEmbargo++
-                    return@forEach
-                }
-
-                if (!policyApplied) {
-                    brains.forEachIndexed { i, brain ->
-                        val result = BinaryTrainingPolicy.applyCalibration(brain, calibration[i])
-                        calibrated[i] = result
-                    }
-                    policyApplied = true
+                calibrationUsed++
+                if (calibrationUsed % 25_000L == 0L) {
                     onProgress(
                         HistoricalCorpusTrainer.Progress(
-                            "${stagePrefix}_POLICY_FIXED",
-                            1,
-                            1,
-                            "Development policy fixed before scoring · ${EMBARGO_MINUTES}m leakage embargo complete · thresholds frozen for later VALIDATION/TEST",
+                            "${stagePrefix}_CALIBRATION",
+                            calibrationUsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                            sampledCalibrationRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                            "G$generation · calibration $calibrationUsed/$sampledCalibrationRows",
                         ),
                     )
                 }
+            }
 
-                if (scoringUsed >= scoringRows) return@forEach
+            brains.forEachIndexed { i, brain ->
+                calibrated[i] = BinaryTrainingPolicy.applyCalibration(brain, calibration[i])
+            }
+            onProgress(
+                HistoricalCorpusTrainer.Progress(
+                    "${stagePrefix}_POLICY_FIXED",
+                    1,
+                    1,
+                    "Development policy frozen from timestamp-early VALIDATION · later scoring/TEST cannot tune thresholds",
+                ),
+            )
+
+            store.forEach(
+                split = AimlHistoricalOptionCorpusV1Store.Split.VALIDATION,
+                stride = validationStride,
+                shouldCancel = shouldCancel,
+                accept = scoringAccept,
+            ) { record ->
+                val s = sample(record)
                 val pp = production.predict(s.features)
                 productionAcc.add(pp, s)
-                val fold = ((scoringUsed * FOLDS) / max(1L, scoringRows)).toInt().coerceIn(0, FOLDS - 1)
+                val fold = timeFold(record.timestampMs, scoringStartMs, safeValidationEndMs, FOLDS)
                 foldProduction[fold].add(pp, s)
                 brains.forEachIndexed { i, brain ->
                     val cp = brain.predict(s.features)
@@ -244,15 +276,11 @@ class AimlHistoricalOptionCorpusV1Trainer(
                         HistoricalCorpusTrainer.Progress(
                             "${stagePrefix}_SCORING",
                             scoringUsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                            scoringRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                            "G$generation · later VALIDATION scoring $scoringUsed/$scoringRows · policy frozen · TEST locked",
+                            sampledScoringRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                            "G$generation · timestamp-later VALIDATION scoring $scoringUsed/$sampledScoringRows · policy frozen · TEST locked",
                         ),
                     )
                 }
-            }
-
-            if (!policyApplied) {
-                brains.forEachIndexed { i, brain -> calibrated[i] = BinaryTrainingPolicy.applyCalibration(brain, calibration[i]) }
             }
 
             val prodValidation = productionAcc.metrics()
@@ -313,7 +341,7 @@ class AimlHistoricalOptionCorpusV1Trainer(
                     "PRELABELLED_EVOLVE",
                     adaptiveGenerations,
                     HistoricalAdaptiveCandidateSearch.MAX_ADAPTIVE_GENERATIONS,
-                    "G$adaptiveGenerations ${guidance.name} · model evolves LR/L2 while TAKE/REJECT is recalibrated on embargoed early VALIDATION · TEST unchanged",
+                    "G$adaptiveGenerations ${guidance.name} · LR/L2 evolve · policy recalibrates only on timestamp-early VALIDATION · TEST unchanged",
                 ),
             )
             evaluations += trainAndEvaluateBatch(batch.candidates, adaptiveGenerations, guidance)
@@ -344,7 +372,7 @@ class AimlHistoricalOptionCorpusV1Trainer(
                 candidateHoldout = null,
                 productionHoldout = null,
                 champion = null,
-                note = "aiml-historical-option-row-v1 · ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved Candidates across G$adaptiveGenerations · TRAIN fits weights · ${EMBARGO_MINUTES}m leakage embargo · early VALIDATION calibrates TAKE/REJECT by cost-adjusted expectancy · later VALIDATION scores governance · TEST never opened · Development ${developmentGovernance.label}: ${developmentGovernance.reasons.joinToString("; ")}.",
+                note = "aiml-historical-option-row-v1 · time-causal TRAIN→calibration→embargo→scoring · TEST never opened · Development ${developmentGovernance.label}: ${developmentGovernance.reasons.joinToString("; ")}.",
             )
         }
 
@@ -354,12 +382,15 @@ class AimlHistoricalOptionCorpusV1Trainer(
             HistoricalCorpusTrainer.Progress(
                 "PRELABELLED_REFIT",
                 0,
-                1,
-                "Development-qualified after G$adaptiveGenerations · refitting weights on full TRAIN; calibrated policy remains frozen",
+                safeTrainRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                "Development-qualified after G$adaptiveGenerations · refitting on safe TRAIN only · policy frozen",
             ),
         )
-        store.forEach(AimlHistoricalOptionCorpusV1Store.Split.TRAIN, shouldCancel = shouldCancel) { record ->
-            if (record.index != index) return@forEach
+        store.forEach(
+            AimlHistoricalOptionCorpusV1Store.Split.TRAIN,
+            shouldCancel = shouldCancel,
+            accept = safeTrainAccept,
+        ) { record ->
             val s = sample(record)
             champion.learn(s.features, s.success, s.weight)
             fullTrain++
@@ -368,8 +399,8 @@ class AimlHistoricalOptionCorpusV1Trainer(
                     HistoricalCorpusTrainer.Progress(
                         "PRELABELLED_REFIT",
                         fullTrain.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                        trainRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                        "Full TRAIN refit · $fullTrain/$trainRows · policy fixed ${"%.1f".format(best.hyperParameters.takeThreshold * 100)}%/${"%.1f".format(best.hyperParameters.rejectThreshold * 100)}%",
+                        safeTrainRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        "Safe TRAIN refit · $fullTrain/$safeTrainRows · policy fixed ${"%.1f".format(best.hyperParameters.takeThreshold * 100)}%/${"%.1f".format(best.hyperParameters.rejectThreshold * 100)}%",
                     ),
                 )
             }
@@ -378,20 +409,20 @@ class AimlHistoricalOptionCorpusV1Trainer(
         val candidateTest = Acc()
         val productionTest = Acc()
         val production = brainFromBaseline(productionBaseline.hyperParameters)
-        var testSeen = 0L
         var testUsed = 0L
         onProgress(
             HistoricalCorpusTrainer.Progress(
                 "LOCKED_HOLDOUT",
                 0,
-                1,
-                "Development-qualified model + frozen policy · opening original TEST ONCE after ${EMBARGO_MINUTES}m purge band",
+                selectedTestRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                "Development-qualified model + frozen policy · opening original TEST ONCE",
             ),
         )
-        store.forEach(AimlHistoricalOptionCorpusV1Store.Split.TEST, shouldCancel = shouldCancel) { record ->
-            if (record.index != index) return@forEach
-            testSeen++
-            if (testSeen <= EMBARGO_MINUTES) return@forEach
+        store.forEach(
+            AimlHistoricalOptionCorpusV1Store.Split.TEST,
+            shouldCancel = shouldCancel,
+            accept = marketAccept,
+        ) { record ->
             val s = sample(record)
             candidateTest.add(champion.predict(s.features), s)
             productionTest.add(production.predict(s.features), s)
@@ -401,8 +432,8 @@ class AimlHistoricalOptionCorpusV1Trainer(
                     HistoricalCorpusTrainer.Progress(
                         "LOCKED_HOLDOUT",
                         testUsed.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                        testRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                        "Locked TEST · $testUsed evaluated · policy frozen",
+                        selectedTestRows.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                        "Locked TEST · $testUsed/$selectedTestRows · policy frozen",
                     ),
                 )
             }
@@ -424,7 +455,7 @@ class AimlHistoricalOptionCorpusV1Trainer(
                 evaluations.size,
                 evaluations.size,
                 when (governance.status) {
-                    HistoricalCandidateGovernance.Status.PASS -> "Original locked TEST + governance + leakage guard PASS · calibrated champion ready as Candidate only"
+                    HistoricalCandidateGovernance.Status.PASS -> "Original locked TEST + governance + time-leakage guard PASS · champion ready as Candidate only"
                     HistoricalCandidateGovernance.Status.INSUFFICIENT_DATA -> "Original locked TEST INSUFFICIENT DATA · cycle stops; TEST not reused"
                     HistoricalCandidateGovernance.Status.FAIL -> "Original locked TEST FAIL · cycle stops; TEST not reused"
                     HistoricalCandidateGovernance.Status.CLOSED -> "Original locked TEST stayed closed"
@@ -442,7 +473,7 @@ class AimlHistoricalOptionCorpusV1Trainer(
             candidateHoldout = candidateMetrics,
             productionHoldout = productionMetrics,
             champion = state,
-            note = "aiml-historical-option-row-v1 · TRAIN fits weights · ${EMBARGO_MINUTES}m purge/embargo around development boundaries · early VALIDATION calibrates cost-adjusted TAKE/REJECT · later VALIDATION scores robustness · ${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved across G$adaptiveGenerations · original TEST opened once only after purge band · 5m option future-return/MFE/MAE · conservative stop-first · costs included · historical D30 unavailable · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}.",
+            note = "aiml-historical-option-row-v1 · safe TRAIN tail purge · timestamp-early VALIDATION calibration · ${EMBARGO_MINUTES}m embargo · timestamp-later scoring · original TEST opened once only · deferred causal feature materialization · 5m cost-aware labels · Governance ${governance.label}: ${governance.reasons.joinToString("; ")}.",
         )
     }
 
@@ -623,8 +654,18 @@ class AimlHistoricalOptionCorpusV1Trainer(
         private const val CALIBRATION_FRACTION = 0.35
         private const val MIN_CALIBRATION_ROWS = 40L
         private const val MIN_SCORING_ROWS = 80L
-        private const val MIN_VALIDATION_ROWS = MIN_CALIBRATION_ROWS + MIN_SCORING_ROWS
         private const val EMBARGO_MINUTES = 6L
+        private const val EMBARGO_MS = EMBARGO_MINUTES * 60_000L
         private val IST: ZoneOffset = ZoneOffset.ofHoursMinutes(5, 30)
+
+        internal fun sampledCount(rows: Long, stride: Int): Long =
+            if (rows <= 0L) 0L else (rows + stride - 1L) / stride
+
+        internal fun timeFold(timestampMs: Long, startMs: Long, endMs: Long, folds: Int): Int {
+            if (folds <= 1 || endMs <= startMs) return 0
+            val span = (endMs - startMs + 1L).coerceAtLeast(1L)
+            val offset = (timestampMs - startMs).coerceIn(0L, span - 1L)
+            return ((offset * folds) / span).toInt().coerceIn(0, folds - 1)
+        }
     }
 }

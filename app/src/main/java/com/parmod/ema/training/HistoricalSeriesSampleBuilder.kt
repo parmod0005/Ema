@@ -4,6 +4,7 @@ import com.parmod.ema.backtest.UpstoxPlusHistoricalClient
 import com.parmod.ema.engine.NumericalMetaBrain
 import com.parmod.ema.engine.SignalEngineV2
 import com.parmod.ema.model.EngineId
+import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.PositionSide
 import kotlin.math.abs
 import kotlin.math.max
@@ -23,6 +24,7 @@ import kotlin.math.min
 internal object HistoricalSeriesSampleBuilder {
     data class Sample(
         val timestamp: Long,
+        val index: MarketIndex,
         val features: NumericalMetaBrain.Features,
         val success: Boolean,
         val weight: Double,
@@ -129,7 +131,7 @@ internal object HistoricalSeriesSampleBuilder {
                 recentEngineWinRate = 50.0,
                 recentEngineProfitFactor = 1.0,
             )
-            out += sample(options, i, features, outcome, side, engine)
+            out += sample(contract.index, options, i, features, outcome, side, engine)
         }
         return Result(out, nativeUnderlying = true, alignedUnderlyingBars = underlyingSeen.size)
     }
@@ -181,12 +183,13 @@ internal object HistoricalSeriesSampleBuilder {
                 recentEngineWinRate = 50.0,
                 recentEngineProfitFactor = 1.0,
             )
-            out += sample(options, i, features, outcome, side, engine)
+            out += sample(contract.index, options, i, features, outcome, side, engine)
         }
         return Result(out, nativeUnderlying = false, alignedUnderlyingBars = 0)
     }
 
     private fun sample(
+        index: MarketIndex,
         options: List<UpstoxPlusHistoricalClient.Candle>,
         i: Int,
         features: NumericalMetaBrain.Features,
@@ -195,6 +198,7 @@ internal object HistoricalSeriesSampleBuilder {
         engine: EngineId,
     ) = Sample(
         timestamp = options[i + 1].time.toInstant().toEpochMilli(),
+        index = index,
         features = features,
         success = outcome.success,
         weight = if (outcome.exitReason == HistoricalPremiumLabeler.ExitReason.TIMEOUT) 0.75 else 1.25,

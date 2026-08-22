@@ -6,6 +6,7 @@ import com.parmod.ema.model.MarketIndex
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.security.MessageDigest
 import java.time.LocalDate
 import java.util.Properties
@@ -14,16 +15,16 @@ import kotlin.math.abs
 /**
  * Resumable read-only Upstox historical downloader for NIFTY/SENSEX expired CE/PE data.
  *
- * Strike bands are anchored to an underlying close observed no later than the start of
- * each option research window. Matching 1-minute NIFTY/SENSEX index history is persisted
- * separately and later aligned causally to option labels. Resume markers are trusted only
- * after full contract-file verification.
+ * Planning uses the union of the persistent verified contract catalogue and fresh Upstox
+ * Plus expiry discovery. This preserves older known expired instrument keys even when the
+ * current discovery endpoint exposes a shorter history window.
  */
 class HistoricalCorpusDownloadManager(
     context: Context,
     private val store: DownloadedHistoricalCorpusStore = DownloadedHistoricalCorpusStore(context),
     private val cacheDirectory: File = File(context.filesDir, "upstox_backtest_cache/v1"),
     private val underlyingStore: DownloadedUnderlyingCorpusStore = DownloadedUnderlyingCorpusStore(context),
+    private val catalogStore: HistoricalContractCatalogStore = HistoricalContractCatalogStore(context),
 ) {
     data class Progress(
         val stage: String,
@@ -52,6 +53,7 @@ class HistoricalCorpusDownloadManager(
         val storage: DownloadedHistoricalCorpusStore.StorageStatus,
         val underlyingRows: Long = 0L,
         val underlyingRowsAdded: Long = 0L,
+        val catalogue: HistoricalContractCatalogStore.Summary = HistoricalContractCatalogStore.Summary(),
     )
 
     private data class Work(
@@ -62,11 +64,7 @@ class HistoricalCorpusDownloadManager(
         val referenceSpot: Double?,
     )
 
-    private data class Marker(
-        val identity: String,
-        val rows: Int,
-        val fingerprint: String,
-    )
+    private data class Marker(val identity: String, val rows: Int, val fingerprint: String)
 
     private val appContext = context.applicationContext
     private val markerRoot = File(appContext.filesDir, "vardhani_historical_download_markers/v$SCHEMA").apply { mkdirs() }
@@ -92,33 +90,32 @@ class HistoricalCorpusDownloadManager(
         var expiryCount = 0
         var earliestAvailable: LocalDate? = null
         var latestAvailable: LocalDate? = null
-        var coverageLimited = months == PrelabelledTrainingWindowPlan.FULL
         var referenceFallbacks = 0
         var underlyingRowsAdded = 0L
         val requestedStart = HistoricalDownloadPlanner.windowStart(months, today)
 
         markets.forEachIndexed { marketIndex, market ->
             if (shouldCancel()) error("Historical download cancelled")
-            onProgress(progress("DISCOVERY", marketIndex, markets.size, "Discovering ${market.name} expired option history…", client))
-            val available = runCatching { client.getExpiries(market) }
-                .getOrElse { error("Could not discover ${market.name} expiries: ${it.message}") }
+            onProgress(progress("DISCOVERY", marketIndex, markets.size, "Discovering ${market.name} · persistent catalogue + Upstox Plus…", client))
+
+            val freshExpiries = runCatching { client.getExpiries(market) }
+                .onFailure { errors += "${market.name}: fresh expiry discovery failed (${it.message}); retained catalogue will still be used" }
+                .getOrDefault(emptyList())
                 .filter { it.isBefore(today) }
                 .distinct()
                 .sorted()
+            val knownExpiries = catalogStore.expiries(market).filter { it.isBefore(today) }
+            val available = (knownExpiries + freshExpiries).distinct().sorted()
             if (available.isEmpty()) {
-                errors += "${market.name}: Upstox returned no completed expired-option expiries"
+                errors += "${market.name}: no completed expired-option expiries in Upstox discovery or local catalogue"
                 return@forEachIndexed
             }
-            val marketEarliest = available.first()
-            val marketLatest = available.last()
-            earliestAvailable = listOfNotNull(earliestAvailable, marketEarliest).minOrNull()
-            latestAvailable = listOfNotNull(latestAvailable, marketLatest).maxOrNull()
-            if (requestedStart != null && marketEarliest.isAfter(requestedStart.plusDays(COVERAGE_TOLERANCE_DAYS))) {
-                coverageLimited = true
-            }
 
+            earliestAvailable = listOfNotNull(earliestAvailable, available.first()).minOrNull()
+            latestAvailable = listOfNotNull(latestAvailable, available.last()).maxOrNull()
             val expiries = HistoricalDownloadPlanner.expiries(available, months, today)
             expiryCount += expiries.size
+
             expiries.forEachIndexed { expiryIndex, expiry ->
                 if (shouldCancel()) error("Historical download cancelled")
                 ensureStorage()
@@ -130,24 +127,27 @@ class HistoricalCorpusDownloadManager(
                     if (from.isAfter(expiry)) return@runCatching
 
                     val spotHistory = client.getHistoricalUnderlyingDailyCandles(
-                        index = market,
-                        fromDate = from.minusDays(SPOT_REFERENCE_LOOKBACK_DAYS),
-                        toDate = from,
+                        market,
+                        from.minusDays(SPOT_REFERENCE_LOOKBACK_DAYS),
+                        from,
                     )
-                    val referenceSpot = spotHistory
-                        .asSequence()
+                    val referenceSpot = spotHistory.asSequence()
                         .filter { !it.time.toLocalDate().isAfter(from) && it.close > 0.0 }
                         .maxByOrNull { it.time.toInstant().toEpochMilli() }
                         ?.close
                     if (referenceSpot == null) referenceFallbacks++
 
-                    val contracts = client.getExpiredOptionContracts(market, expiry)
-                    val selected = HistoricalDownloadPlanner.selectContracts(
-                        contracts = contracts,
-                        strikesEachSide = strikesEachSide,
-                        referenceSpot = referenceSpot,
-                    )
-                    if (selected.isEmpty()) errors += "${market.name} $expiry: no usable CE/PE contracts"
+                    val retained = catalogStore.contracts(market, expiry)
+                    val fresh = if (expiry in freshExpiries || retained.isEmpty()) {
+                        runCatching { client.getExpiredOptionContracts(market, expiry) }
+                            .onFailure { errors += "${market.name} $expiry contract refresh: ${it.message}" }
+                            .getOrDefault(emptyList())
+                    } else emptyList()
+                    if (fresh.isNotEmpty()) catalogStore.merge(market, expiry, fresh)
+                    val contracts = (retained + fresh)
+                        .distinctBy { "${it.instrumentKey}|${it.optionType}|${it.strike}" }
+                    val selected = HistoricalDownloadPlanner.selectContracts(contracts, strikesEachSide, referenceSpot)
+                    if (selected.isEmpty()) errors += "${market.name} $expiry: no usable verified CE/PE contracts"
                     selected.forEach { contract -> work += Work(market, contract, from, contract.expiry, referenceSpot) }
                 }.onFailure {
                     errors += "${market.name} $expiry discovery: ${(it.message ?: it::class.java.simpleName).take(220)}"
@@ -156,31 +156,8 @@ class HistoricalCorpusDownloadManager(
         }
 
         val distinctWork = work.distinctBy(::requestIdentity)
-        if (distinctWork.isEmpty()) {
-            val summary = store.summary()
-            val stats = client.requestStats()
-            return Result(
-                summary = summary,
-                expiries = expiryCount,
-                contractsPlanned = 0,
-                contractsDownloaded = 0,
-                contractsSkipped = 0,
-                rowsAdded = 0,
-                duplicatesRemoved = 0,
-                errors = (errors + "No historical option contracts were planned").distinct(),
-                stats = stats,
-                availableFrom = earliestAvailable,
-                availableTo = latestAvailable,
-                sourceCoverageLimited = coverageLimited,
-                strikeReferenceFallbacks = referenceFallbacks,
-                allAvailableWorkComplete = false,
-                storage = store.storageStatus(),
-                underlyingRows = underlyingStore.rows(),
-            )
-        }
+        if (distinctWork.isEmpty()) return emptyResult(client, expiryCount, earliestAvailable, latestAvailable, requestedStart, errors, referenceFallbacks)
 
-        // Download index context before options. One list is later shared by every contract
-        // for the same market/window; no future index bars are consumed by the sample builder.
         markets.forEach { market ->
             val marketWork = distinctWork.filter { it.index == market }
             if (marketWork.isEmpty()) return@forEach
@@ -198,8 +175,7 @@ class HistoricalCorpusDownloadManager(
                 runCatching {
                     val candles = client.getHistoricalUnderlyingMinuteCandles(market, chunkFrom, chunkTo)
                     require(candles.isNotEmpty()) { "No underlying index candles returned" }
-                    val saved = underlyingStore.save(market, candles)
-                    underlyingRowsAdded += saved.addedRows
+                    underlyingRowsAdded += underlyingStore.save(market, candles).addedRows
                 }.onFailure { e ->
                     errors += "${market.name} index context $chunkFrom → $chunkTo: ${(e.message ?: e::class.java.simpleName).take(220)}"
                 }
@@ -219,12 +195,12 @@ class HistoricalCorpusDownloadManager(
             val marker = readMarker(markerFile)
             if (marker != null && marker.identity == requestIdentity(item)) {
                 val verified = store.verifyContract(
-                    index = item.index,
-                    expiry = item.contract.expiry,
-                    strike = item.contract.strike,
-                    optionType = item.contract.optionType,
-                    expectedFingerprint = marker.fingerprint.takeIf(String::isNotBlank),
-                    expectedRows = marker.rows.takeIf { it > 0 },
+                    item.index,
+                    item.contract.expiry,
+                    item.contract.strike,
+                    item.contract.optionType,
+                    marker.fingerprint.takeIf(String::isNotBlank),
+                    marker.rows.takeIf { it > 0 },
                 )
                 if (verified.verified) {
                     if (marker.fingerprint.isBlank() || marker.rows <= 0) writeMarker(markerFile, item, verified.rows, verified.fingerprint)
@@ -237,7 +213,6 @@ class HistoricalCorpusDownloadManager(
 
             onProgress(progress("DOWNLOAD", i, distinctWork.size, "$label · downloading 1-minute candles…", client))
             runCatching {
-                ensureStorage()
                 val candles = client.getExpiredCandles(item.contract.instrumentKey, INTERVAL, item.fromDate, item.toDate)
                 require(candles.isNotEmpty()) { "No candles returned" }
                 ensureStorage()
@@ -257,9 +232,7 @@ class HistoricalCorpusDownloadManager(
                 duplicates += saved.duplicateRows
                 writeMarker(markerFile, item, saved.totalRows, saved.fingerprint)
                 downloaded++
-            }.onFailure { e ->
-                errors += "$label: ${(e.message ?: e::class.java.simpleName).take(220)}"
-            }
+            }.onFailure { e -> errors += "$label: ${(e.message ?: e::class.java.simpleName).take(220)}" }
             onProgress(progress("DOWNLOAD", i + 1, distinctWork.size, "$label · processed · phone corpus ${store.summary().optionContracts} contracts", client))
         }
 
@@ -269,45 +242,50 @@ class HistoricalCorpusDownloadManager(
         val complete = errors.isEmpty() && downloaded + skipped == distinctWork.size && markets.all { market ->
             distinctWork.none { it.index == market } || underlyingStore.rows(market) >= MIN_UNDERLYING_ROWS
         }
+        val coverageLimited = requestedStart == null || earliestAvailable == null || earliestAvailable!!.isAfter(requestedStart.plusDays(COVERAGE_TOLERANCE_DAYS))
         val coverageText = when {
-            earliestAvailable == null || latestAvailable == null -> "discovery coverage unknown"
-            coverageLimited -> "current expiry discovery $earliestAvailable → $latestAvailable; older locally known history is retained"
-            else -> "current expiry discovery $earliestAvailable → $latestAvailable"
+            earliestAvailable == null || latestAvailable == null -> "catalogue coverage unknown"
+            coverageLimited -> "verified catalogue/discovery $earliestAvailable → $latestAvailable (shorter than requested)"
+            else -> "verified catalogue/discovery $earliestAvailable → $latestAvailable"
         }
         onProgress(
             Progress(
-                stage = if (complete) "DOWNLOAD_COMPLETE" else "DOWNLOAD_PARTIAL",
-                completed = downloaded + skipped,
-                total = distinctWork.size,
-                message = "Historical download ${if (complete) "complete" else "partial"} · NIFTY ${summary.niftyContracts} · SENSEX ${summary.sensexContracts} · option rows ${summary.rowsAccepted} · index rows $underlyingRows · $coverageText",
-                cacheHits = stats.cacheHits,
-                networkRequests = stats.requests,
+                if (complete) "DOWNLOAD_COMPLETE" else "DOWNLOAD_PARTIAL",
+                downloaded + skipped,
+                distinctWork.size,
+                "Historical download ${if (complete) "complete" else "partial"} · NIFTY ${summary.niftyContracts} · SENSEX ${summary.sensexContracts} · option rows ${summary.rowsAccepted} · index rows $underlyingRows · $coverageText",
+                stats.cacheHits,
+                stats.requests,
             ),
         )
         return Result(
-            summary = summary,
-            expiries = expiryCount,
-            contractsPlanned = distinctWork.size,
-            contractsDownloaded = downloaded,
-            contractsSkipped = skipped,
-            rowsAdded = rowsAdded,
-            duplicatesRemoved = duplicates,
-            errors = errors.distinct().takeLast(80),
-            stats = stats,
-            availableFrom = earliestAvailable,
-            availableTo = latestAvailable,
-            sourceCoverageLimited = coverageLimited,
-            strikeReferenceFallbacks = referenceFallbacks,
-            allAvailableWorkComplete = complete,
-            storage = store.storageStatus(),
-            underlyingRows = underlyingRows,
-            underlyingRowsAdded = underlyingRowsAdded,
+            summary,
+            expiryCount,
+            distinctWork.size,
+            downloaded,
+            skipped,
+            rowsAdded,
+            duplicates,
+            errors.distinct().takeLast(80),
+            stats,
+            earliestAvailable,
+            latestAvailable,
+            coverageLimited,
+            referenceFallbacks,
+            complete,
+            store.storageStatus(),
+            underlyingRows,
+            underlyingRowsAdded,
+            catalogStore.summary(),
         )
     }
 
     fun summary(): LocalCorpusSummary = store.summary()
     fun storageStatus(): DownloadedHistoricalCorpusStore.StorageStatus = store.storageStatus()
     fun underlyingRows(index: MarketIndex? = null): Long = underlyingStore.rows(index)
+    fun catalogueSummary(): HistoricalContractCatalogStore.Summary = catalogStore.summary()
+    fun importCatalogue(input: InputStream, nameHint: String = ""): HistoricalContractCatalogImporter.Result =
+        HistoricalContractCatalogImporter(catalogStore).import(input, nameHint)
 
     @Synchronized
     fun clearDownloadedCorpus() {
@@ -317,13 +295,47 @@ class HistoricalCorpusDownloadManager(
         markerRoot.mkdirs()
     }
 
+    @Synchronized
+    fun clearCatalogue() = catalogStore.clear()
+
+    private fun emptyResult(
+        client: UpstoxPlusHistoricalClient,
+        expiryCount: Int,
+        earliest: LocalDate?,
+        latest: LocalDate?,
+        requestedStart: LocalDate?,
+        errors: List<String>,
+        referenceFallbacks: Int,
+    ): Result {
+        val summary = store.summary()
+        val stats = client.requestStats()
+        val limited = requestedStart == null || earliest == null || earliest.isAfter(requestedStart.plusDays(COVERAGE_TOLERANCE_DAYS))
+        return Result(
+            summary = summary,
+            expiries = expiryCount,
+            contractsPlanned = 0,
+            contractsDownloaded = 0,
+            contractsSkipped = 0,
+            rowsAdded = 0,
+            duplicatesRemoved = 0,
+            errors = (errors + "No historical option contracts were planned").distinct(),
+            stats = stats,
+            availableFrom = earliest,
+            availableTo = latest,
+            sourceCoverageLimited = limited,
+            strikeReferenceFallbacks = referenceFallbacks,
+            allAvailableWorkComplete = false,
+            storage = store.storageStatus(),
+            underlyingRows = underlyingStore.rows(),
+            catalogue = catalogStore.summary(),
+        )
+    }
+
     private fun ensureStorage() {
         val storage = store.storageStatus()
-        if (!storage.canDownload) {
-            error(
-                "Historical download paused by storage protection · free ${formatGiB(storage.freeBytes)} GB is below the ${formatGiB(storage.minimumFreeBytes)} GB safety floor · completed contracts retained",
-            )
-        }
+        if (!storage.canDownload) error(
+            "Historical download paused by storage protection · free ${formatGiB(storage.freeBytes)} GB is below the ${formatGiB(storage.minimumFreeBytes)} GB safety floor · completed contracts retained",
+        )
     }
 
     private fun progress(stage: String, completed: Int, total: Int, message: String, client: UpstoxPlusHistoricalClient): Progress {
@@ -351,10 +363,7 @@ class HistoricalCorpusDownloadManager(
                 rows = p.getProperty("rows")?.toIntOrNull() ?: 0,
                 fingerprint = p.getProperty("fingerprint").orEmpty(),
             )
-        }.getOrElse {
-            file.delete()
-            null
-        }
+        }.getOrElse { file.delete(); null }
     }
 
     private fun writeMarker(file: File, item: Work, rows: Int, fingerprint: String) {
@@ -393,7 +402,7 @@ class HistoricalCorpusDownloadManager(
     companion object {
         const val DEFAULT_STRIKES_EACH_SIDE = 5
         val ALLOWED_STRIKE_RADII: Set<Int> = setOf(2, 5, 10)
-        private const val SCHEMA = 3
+        private const val SCHEMA = 4
         private const val INTERVAL = "1minute"
         private const val CONTRACT_LOOKBACK_DAYS = 7L
         private const val SPOT_REFERENCE_LOOKBACK_DAYS = 10L
@@ -403,8 +412,7 @@ class HistoricalCorpusDownloadManager(
         private const val GIB = 1024L * 1024L * 1024L
 
         private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
-            .digest(value.toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
+            .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
     }
 }
 
@@ -445,10 +453,8 @@ object HistoricalDownloadPlanner {
         val strikes = contracts.map { it.strike }.filter { it > 0.0 }.distinct().sorted()
         if (strikes.isEmpty()) return emptyList()
         val centre = referenceSpot?.takeIf { it.isFinite() && it > 0.0 } ?: strikes[strikes.size / 2]
-        val selected = strikes
-            .sortedWith(compareBy<Double> { abs(it - centre) }.thenBy { it })
-            .take(strikesEachSide * 2 + 1)
-            .toSet()
+        val selected = strikes.sortedWith(compareBy<Double> { abs(it - centre) }.thenBy { it })
+            .take(strikesEachSide * 2 + 1).toSet()
         return contracts.asSequence()
             .filter { it.optionType == "CE" || it.optionType == "PE" }
             .filter { it.strike in selected }

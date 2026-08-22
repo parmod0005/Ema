@@ -10,15 +10,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.time.LocalDate
 
-/**
- * Persistent metadata catalogue for expired NIFTY/SENSEX option contracts.
- *
- * Upstox's current expiry-discovery response can be shorter than the candle history
- * accessible for an already-known expired instrument key. This catalogue therefore
- * retains every verified contract ever discovered/imported and unions it with fresh
- * discovery. No expiry date, instrument key or market identity is inferred from exchange
- * segment alone.
- */
+/** Persistent verified metadata catalogue for expired NIFTY/SENSEX option contracts. */
 class HistoricalContractCatalogStore(context: Context) {
     data class Summary(
         val niftyExpiries: Int = 0,
@@ -125,40 +117,63 @@ class HistoricalContractCatalogStore(context: Context) {
         private const val SCHEMA = 1
         private const val EXT = "vhc"
 
-        /** Parse one Upstox option-contract object without inventing missing metadata. */
-        fun parseContract(item: JSONObject, fallbackExpiry: LocalDate? = null): UpstoxPlusHistoricalClient.ExpiredContract? {
-            val type = item.optString("instrument_type").uppercase()
+        fun parseContract(item: JSONObject, fallbackExpiry: LocalDate? = null): UpstoxPlusHistoricalClient.ExpiredContract? =
+            parseContractFields(
+                instrumentKey = item.optString("instrument_key"),
+                expiryText = item.optString("expiry"),
+                fallbackExpiry = fallbackExpiry,
+                strike = item.optDouble("strike_price", Double.NaN),
+                optionType = item.optString("instrument_type"),
+                lotSize = item.optInt("lot_size", item.optInt("minimum_lot", 0)),
+                tradingSymbol = item.optString("trading_symbol"),
+            )
+
+        /** Pure validation helper so JVM tests do not depend on Android's JSONObject runtime. */
+        fun parseContractFields(
+            instrumentKey: String,
+            expiryText: String,
+            fallbackExpiry: LocalDate? = null,
+            strike: Double,
+            optionType: String,
+            lotSize: Int,
+            tradingSymbol: String = "",
+        ): UpstoxPlusHistoricalClient.ExpiredContract? {
+            val type = optionType.uppercase()
             if (type != "CE" && type != "PE") return null
-            val key = item.optString("instrument_key")
-            val strike = item.optDouble("strike_price", Double.NaN)
             val expiry = runCatching {
-                LocalDate.parse(item.optString("expiry").ifBlank { fallbackExpiry?.toString().orEmpty() })
+                LocalDate.parse(expiryText.ifBlank { fallbackExpiry?.toString().orEmpty() })
             }.getOrNull() ?: return null
-            val lot = item.optInt("lot_size", item.optInt("minimum_lot", 0))
-            if (key.isBlank() || !strike.isFinite() || strike <= 0.0 || lot <= 0) return null
+            if (instrumentKey.isBlank() || !strike.isFinite() || strike <= 0.0 || lotSize <= 0) return null
             return UpstoxPlusHistoricalClient.ExpiredContract(
-                instrumentKey = key,
+                instrumentKey = instrumentKey,
                 expiry = expiry,
                 strike = strike,
                 optionType = type,
-                lotSize = lot,
-                tradingSymbol = item.optString("trading_symbol"),
+                lotSize = lotSize,
+                tradingSymbol = tradingSymbol,
             )
         }
 
-        /**
-         * Market identity must be explicit in underlying/name/symbol/path metadata.
-         * NSE_FO/BSE_FO instrument-key prefixes identify an exchange segment, not NIFTY/SENSEX.
-         */
-        fun inferMarket(item: JSONObject, pathHint: String = ""): MarketIndex? {
-            val explicit = listOf(
-                item.optString("underlying_key"),
-                item.optString("underlying_symbol"),
-                item.optString("underlying_name"),
-                item.optString("name"),
-                item.optString("trading_symbol"),
-                pathHint,
-            ).joinToString("|").uppercase()
+        fun inferMarket(item: JSONObject, pathHint: String = ""): MarketIndex? = inferMarketFields(
+            underlyingKey = item.optString("underlying_key"),
+            underlyingSymbol = item.optString("underlying_symbol"),
+            underlyingName = item.optString("underlying_name"),
+            name = item.optString("name"),
+            tradingSymbol = item.optString("trading_symbol"),
+            pathHint = pathHint,
+        )
+
+        /** Exchange-segment prefixes alone are deliberately not accepted as market identity. */
+        fun inferMarketFields(
+            underlyingKey: String = "",
+            underlyingSymbol: String = "",
+            underlyingName: String = "",
+            name: String = "",
+            tradingSymbol: String = "",
+            pathHint: String = "",
+        ): MarketIndex? {
+            val explicit = listOf(underlyingKey, underlyingSymbol, underlyingName, name, tradingSymbol, pathHint)
+                .joinToString("|").uppercase()
             return when {
                 "SENSEX" in explicit -> MarketIndex.SENSEX
                 "NIFTY 50" in explicit || "NIFTY50" in explicit || "NIFTY-50" in explicit ||

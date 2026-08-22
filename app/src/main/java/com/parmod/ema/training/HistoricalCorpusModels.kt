@@ -34,8 +34,11 @@ data class HistoricalOptionSeries(
     val symbol: String,
     val source: String,
     val candles: List<UpstoxPlusHistoricalClient.Candle>,
+    /** Past/at-signal underlying index bars; empty means legacy option-premium proxy fallback. */
+    val underlyingCandles: List<UpstoxPlusHistoricalClient.Candle> = emptyList(),
 ) {
     val key: String get() = "${index.name}|${expiry}|${strike}|${optionType.uppercase()}"
+    val hasNativeUnderlyingContext: Boolean get() = underlyingCandles.isNotEmpty()
 }
 
 data class LocalCorpusSummary(

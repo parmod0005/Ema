@@ -1,6 +1,5 @@
 package com.parmod.ema.training
 
-import com.parmod.ema.backtest.UpstoxPlusHistoricalClient
 import com.parmod.ema.engine.MetaBrainRuntime
 import com.parmod.ema.engine.NumericalMetaBrain
 import com.parmod.ema.engine.SignalEngineV2
@@ -8,11 +7,12 @@ import com.parmod.ema.model.EngineId
 import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.PositionSide
 import java.time.LocalDate
-import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+
+private typealias JointRawHistoricalSample = HistoricalSeriesSampleBuilder.Sample
 
 /**
  * Joint historical research for the shared VARDHANI brain.
@@ -24,19 +24,6 @@ class JointHistoricalSeriesTrainer(
     private val productionBaseline: NumericalMetaBrain.ModelState,
     private val signalEngine: SignalEngineV2 = SignalEngineV2(),
 ) {
-    private data class Sample(
-        val timestamp: Long,
-        val index: MarketIndex,
-        val features: NumericalMetaBrain.Features,
-        val success: Boolean,
-        val weight: Double,
-        val mfeReturn: Double,
-        val maeReturn: Double,
-        val netReturn: Double,
-        val side: PositionSide,
-        val engine: EngineId,
-    )
-
     private data class Acc(
         var labels: Long = 0,
         var correct: Long = 0,
@@ -47,7 +34,7 @@ class JointHistoricalSeriesTrainer(
         var rejectLosses: Long = 0,
         var takeNet: Double = 0.0,
     ) {
-        fun add(prediction: NumericalMetaBrain.Prediction, sample: Sample) {
+        fun add(prediction: NumericalMetaBrain.Prediction, sample: JointRawHistoricalSample) {
             val y = if (sample.success) 1.0 else 0.0
             labels++
             if ((prediction.probabilitySuccess >= 0.50) == sample.success) correct++
@@ -108,12 +95,14 @@ class JointHistoricalSeriesTrainer(
         require(config.developmentFraction in 0.70..0.92)
         val selected = series.filter { it.index in MarketIndex.entries && it.optionType in setOf("CE", "PE") && it.candles.isNotEmpty() }
         val errors = mutableListOf<String>()
-        val samples = ArrayList<Sample>()
+        val samples = ArrayList<JointRawHistoricalSample>()
         var ce = 0
         var pe = 0
         var e1 = 0
         var e2 = 0
         var e3 = 0
+        var nativeUnderlyingContracts = 0
+        var proxyContracts = 0
 
         selected.forEachIndexed { i, contract ->
             if (shouldCancel()) error("Training cancelled")
@@ -128,9 +117,10 @@ class JointHistoricalSeriesTrainer(
             runCatching {
                 val candles = contract.candles.sortedBy { it.time.toInstant().toEpochMilli() }
                     .distinctBy { it.time.toInstant().toEpochMilli() }
-                val built = buildSamples(contract, candles, config)
-                samples += built
-                built.forEach { s ->
+                val built = HistoricalSeriesSampleBuilder.build(contract, candles, config, signalEngine)
+                if (built.nativeUnderlying) nativeUnderlyingContracts++ else proxyContracts++
+                samples += built.samples
+                built.samples.forEach { s ->
                     if (s.side == PositionSide.CE) ce++ else pe++
                     when (s.engine) {
                         EngineId.ENGINE_1_TREND -> e1++
@@ -141,13 +131,21 @@ class JointHistoricalSeriesTrainer(
             }.onFailure { errors += "${contract.index.name} ${contract.symbol.ifBlank { contract.key }}: ${it.message}" }
         }
 
-        val corpus = samples.sortedWith(compareBy<Sample> { it.timestamp }.thenBy { it.index.ordinal })
+        val corpus = samples.sortedWith(compareBy<JointRawHistoricalSample> { it.timestamp }.thenBy { it.index.ordinal })
         val coverage = HistoricalCorpusTrainer.Coverage(ce, pe, e1, e2, e3, 0)
         val marketCounts = MarketIndex.entries.associateWith { m -> corpus.count { it.index == m } }
         val from = selected.flatMap { it.candles }.minOfOrNull { it.time.toLocalDate() } ?: LocalDate.now().minusMonths(config.months)
         val to = selected.flatMap { it.candles }.maxOfOrNull { it.time.toLocalDate() } ?: LocalDate.now()
         val expiryCount = selected.map { it.index to it.expiry }.distinct().size
-        onProgress(HistoricalCorpusTrainer.Progress("JOINT_CORPUS", selected.size, selected.size, "Joint corpus ready · NIFTY ${marketCounts[MarketIndex.NIFTY]} · SENSEX ${marketCounts[MarketIndex.SENSEX]}"))
+        val contextNote = "signal context: native underlying $nativeUnderlyingContracts contract(s) · legacy option-premium proxy $proxyContracts contract(s)"
+        onProgress(
+            HistoricalCorpusTrainer.Progress(
+                "JOINT_CORPUS",
+                selected.size,
+                selected.size,
+                "Joint corpus ready · NIFTY ${marketCounts[MarketIndex.NIFTY]} · SENSEX ${marketCounts[MarketIndex.SENSEX]} · $contextNote",
+            ),
+        )
 
         val marketMin = max(config.minimumCorpusSamples / 2, 60)
         val missingMarket = MarketIndex.entries.firstOrNull { (marketCounts[it] ?: 0) < marketMin }
@@ -156,7 +154,7 @@ class JointHistoricalSeriesTrainer(
                 config, from, to, expiryCount, selected.size, corpus, coverage, 0, null,
                 false, false, null, null, null,
                 errors + if (missingMarket != null) "${missingMarket.name} needs at least $marketMin causal samples for BOTH-market training" else "Need at least ${config.minimumCorpusSamples} joint causal samples",
-                "$sourceLabel · BOTH-market training blocked until both NIFTY and SENSEX have adequate causal evidence.",
+                "$sourceLabel · $contextNote · BOTH-market training blocked until both NIFTY and SENSEX have adequate causal evidence.",
             )
         }
 
@@ -181,7 +179,7 @@ class JointHistoricalSeriesTrainer(
             return result(
                 config, from, to, expiryCount, selected.size, corpus, coverage, 0, null,
                 false, false, null, null, null, errors + reason,
-                "$sourceLabel · BOTH fail-closed leakage validation blocked training; Production unchanged.",
+                "$sourceLabel · $contextNote · BOTH fail-closed leakage validation blocked training; Production unchanged.",
             )
         }
         val seedHypers = candidateHyperParameters()
@@ -235,7 +233,7 @@ class JointHistoricalSeriesTrainer(
             return result(
                 config, from, to, expiryCount, selected.size, corpus, coverage, evaluations.size, best?.summary,
                 false, false, null, null, null, errors,
-                "$sourceLabel · BOTH joint model + policy search exhausted G$adaptiveGenerations · ${best?.governance?.label ?: "CLOSED"}: ${best?.governance?.reasons?.joinToString("; ") ?: "no candidate"} · leakage guard active · locked holdout never opened.",
+                "$sourceLabel · $contextNote · BOTH joint model + policy search exhausted G$adaptiveGenerations · ${best?.governance?.label ?: "CLOSED"}: ${best?.governance?.reasons?.joinToString("; ") ?: "no candidate"} · leakage guard active · locked holdout never opened.",
             )
         }
 
@@ -260,7 +258,7 @@ class JointHistoricalSeriesTrainer(
         val passed = governance.passed
         val state = if (passed) champion.snapshot().copy(mode = NumericalMetaBrain.Mode.SHADOW) else null
         val note = buildString {
-            append("$sourceLabel · BOTH NIFTY+SENSEX joint chronological corpus · ")
+            append("$sourceLabel · $contextNote · BOTH NIFTY+SENSEX joint chronological corpus · ")
             append("${seedHypers.size} seeds + ${evaluations.size - seedHypers.size} evolved across G$adaptiveGenerations · ")
             append("every TRAIN/calibration/scoring/holdout boundary purged by ${embargoMs / 60_000L}m · locked holdout opened once · ")
             append("dual-market governance ${governance.label}: ${governance.reasons.joinToString("; ")} · ")
@@ -273,76 +271,8 @@ class JointHistoricalSeriesTrainer(
         )
     }
 
-    private fun buildSamples(
-        contract: HistoricalOptionSeries,
-        candles: List<UpstoxPlusHistoricalClient.Candle>,
-        config: HistoricalCorpusTrainer.Config,
-    ): List<Sample> {
-        if (candles.size < 70) return emptyList()
-        val out = ArrayList<Sample>()
-        val bars = ArrayList<SignalEngineV2.Bar>(candles.size)
-        val engineConfig = SignalEngineV2.Config(minimumScore = config.minimumSignalScore)
-        candles.forEachIndexed { i, candle ->
-            if (candle.close <= 0.0) return@forEachIndexed
-            bars += SignalEngineV2.Bar(candle.open, candle.high, candle.low, candle.close, candle.volume)
-            if (i < 60 || i % config.sampleStrideBars != 0 || i + 1 >= candles.size) return@forEachIndexed
-            val evaluation = signalEngine.evaluate(bars, engineConfig)
-            if (evaluation.direction != SignalEngineV2.Direction.BULLISH || evaluation.score < config.minimumSignalScore) return@forEachIndexed
-            val outcome = HistoricalPremiumLabeler.label(candles, i, contract.lotSize, config.labelConfig) ?: return@forEachIndexed
-            val range = max(candle.high - candle.low, 0.01)
-            val orderFlow = ((candle.close - candle.open) / range).coerceIn(-1.0, 1.0)
-            val oiImpulse = openInterestImpulse(candles, i)
-            val optionFlow = (orderFlow * min(evaluation.volumeRatio, 3.0) / 3.0).coerceIn(-1.0, 1.0)
-            val acceleration = acceleration(candles, i)
-            val extensionAtr = if (evaluation.atr > 0.0) abs(candle.close - evaluation.ema50) / evaluation.atr else 0.0
-            val entryQuality = (
-                min(evaluation.adx, 40.0) / 40.0 * 16.0 +
-                    min(evaluation.atrExpansion, 2.0) / 2.0 * 12.0 +
-                    min(evaluation.volumeRatio, 2.0) / 2.0 * 12.0
-                ).coerceIn(0.0, 40.0)
-            val engine = historicalEngineProxy(evaluation, oiImpulse)
-            val side = if (contract.optionType == "CE") PositionSide.CE else PositionSide.PE
-            val local = candle.time
-            val features = NumericalMetaBrain.Features(
-                engine = engine,
-                index = contract.index,
-                side = side,
-                engineConfidence = evaluation.score.toDouble(),
-                directionScore = (evaluation.score * 0.60).coerceIn(0.0, 60.0),
-                entryQualityScore = entryQuality,
-                orderFlow = orderFlow,
-                relativeActivity = evaluation.volumeRatio,
-                oiImpulse = oiImpulse,
-                optionFlow = optionFlow,
-                acceleration = acceleration,
-                extensionAtr = extensionAtr,
-                depthImbalance = 0.0,
-                micropricePressure = 0.0,
-                totalBookPressure = 0.0,
-                wallPressure = 0.0,
-                depthLevels = 0.0,
-                minutesFromOpen = (local.hour * 60 + local.minute - (9 * 60 + 15)).coerceAtLeast(0).toDouble(),
-                recentEngineWinRate = 50.0,
-                recentEngineProfitFactor = 1.0,
-            )
-            out += Sample(
-                timestamp = candles[i + 1].time.toInstant().toEpochMilli(),
-                index = contract.index,
-                features = features,
-                success = outcome.success,
-                weight = if (outcome.exitReason == HistoricalPremiumLabeler.ExitReason.TIMEOUT) 0.75 else 1.25,
-                mfeReturn = outcome.mfeReturn,
-                maeReturn = outcome.maeReturn,
-                netReturn = outcome.netReturn,
-                side = side,
-                engine = engine,
-            )
-        }
-        return out
-    }
-
     private fun evaluateWalkForward(
-        development: List<Sample>,
+        development: List<JointRawHistoricalSample>,
         hyper: NumericalMetaBrain.HyperParameters,
         requestedFolds: Int,
         coverage: HistoricalCorpusTrainer.Coverage,
@@ -459,19 +389,20 @@ class JointHistoricalSeriesTrainer(
         }
     }
 
-    private fun evaluate(brain: NumericalMetaBrain, samples: List<Sample>): Acc =
+    private fun evaluate(brain: NumericalMetaBrain, samples: List<JointRawHistoricalSample>): Acc =
         Acc().also { a -> samples.forEach { a.add(brain.predict(it.features), it) } }
 
-    private fun evaluateAccByMarket(brain: NumericalMetaBrain, samples: List<Sample>): Map<MarketIndex, Acc> {
+    private fun evaluateAccByMarket(brain: NumericalMetaBrain, samples: List<JointRawHistoricalSample>): Map<MarketIndex, Acc> {
         val out = MarketIndex.entries.associateWith { Acc() }.toMutableMap()
         samples.forEach { out.getValue(it.index).add(brain.predict(it.features), it) }
         return out
     }
 
-    private fun evaluateByMarket(brain: NumericalMetaBrain, samples: List<Sample>): Map<MarketIndex, HistoricalCorpusTrainer.Metrics> =
+    private fun evaluateByMarket(brain: NumericalMetaBrain, samples: List<JointRawHistoricalSample>): Map<MarketIndex, HistoricalCorpusTrainer.Metrics> =
         evaluateAccByMarket(brain, samples).mapValues { it.value.metrics() }
 
-    private fun learn(brain: NumericalMetaBrain, samples: List<Sample>) = samples.forEach { brain.learn(it.features, it.success, it.weight) }
+    private fun learn(brain: NumericalMetaBrain, samples: List<JointRawHistoricalSample>) =
+        samples.forEach { brain.learn(it.features, it.success, it.weight) }
 
     private fun foldScore(c: HistoricalCorpusTrainer.Metrics, p: HistoricalCorpusTrainer.Metrics): Double {
         val accuracyGain = c.accuracy - p.accuracy
@@ -511,30 +442,6 @@ class JointHistoricalSeriesTrainer(
         return all.distinctBy { HistoricalAdaptiveCandidateSearch.signature(it) }
     }
 
-    private fun historicalEngineProxy(e: SignalEngineV2.Evaluation, oiImpulse: Double): EngineId = when {
-        e.volumeRatio >= 1.40 || abs(oiImpulse) >= 0.04 -> EngineId.ENGINE_2_AVWAP_LIQUIDITY
-        e.atrExpansion >= 1.25 -> EngineId.ENGINE_3_V76_SCALPER
-        else -> EngineId.ENGINE_1_TREND
-    }
-
-    private fun openInterestImpulse(candles: List<UpstoxPlusHistoricalClient.Candle>, index: Int): Double {
-        val current = candles[index].openInterest.toDouble()
-        if (current <= 0.0 || index <= 0) return 0.0
-        val prior = candles.subList(max(0, index - 20), index).map { it.openInterest.toDouble() }.filter { it > 0.0 }
-        if (prior.isEmpty()) return 0.0
-        val average = prior.average()
-        return ((current - average) / max(abs(average), 1.0)).coerceIn(-1.0, 1.0)
-    }
-
-    private fun acceleration(candles: List<UpstoxPlusHistoricalClient.Candle>, index: Int): Double {
-        if (index < 2) return 0.0
-        val a = candles[index - 2].close
-        val b = candles[index - 1].close
-        val c = candles[index].close
-        if (a <= 0.0 || b <= 0.0) return 0.0
-        return ((((c - b) / b) - ((b - a) / a)) * 1_000.0).coerceIn(-3.0, 3.0)
-    }
-
     private fun median(values: List<Double>, fallback: Double): Double {
         if (values.isEmpty()) return fallback
         val sorted = values.sorted()
@@ -548,7 +455,7 @@ class JointHistoricalSeriesTrainer(
         to: LocalDate,
         expiries: Int,
         contracts: Int,
-        corpus: List<Sample>,
+        corpus: List<JointRawHistoricalSample>,
         coverage: HistoricalCorpusTrainer.Coverage,
         candidates: Int,
         best: HistoricalCorpusTrainer.CandidateEvaluation?,

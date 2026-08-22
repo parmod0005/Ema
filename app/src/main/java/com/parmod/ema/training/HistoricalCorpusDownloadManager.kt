@@ -15,13 +15,15 @@ import kotlin.math.abs
  * Resumable read-only Upstox historical downloader for NIFTY/SENSEX expired CE/PE data.
  *
  * Strike bands are anchored to an underlying close observed no later than the start of
- * each option research window. Resume markers are trusted only after full contract-file
- * verification. The downloader reports the source's actual available date coverage.
+ * each option research window. Matching 1-minute NIFTY/SENSEX index history is persisted
+ * separately and later aligned causally to option labels. Resume markers are trusted only
+ * after full contract-file verification.
  */
 class HistoricalCorpusDownloadManager(
     context: Context,
     private val store: DownloadedHistoricalCorpusStore = DownloadedHistoricalCorpusStore(context),
     private val cacheDirectory: File = File(context.filesDir, "upstox_backtest_cache/v1"),
+    private val underlyingStore: DownloadedUnderlyingCorpusStore = DownloadedUnderlyingCorpusStore(context),
 ) {
     data class Progress(
         val stage: String,
@@ -48,6 +50,8 @@ class HistoricalCorpusDownloadManager(
         val strikeReferenceFallbacks: Int,
         val allAvailableWorkComplete: Boolean,
         val storage: DownloadedHistoricalCorpusStore.StorageStatus,
+        val underlyingRows: Long = 0L,
+        val underlyingRowsAdded: Long = 0L,
     )
 
     private data class Work(
@@ -90,6 +94,7 @@ class HistoricalCorpusDownloadManager(
         var latestAvailable: LocalDate? = null
         var coverageLimited = months == PrelabelledTrainingWindowPlan.FULL
         var referenceFallbacks = 0
+        var underlyingRowsAdded = 0L
         val requestedStart = HistoricalDownloadPlanner.windowStart(months, today)
 
         markets.forEachIndexed { marketIndex, market ->
@@ -142,12 +147,8 @@ class HistoricalCorpusDownloadManager(
                         strikesEachSide = strikesEachSide,
                         referenceSpot = referenceSpot,
                     )
-                    if (selected.isEmpty()) {
-                        errors += "${market.name} $expiry: no usable CE/PE contracts"
-                    }
-                    selected.forEach { contract ->
-                        work += Work(market, contract, from, contract.expiry, referenceSpot)
-                    }
+                    if (selected.isEmpty()) errors += "${market.name} $expiry: no usable CE/PE contracts"
+                    selected.forEach { contract -> work += Work(market, contract, from, contract.expiry, referenceSpot) }
                 }.onFailure {
                     errors += "${market.name} $expiry discovery: ${(it.message ?: it::class.java.simpleName).take(220)}"
                 }
@@ -174,7 +175,35 @@ class HistoricalCorpusDownloadManager(
                 strikeReferenceFallbacks = referenceFallbacks,
                 allAvailableWorkComplete = false,
                 storage = store.storageStatus(),
+                underlyingRows = underlyingStore.rows(),
             )
+        }
+
+        // Download index context before options. One list is later shared by every contract
+        // for the same market/window; no future index bars are consumed by the sample builder.
+        markets.forEach { market ->
+            val marketWork = distinctWork.filter { it.index == market }
+            if (marketWork.isEmpty()) return@forEach
+            val from = marketWork.minOf { it.fromDate }.minusDays(UNDERLYING_WARMUP_DAYS)
+            val to = marketWork.maxOf { it.toDate }
+            val chunks = HistoricalDownloadPlanner.monthChunks(from, to)
+            chunks.forEachIndexed { chunkIndex, (chunkFrom, chunkTo) ->
+                if (shouldCancel()) error("Historical download cancelled")
+                ensureStorage()
+                if (underlyingStore.hasUsableRange(market, chunkFrom, chunkTo)) {
+                    onProgress(progress("INDEX_CONTEXT", chunkIndex + 1, chunks.size, "${market.name} 1m $chunkFrom → $chunkTo · verified local skip", client))
+                    return@forEachIndexed
+                }
+                onProgress(progress("INDEX_CONTEXT", chunkIndex, chunks.size, "${market.name} 1m $chunkFrom → $chunkTo · downloading causal index context…", client))
+                runCatching {
+                    val candles = client.getHistoricalUnderlyingMinuteCandles(market, chunkFrom, chunkTo)
+                    require(candles.isNotEmpty()) { "No underlying index candles returned" }
+                    val saved = underlyingStore.save(market, candles)
+                    underlyingRowsAdded += saved.addedRows
+                }.onFailure { e ->
+                    errors += "${market.name} index context $chunkFrom → $chunkTo: ${(e.message ?: e::class.java.simpleName).take(220)}"
+                }
+            }
         }
 
         var downloaded = 0
@@ -198,9 +227,7 @@ class HistoricalCorpusDownloadManager(
                     expectedRows = marker.rows.takeIf { it > 0 },
                 )
                 if (verified.verified) {
-                    if (marker.fingerprint.isBlank() || marker.rows <= 0) {
-                        writeMarker(markerFile, item, verified.rows, verified.fingerprint)
-                    }
+                    if (marker.fingerprint.isBlank() || marker.rows <= 0) writeMarker(markerFile, item, verified.rows, verified.fingerprint)
                     skipped++
                     onProgress(progress("DOWNLOAD", i + 1, distinctWork.size, "$label · verified resume skip", client))
                     return@forEachIndexed
@@ -238,18 +265,21 @@ class HistoricalCorpusDownloadManager(
 
         val summary = store.summary()
         val stats = client.requestStats()
-        val complete = errors.isEmpty() && downloaded + skipped == distinctWork.size
+        val underlyingRows = underlyingStore.rows()
+        val complete = errors.isEmpty() && downloaded + skipped == distinctWork.size && markets.all { market ->
+            distinctWork.none { it.index == market } || underlyingStore.rows(market) >= MIN_UNDERLYING_ROWS
+        }
         val coverageText = when {
-            earliestAvailable == null || latestAvailable == null -> "source coverage unknown"
-            coverageLimited -> "available source coverage $earliestAvailable → $latestAvailable (shorter than requested window)"
-            else -> "source coverage $earliestAvailable → $latestAvailable"
+            earliestAvailable == null || latestAvailable == null -> "discovery coverage unknown"
+            coverageLimited -> "current expiry discovery $earliestAvailable → $latestAvailable; older locally known history is retained"
+            else -> "current expiry discovery $earliestAvailable → $latestAvailable"
         }
         onProgress(
             Progress(
                 stage = if (complete) "DOWNLOAD_COMPLETE" else "DOWNLOAD_PARTIAL",
                 completed = downloaded + skipped,
                 total = distinctWork.size,
-                message = "Historical download ${if (complete) "complete" else "partial"} · NIFTY ${summary.niftyContracts} · SENSEX ${summary.sensexContracts} · ${summary.rowsAccepted} unique rows · $coverageText",
+                message = "Historical download ${if (complete) "complete" else "partial"} · NIFTY ${summary.niftyContracts} · SENSEX ${summary.sensexContracts} · option rows ${summary.rowsAccepted} · index rows $underlyingRows · $coverageText",
                 cacheHits = stats.cacheHits,
                 networkRequests = stats.requests,
             ),
@@ -270,15 +300,19 @@ class HistoricalCorpusDownloadManager(
             strikeReferenceFallbacks = referenceFallbacks,
             allAvailableWorkComplete = complete,
             storage = store.storageStatus(),
+            underlyingRows = underlyingRows,
+            underlyingRowsAdded = underlyingRowsAdded,
         )
     }
 
     fun summary(): LocalCorpusSummary = store.summary()
     fun storageStatus(): DownloadedHistoricalCorpusStore.StorageStatus = store.storageStatus()
+    fun underlyingRows(index: MarketIndex? = null): Long = underlyingStore.rows(index)
 
     @Synchronized
     fun clearDownloadedCorpus() {
         store.clear()
+        underlyingStore.clear()
         markerRoot.deleteRecursively()
         markerRoot.mkdirs()
     }
@@ -359,11 +393,13 @@ class HistoricalCorpusDownloadManager(
     companion object {
         const val DEFAULT_STRIKES_EACH_SIDE = 5
         val ALLOWED_STRIKE_RADII: Set<Int> = setOf(2, 5, 10)
-        private const val SCHEMA = 2
+        private const val SCHEMA = 3
         private const val INTERVAL = "1minute"
         private const val CONTRACT_LOOKBACK_DAYS = 7L
         private const val SPOT_REFERENCE_LOOKBACK_DAYS = 10L
+        private const val UNDERLYING_WARMUP_DAYS = 7L
         private const val COVERAGE_TOLERANCE_DAYS = 7L
+        private const val MIN_UNDERLYING_ROWS = 60L
         private const val GIB = 1024L * 1024L * 1024L
 
         private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
@@ -384,6 +420,20 @@ object HistoricalDownloadPlanner {
 
     fun windowStart(months: Int, today: LocalDate): LocalDate? =
         if (months == PrelabelledTrainingWindowPlan.FULL) null else today.minusMonths(months.toLong())
+
+    /** Inclusive, gap-free chunks satisfying Upstox V3's <= one-month minute-data window. */
+    fun monthChunks(fromDate: LocalDate, toDate: LocalDate): List<Pair<LocalDate, LocalDate>> {
+        require(!fromDate.isAfter(toDate))
+        val out = ArrayList<Pair<LocalDate, LocalDate>>()
+        var cursor = fromDate
+        while (!cursor.isAfter(toDate)) {
+            val maxEnd = cursor.plusMonths(1).minusDays(1)
+            val end = if (maxEnd.isBefore(toDate)) maxEnd else toDate
+            out += cursor to end
+            cursor = end.plusDays(1)
+        }
+        return out
+    }
 
     fun selectContracts(
         contracts: List<UpstoxPlusHistoricalClient.ExpiredContract>,

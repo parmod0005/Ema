@@ -3,7 +3,9 @@ package com.parmod.ema
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -27,9 +29,7 @@ class HistoricalDataActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
-                    HistoricalDataScreen(
-                        openAiLab = { startActivity(Intent(this, MetaBrainLabActivity::class.java)) },
-                    )
+                    HistoricalDataScreen(openAiLab = { startActivity(Intent(this, MetaBrainLabActivity::class.java)) })
                 }
             }
         }
@@ -44,6 +44,10 @@ private fun HistoricalDataScreen(
     val state by vm.state.collectAsState()
     val corpus = state.summary
     val storage = state.storage
+    val catalog = state.catalogue
+    val importCatalogue = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importOldCatalogue(uri)
+    }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
@@ -51,7 +55,7 @@ private fun HistoricalDataScreen(
     ) {
         Text("VARDHANI HISTORICAL DATA", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         Text(
-            "Persistent read-only Upstox expired-option corpus · NIFTY + SENSEX · 1-minute CE/PE OHLC + volume + OI · verified resume",
+            "Persistent read-only Upstox Plus corpus · NIFTY + SENSEX · 1-minute CE/PE OHLC + volume + OI + aligned index context · verified resume",
             style = MaterialTheme.typography.labelMedium,
         )
 
@@ -60,7 +64,7 @@ private fun HistoricalDataScreen(
                 Text("DOWNLOADED CORPUS", fontWeight = FontWeight.Bold)
                 Row {
                     DownloadMetric("Contracts", corpus.optionContracts.toString(), Modifier.weight(1f))
-                    DownloadMetric("Rows", corpus.rowsAccepted.toString(), Modifier.weight(1f))
+                    DownloadMetric("Option rows", corpus.rowsAccepted.toString(), Modifier.weight(1f))
                     DownloadMetric("Deduped", corpus.duplicatesRemoved.toString(), Modifier.weight(1f))
                 }
                 Row {
@@ -68,14 +72,49 @@ private fun HistoricalDataScreen(
                     DownloadMetric("SENSEX", corpus.sensexContracts.toString(), Modifier.weight(1f))
                     DownloadMetric("CE / PE", "${corpus.ceContracts}/${corpus.peContracts}", Modifier.weight(1f))
                 }
-                Text("Local coverage ${corpus.fromDate ?: "--"} → ${corpus.toDate ?: "--"}", style = MaterialTheme.typography.labelSmall)
+                Row {
+                    DownloadMetric("NIFTY index 1m", state.niftyUnderlyingRows.toString(), Modifier.weight(1f))
+                    DownloadMetric("SENSEX index 1m", state.sensexUnderlyingRows.toString(), Modifier.weight(1f))
+                }
+                Text("Local option coverage ${corpus.fromDate ?: "--"} → ${corpus.toDate ?: "--"}", style = MaterialTheme.typography.labelSmall)
                 Text(
-                    if (corpus.bothMarketsPresent) "✓ BOTH-MARKET DOWNLOADED CORPUS AVAILABLE" else "Download BOTH so NIFTY + SENSEX can be trained/tested from the same source family",
+                    if (corpus.bothMarketsPresent && state.niftyUnderlyingRows > 0 && state.sensexUnderlyingRows > 0) {
+                        "✓ BOTH-MARKET OPTION + UNDERLYING CORPUS AVAILABLE"
+                    } else {
+                        "BOTH training needs verified NIFTY + SENSEX options and matching 1-minute index context"
+                    },
                     color = if (corpus.bothMarketsPresent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     fontWeight = FontWeight.Bold,
                     fontSize = 10.sp,
                 )
                 corpus.errors.takeLast(3).forEach { Text("⚠ $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
+            }
+        }
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Text("EXPIRED CONTRACT CATALOGUE", fontWeight = FontWeight.Bold)
+                Row {
+                    DownloadMetric("NIFTY expiries", catalog.niftyExpiries.toString(), Modifier.weight(1f))
+                    DownloadMetric("SENSEX expiries", catalog.sensexExpiries.toString(), Modifier.weight(1f))
+                    DownloadMetric("Contracts", catalog.contracts.toString(), Modifier.weight(1f))
+                }
+                Text("Catalogue coverage ${catalog.fromDate ?: "--"} → ${catalog.toDate ?: "--"}", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    "Fresh Upstox Plus discovery is merged with this catalogue. Older verified instrument keys remain reusable even if today's expiry-discovery response is shorter.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedButton(
+                    onClick = { importCatalogue.launch(arrayOf("application/zip", "application/json", "application/octet-stream", "*/*")) },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !state.isRunning && !state.isImportingCatalogue,
+                ) {
+                    Text(if (state.isImportingCatalogue) "IMPORTING…" else "IMPORT OLD UPSTOX ARCHIVE / contracts.json")
+                }
+                Text(
+                    "Import reads only real contracts.json metadata from a prior Upstox archive/ZIP. It does not guess expiry dates or instrument keys, and it does not change any model.",
+                    style = MaterialTheme.typography.labelSmall,
+                )
             }
         }
 
@@ -102,7 +141,7 @@ private fun HistoricalDataScreen(
                 Text("MARKET", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     HistoricalMarketScope.entries.forEach { scope ->
-                        DownloadChoice(scope.label, state.selectedScope == scope, Modifier.weight(1f), !state.isRunning) { vm.selectScope(scope) }
+                        DownloadChoice(scope.label, state.selectedScope == scope, Modifier.weight(1f), !state.isRunning && !state.isImportingCatalogue) { vm.selectScope(scope) }
                     }
                 }
 
@@ -113,12 +152,12 @@ private fun HistoricalDataScreen(
                             PrelabelledTrainingWindowPlan.label(months),
                             state.selectedMonths == months,
                             Modifier.weight(1f),
-                            !state.isRunning,
+                            !state.isRunning && !state.isImportingCatalogue,
                         ) { vm.selectMonths(months) }
                     }
                 }
                 Text(
-                    "Upstox currently documents expired-expiry discovery as covering up to about six months. 12M/FULL therefore downloads every expiry Upstox currently exposes and keeps older locally accumulated downloads; the actual returned source coverage is shown below.",
+                    "12M/FULL use every verified expiry in the persistent catalogue plus fresh Upstox Plus discovery. If catalogue coverage is shorter than requested, VARDHANI reports the gap instead of inventing data.",
                     style = MaterialTheme.typography.labelSmall,
                 )
 
@@ -129,12 +168,12 @@ private fun HistoricalDataScreen(
                             "${radius * 2 + 1} STRIKES",
                             state.strikeRadius == radius,
                             Modifier.weight(1f),
-                            !state.isRunning,
+                            !state.isRunning && !state.isImportingCatalogue,
                         ) { vm.selectStrikeRadius(radius) }
                     }
                 }
                 Text(
-                    "Strike bands are anchored to a NIFTY/SENSEX underlying close observed no later than the start of each option research window. 11 strikes/expiry is the balanced default; each selected strike keeps CE + PE when available.",
+                    "Strike bands are anchored to a NIFTY/SENSEX close observed no later than the start of each option research window. 11 strikes/expiry is the balanced default; CE + PE are kept when available.",
                     style = MaterialTheme.typography.labelSmall,
                 )
             }
@@ -153,7 +192,7 @@ private fun HistoricalDataScreen(
                     }
                     OutlinedButton(vm::cancel, Modifier.fillMaxWidth()) { Text("STOP DOWNLOAD SAFELY") }
                 } else {
-                    Button(vm::downloadOrResume, Modifier.fillMaxWidth(), enabled = storage.canDownload) {
+                    Button(vm::downloadOrResume, Modifier.fillMaxWidth(), enabled = storage.canDownload && !state.isImportingCatalogue) {
                         Text("DOWNLOAD / RESUME ${state.selectedScope.label} ${state.windowLabel}")
                     }
                     Text(state.message, style = MaterialTheme.typography.labelSmall)
@@ -165,13 +204,13 @@ private fun HistoricalDataScreen(
                 }
 
                 if (state.availableFrom != null || state.availableTo != null) {
-                    Text("Latest Upstox discovery coverage ${state.availableFrom ?: "?"} → ${state.availableTo ?: "?"}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall)
+                    Text("Verified catalogue/discovery coverage ${state.availableFrom ?: "?"} → ${state.availableTo ?: "?"}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall)
                 }
                 if (state.sourceCoverageLimited) {
-                    Text("⚠ Requested window is longer than the history currently returned by Upstox expiry discovery; VARDHANI did not invent missing history.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                    Text("⚠ Requested window is longer than verified catalogue/discovery coverage; missing history was not fabricated.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
                 }
                 if (state.strikeReferenceFallbacks > 0) {
-                    Text("⚠ ${state.strikeReferenceFallbacks} expiry plan(s) could not obtain a causal underlying reference and used deterministic centre-strike fallback; this is recorded, not hidden.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                    Text("⚠ ${state.strikeReferenceFallbacks} expiry plan(s) lacked a causal index reference and used deterministic centre-strike fallback; this is recorded.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
                 }
                 state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
             }
@@ -181,12 +220,12 @@ private fun HistoricalDataScreen(
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("TRAINING HANDOFF", fontWeight = FontWeight.Bold)
                 Text(
-                    "After download: AI LAB → source DOWNLOADED → choose NIFTY, SENSEX or BOTH → choose the desired local window → RUN training. Training is offline from the saved corpus and keeps the existing leakage guards/locked holdout.",
+                    "After download: AI LAB → DOWNLOADED → NIFTY, SENSEX or BOTH → select window → RUN. Direction comes from aligned 1-minute NIFTY/SENSEX bars; outcomes come from actual CE/PE premium paths.",
                     style = MaterialTheme.typography.bodySmall,
                 )
-                Button(openAiLab, Modifier.fillMaxWidth(), enabled = !state.isRunning && corpus.trainable) { Text("OPEN AI LAB") }
-                OutlinedButton(vm::refresh, Modifier.fillMaxWidth(), enabled = !state.isRunning) { Text("REFRESH CORPUS / STORAGE") }
-                OutlinedButton(vm::clearDownloaded, Modifier.fillMaxWidth(), enabled = !state.isRunning && corpus.optionContracts > 0) { Text("CLEAR DOWNLOADED HISTORICAL DATA") }
+                Button(openAiLab, Modifier.fillMaxWidth(), enabled = !state.isRunning && !state.isImportingCatalogue && corpus.trainable) { Text("OPEN AI LAB") }
+                OutlinedButton(vm::refresh, Modifier.fillMaxWidth(), enabled = !state.isRunning && !state.isImportingCatalogue) { Text("REFRESH CORPUS / CATALOGUE / STORAGE") }
+                OutlinedButton(vm::clearDownloaded, Modifier.fillMaxWidth(), enabled = !state.isRunning && !state.isImportingCatalogue && corpus.optionContracts > 0) { Text("CLEAR DOWNLOADED CANDLES (KEEP CATALOGUE)") }
             }
         }
 
@@ -194,11 +233,12 @@ private fun HistoricalDataScreen(
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("DATA SAFETY", fontWeight = FontWeight.Bold)
                 Text("• Read-only market-data APIs only; no broker order endpoint is involved.", style = MaterialTheme.typography.bodySmall)
-                Text("• Every saved contract is fully decoded, validated and SHA-256 fingerprinted before its resume marker is trusted.", style = MaterialTheme.typography.bodySmall)
+                Text("• Every saved option contract is fully decoded, validated and SHA-256 fingerprinted before its resume marker is trusted.", style = MaterialTheme.typography.bodySmall)
+                Text("• NIFTY/SENSEX 1-minute index context is stored separately and aligned only up to signal time.", style = MaterialTheme.typography.bodySmall)
                 Text("• Corrupt contract files are quarantined instead of silently entering training.", style = MaterialTheme.typography.bodySmall)
-                Text("• Interrupted downloads retain verified contracts and resume by skipping only verified request windows.", style = MaterialTheme.typography.bodySmall)
-                Text("• Historical D30/depth is never fabricated; missing depth features remain unavailable/zero in historical raw-series training.", style = MaterialTheme.typography.bodySmall)
-                Text("• Download storage is independent from your imported NIFTY corpus and LIVE ARCHIVE.", style = MaterialTheme.typography.bodySmall)
+                Text("• Interrupted downloads retain verified data; catalogue metadata remains available for later re-download.", style = MaterialTheme.typography.bodySmall)
+                Text("• Historical D30/depth is never fabricated; unavailable depth features remain zero.", style = MaterialTheme.typography.bodySmall)
+                Text("• Downloaded data is independent from the old imported NIFTY corpus and LIVE ARCHIVE.", style = MaterialTheme.typography.bodySmall)
             }
         }
 

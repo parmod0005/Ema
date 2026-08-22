@@ -40,6 +40,32 @@ class HistoricalDownloadPlannerTest {
     }
 
     @Test
+    fun minute_history_chunks_are_gap_free_and_never_exceed_one_month() {
+        val from = LocalDate.of(2024, 6, 3)
+        val to = LocalDate.of(2026, 8, 4)
+        val chunks = HistoricalDownloadPlanner.monthChunks(from, to)
+        assertTrue(chunks.size > 20)
+        assertEquals(from, chunks.first().first)
+        assertEquals(to, chunks.last().second)
+        chunks.forEachIndexed { i, (start, end) ->
+            assertFalse(start.isAfter(end))
+            assertFalse(start.isBefore(end.minusMonths(1)))
+            if (i > 0) assertEquals(chunks[i - 1].second.plusDays(1), start)
+        }
+    }
+
+    @Test
+    fun month_chunk_handles_month_end_without_gaps() {
+        val chunks = HistoricalDownloadPlanner.monthChunks(
+            LocalDate.of(2026, 1, 31),
+            LocalDate.of(2026, 4, 2),
+        )
+        assertEquals(LocalDate.of(2026, 1, 31), chunks.first().first)
+        assertEquals(LocalDate.of(2026, 4, 2), chunks.last().second)
+        chunks.zipWithNext().forEach { (a, b) -> assertEquals(a.second.plusDays(1), b.first) }
+    }
+
+    @Test
     fun causal_reference_spot_centres_selected_strike_band() {
         val expiry = LocalDate.of(2026, 8, 20)
         val contracts = contracts(expiry)

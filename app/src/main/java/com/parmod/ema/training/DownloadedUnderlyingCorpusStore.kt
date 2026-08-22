@@ -19,6 +19,12 @@ import java.time.ZoneOffset
 class DownloadedUnderlyingCorpusStore(context: Context) {
     data class SaveResult(val addedRows: Int, val totalRows: Int, val days: Int)
 
+    data class Coverage(
+        val rows: Long = 0L,
+        val fromDate: LocalDate? = null,
+        val toDate: LocalDate? = null,
+    )
+
     private data class DayData(
         val index: MarketIndex,
         val date: LocalDate,
@@ -75,6 +81,26 @@ class DownloadedUnderlyingCorpusStore(context: Context) {
         (index?.let(::files) ?: MarketIndex.entries.flatMap(::files)).sumOf { file ->
             runCatching { readHeaderCount(file).toLong() }.getOrDefault(0L)
         }
+
+    fun coverage(index: MarketIndex): Coverage {
+        val days = files(index).mapNotNull { file ->
+            runCatching { readDay(file) }.getOrNull()
+        }
+        if (days.isEmpty()) return Coverage()
+        return Coverage(
+            rows = days.sumOf { it.candles.size.toLong() },
+            fromDate = days.minOf { it.date },
+            toDate = days.maxOf { it.date },
+        )
+    }
+
+    @Synchronized
+    fun clear() {
+        root.deleteRecursively()
+        temp.deleteRecursively()
+        root.mkdirs()
+        temp.mkdirs()
+    }
 
     private fun writeDay(
         index: MarketIndex,

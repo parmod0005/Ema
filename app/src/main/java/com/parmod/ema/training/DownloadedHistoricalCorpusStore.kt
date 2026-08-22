@@ -39,7 +39,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         val minEpochMs: Long,
         val maxEpochMs: Long,
     ) {
-        val key: String get() = key(index, expiry, strike, optionType)
+        val key: String get() = DownloadedHistoricalCorpusStore.key(index, expiry, strike, optionType)
     }
 
     private data class Stored(val header: Header, val candles: List<UpstoxPlusHistoricalClient.Candle>)
@@ -220,7 +220,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         Stored(header, rows)
     }
 
-    private fun readHeader(file: File): Header = DataInputStream(FileInputStream(file).buffered(BUFFER)).use(::readHeader)
+    private fun readHeader(file: File): Header = DataInputStream(FileInputStream(file).buffered(BUFFER)).use { input -> readHeader(input) }
 
     private fun readHeader(input: DataInputStream): Header {
         require(input.readUTF() == MAGIC) { "Unsupported downloaded historical corpus schema" }

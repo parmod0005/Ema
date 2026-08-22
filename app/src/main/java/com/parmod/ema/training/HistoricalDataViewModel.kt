@@ -1,9 +1,11 @@
 package com.parmod.ema.training
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.parmod.ema.data.LocalCredentialVault
+import com.parmod.ema.model.MarketIndex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,11 +22,15 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
         val selectedMonths: Int = 6,
         val strikeRadius: Int = HistoricalCorpusDownloadManager.DEFAULT_STRIKES_EACH_SIDE,
         val isRunning: Boolean = false,
+        val isImportingCatalogue: Boolean = false,
         val stage: String = "IDLE",
         val completed: Int = 0,
         val total: Int = 0,
-        val message: String = "Ready · BOTH NIFTY + SENSEX · 6M available-source download selected",
+        val message: String = "Ready · BOTH NIFTY + SENSEX · 6M verified historical download selected",
         val summary: LocalCorpusSummary = LocalCorpusSummary(),
+        val catalogue: HistoricalContractCatalogStore.Summary = HistoricalContractCatalogStore.Summary(),
+        val niftyUnderlyingRows: Long = 0L,
+        val sensexUnderlyingRows: Long = 0L,
         val storage: DownloadedHistoricalCorpusStore.StorageStatus = DownloadedHistoricalCorpusStore.StorageStatus(0L, 0L),
         val cacheHits: Long = 0L,
         val networkRequests: Long = 0L,
@@ -40,11 +46,10 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
         val windowLabel: String get() = PrelabelledTrainingWindowPlan.label(selectedMonths)
     }
 
+    private val app = application
     private val vault = LocalCredentialVault(application)
     private val manager = HistoricalCorpusDownloadManager(application)
-    private val _state = MutableStateFlow(
-        UiState(summary = manager.summary(), storage = manager.storageStatus()),
-    )
+    private val _state = MutableStateFlow(snapshotState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     private var job: Job? = null
@@ -52,11 +57,7 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
 
     fun selectScope(scope: HistoricalMarketScope) {
         if (busy()) return
-        _state.value = _state.value.copy(
-            selectedScope = scope,
-            message = "${scope.label} historical download selected",
-            error = null,
-        )
+        _state.value = _state.value.copy(selectedScope = scope, message = "${scope.label} historical download selected", error = null)
     }
 
     fun selectMonths(months: Int) {
@@ -64,8 +65,8 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
         _state.value = _state.value.copy(
             selectedMonths = months,
             message = when (months) {
-                PrelabelledTrainingWindowPlan.FULL -> "FULL selected · download every expired expiry Upstox currently exposes; locally accumulated older data is retained"
-                12 -> "12M selected · Upstox may expose a shorter expired-expiry history; actual returned coverage will be reported"
+                PrelabelledTrainingWindowPlan.FULL -> "FULL selected · persistent old contract catalogue + fresh Upstox Plus discovery · actual verified coverage will be shown"
+                12 -> "12M selected · old verified catalogue is reused beyond today's fresh expiry-discovery window"
                 else -> "${PrelabelledTrainingWindowPlan.label(months)} historical download selected"
             },
             error = null,
@@ -79,6 +80,47 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
             message = "${radius * 2 + 1} causal spot-centred strikes/expiry selected · CE + PE",
             error = null,
         )
+    }
+
+    fun importOldCatalogue(uri: Uri) {
+        if (busy()) return
+        _state.value = _state.value.copy(
+            isImportingCatalogue = true,
+            stage = "CATALOGUE_IMPORT",
+            message = "Importing real expired-option contract metadata from prior Upstox archive…",
+            error = null,
+        )
+        job = viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    val name = runCatching {
+                        app.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                            if (cursor.moveToFirst()) cursor.getString(0) else null
+                        }
+                    }.getOrNull().orEmpty()
+                    val input = app.contentResolver.openInputStream(uri) ?: error("Could not open selected archive")
+                    input.use { manager.importCatalogue(it, name) }
+                }
+                val catalog = manager.catalogueSummary()
+                _state.value = _state.value.copy(
+                    isImportingCatalogue = false,
+                    stage = "CATALOGUE_READY",
+                    catalogue = catalog,
+                    message = "Catalogue import complete · NIFTY expiries ${catalog.niftyExpiries} · SENSEX ${catalog.sensexExpiries} · contracts ${catalog.contracts} · newly added ${result.contractsAdded}",
+                    errors = result.errors.size,
+                    error = result.errors.lastOrNull(),
+                )
+            } catch (error: Throwable) {
+                _state.value = _state.value.copy(
+                    isImportingCatalogue = false,
+                    stage = "CATALOGUE_ERROR",
+                    message = "Catalogue import stopped safely · existing catalogue retained",
+                    error = (error.message ?: error::class.java.simpleName).take(300),
+                )
+            } finally {
+                job = null
+            }
+        }
     }
 
     fun downloadOrResume() {
@@ -130,6 +172,9 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
                     completed = result.contractsDownloaded + result.contractsSkipped,
                     total = result.contractsPlanned,
                     summary = result.summary,
+                    catalogue = result.catalogue,
+                    niftyUnderlyingRows = manager.underlyingRows(MarketIndex.NIFTY),
+                    sensexUnderlyingRows = manager.underlyingRows(MarketIndex.SENSEX),
                     storage = result.storage,
                     cacheHits = result.stats.cacheHits,
                     networkRequests = result.stats.requests,
@@ -140,11 +185,12 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
                     strikeReferenceFallbacks = result.strikeReferenceFallbacks,
                     allAvailableWorkComplete = result.allAvailableWorkComplete,
                     message = buildString {
-                        append(if (partial) "Partial download retained safely" else "All currently available requested work verified")
+                        append(if (partial) "Partial download retained safely" else "Requested verified catalogue work complete")
                         append(" · new ").append(result.contractsDownloaded)
                         append(" · resume skips ").append(result.contractsSkipped)
-                        append(" · rows +").append(result.rowsAdded)
-                        if (result.sourceCoverageLimited) append(" · requested window exceeds current Upstox expired-expiry coverage")
+                        append(" · option rows +").append(result.rowsAdded)
+                        append(" · index rows +").append(result.underlyingRowsAdded)
+                        if (result.sourceCoverageLimited) append(" · requested window exceeds verified catalogue coverage")
                     },
                     error = result.errors.lastOrNull()?.take(300),
                 )
@@ -154,12 +200,11 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
                     isRunning = false,
                     stage = if (cancelled) "CANCELLED" else "ERROR",
                     summary = manager.summary(),
+                    catalogue = manager.catalogueSummary(),
+                    niftyUnderlyingRows = manager.underlyingRows(MarketIndex.NIFTY),
+                    sensexUnderlyingRows = manager.underlyingRows(MarketIndex.SENSEX),
                     storage = manager.storageStatus(),
-                    message = if (cancelled) {
-                        "Download stopped safely · verified contracts retained · press DOWNLOAD / RESUME to continue"
-                    } else {
-                        "Download stopped safely · verified contracts retained"
-                    },
+                    message = if (cancelled) "Download stopped safely · verified data retained · press DOWNLOAD / RESUME to continue" else "Download stopped safely · verified data retained",
                     error = if (cancelled) null else (error.message ?: error::class.java.simpleName).take(300),
                 )
             } finally {
@@ -177,21 +222,14 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
 
     fun refresh() {
         if (busy()) return
-        _state.value = _state.value.copy(
-            summary = manager.summary(),
-            storage = manager.storageStatus(),
-            message = "Downloaded historical corpus refreshed",
-            error = null,
-        )
+        _state.value = snapshotState(_state.value).copy(message = "Downloaded historical corpus + contract catalogue refreshed", error = null)
     }
 
     fun clearDownloaded() {
         if (busy()) return
         runCatching { manager.clearDownloadedCorpus() }
             .onSuccess {
-                _state.value = _state.value.copy(
-                    summary = LocalCorpusSummary(),
-                    storage = manager.storageStatus(),
+                _state.value = snapshotState(_state.value).copy(
                     stage = "IDLE",
                     completed = 0,
                     total = 0,
@@ -201,14 +239,22 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
                     sourceCoverageLimited = false,
                     strikeReferenceFallbacks = 0,
                     allAvailableWorkComplete = false,
-                    message = "Downloaded historical corpus cleared · imported corpus, live archive and models unchanged",
+                    message = "Downloaded candles/index context cleared · historical contract catalogue retained for re-download",
                     error = null,
                 )
             }
             .onFailure { _state.value = _state.value.copy(error = "Could not clear downloaded corpus: ${it.message}") }
     }
 
-    private fun busy(): Boolean = job?.isActive == true || _state.value.isRunning
+    private fun snapshotState(base: UiState = UiState()): UiState = base.copy(
+        summary = manager.summary(),
+        catalogue = manager.catalogueSummary(),
+        niftyUnderlyingRows = manager.underlyingRows(MarketIndex.NIFTY),
+        sensexUnderlyingRows = manager.underlyingRows(MarketIndex.SENSEX),
+        storage = manager.storageStatus(),
+    )
+
+    private fun busy(): Boolean = job?.isActive == true || _state.value.isRunning || _state.value.isImportingCatalogue
 
     override fun onCleared() {
         cancelRequested = true

@@ -32,6 +32,10 @@
             android:exported="true"
             android:label="VARDHANI AI LAB" />
         <activity
+            android:name=".HistoricalDataActivity"
+            android:exported="true"
+            android:label="VARDHANI HISTORICAL DATA" />
+        <activity
             android:name=".ResearchArchiveActivity"
             android:exported="true"
             android:label="VARDHANI RESEARCH BACKUP" />

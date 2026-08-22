@@ -28,6 +28,10 @@ class VardhaniApplication : Application() {
             action = Intent.ACTION_VIEW
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
+        val historyIntent = Intent(this, HistoricalDataActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
         val backupIntent = Intent(this, ResearchArchiveActivity::class.java).apply {
             action = Intent.ACTION_VIEW
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -38,12 +42,18 @@ class VardhaniApplication : Application() {
             .setIcon(Icon.createWithResource(this, R.drawable.vardhani_logo))
             .setIntent(aiIntent)
             .build()
+        val history = ShortcutInfo.Builder(this, "vardhani_historical_data")
+            .setShortLabel("HISTORICAL DATA")
+            .setLongLabel("VARDHANI HISTORICAL DATA")
+            .setIcon(Icon.createWithResource(this, R.drawable.vardhani_logo))
+            .setIntent(historyIntent)
+            .build()
         val backup = ShortcutInfo.Builder(this, "vardhani_research_backup")
             .setShortLabel("RESEARCH BACKUP")
             .setLongLabel("VARDHANI RESEARCH BACKUP")
             .setIcon(Icon.createWithResource(this, R.drawable.vardhani_logo))
             .setIntent(backupIntent)
             .build()
-        shortcutManager.dynamicShortcuts = listOf(ai, backup)
+        shortcutManager.dynamicShortcuts = listOf(ai, history, backup)
     }
 }

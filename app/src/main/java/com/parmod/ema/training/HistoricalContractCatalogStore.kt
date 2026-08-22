@@ -16,7 +16,8 @@ import java.time.LocalDate
  * Upstox's current expiry-discovery response can be shorter than the candle history
  * accessible for an already-known expired instrument key. This catalogue therefore
  * retains every verified contract ever discovered/imported and unions it with fresh
- * discovery. No expiry date or instrument key is inferred.
+ * discovery. No expiry date, instrument key or market identity is inferred from exchange
+ * segment alone.
  */
 class HistoricalContractCatalogStore(context: Context) {
     data class Summary(
@@ -30,11 +31,7 @@ class HistoricalContractCatalogStore(context: Context) {
     private val root = File(context.applicationContext.filesDir, "vardhani_historical_contract_catalog/v$SCHEMA").apply { mkdirs() }
 
     @Synchronized
-    fun merge(
-        index: MarketIndex,
-        expiry: LocalDate,
-        incoming: List<UpstoxPlusHistoricalClient.ExpiredContract>,
-    ): Int {
+    fun merge(index: MarketIndex, expiry: LocalDate, incoming: List<UpstoxPlusHistoricalClient.ExpiredContract>): Int {
         val valid = incoming.filter {
             it.expiry == expiry && it.instrumentKey.isNotBlank() && it.strike > 0.0 &&
                 it.optionType in setOf("CE", "PE") && it.lotSize > 0
@@ -62,7 +59,7 @@ class HistoricalContractCatalogStore(context: Context) {
     fun summary(): Summary {
         val nifty = expiries(MarketIndex.NIFTY)
         val sensex = expiries(MarketIndex.SENSEX)
-        val all = (nifty.map { MarketIndex.NIFTY to it } + sensex.map { MarketIndex.SENSEX to it })
+        val all = nifty.map { MarketIndex.NIFTY to it } + sensex.map { MarketIndex.SENSEX to it }
         return Summary(
             niftyExpiries = nifty.size,
             sensexExpiries = sensex.size,
@@ -115,9 +112,7 @@ class HistoricalContractCatalogStore(context: Context) {
         require(LocalDate.parse(rootJson.getString("expiry")) == expectedExpiry)
         val rows = rootJson.getJSONArray("contracts")
         return buildList {
-            for (i in 0 until rows.length()) {
-                parseContract(rows.getJSONObject(i), expectedExpiry)?.let(::add)
-            }
+            for (i in 0 until rows.length()) parseContract(rows.getJSONObject(i), expectedExpiry)?.let(::add)
         }.distinctBy { "${it.instrumentKey}|${it.optionType}|${it.strike}" }
     }
 
@@ -151,17 +146,23 @@ class HistoricalContractCatalogStore(context: Context) {
             )
         }
 
+        /**
+         * Market identity must be explicit in underlying/name/symbol/path metadata.
+         * NSE_FO/BSE_FO instrument-key prefixes identify an exchange segment, not NIFTY/SENSEX.
+         */
         fun inferMarket(item: JSONObject, pathHint: String = ""): MarketIndex? {
-            val haystack = listOf(
+            val explicit = listOf(
                 item.optString("underlying_key"),
                 item.optString("underlying_symbol"),
+                item.optString("underlying_name"),
                 item.optString("name"),
                 item.optString("trading_symbol"),
                 pathHint,
             ).joinToString("|").uppercase()
             return when {
-                "SENSEX" in haystack || "BSE_INDEX" in haystack || "BSE_FO" in haystack -> MarketIndex.SENSEX
-                "NIFTY" in haystack || "NSE_INDEX" in haystack || "NSE_FO" in haystack -> MarketIndex.NIFTY
+                "SENSEX" in explicit -> MarketIndex.SENSEX
+                "NIFTY 50" in explicit || "NIFTY50" in explicit || "NIFTY-50" in explicit ||
+                    "NIFTY_50" in explicit || "NIFTY" in explicit -> MarketIndex.NIFTY
                 else -> null
             }
         }

@@ -17,7 +17,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.parmod.ema.training.HistoricalCorpusDownloadManager
-import com.parmod.ema.training.HistoricalCorpusTrainingViewModel
+import com.parmod.ema.training.HistoricalDataViewModel
 import com.parmod.ema.training.HistoricalMarketScope
 import com.parmod.ema.training.PrelabelledTrainingWindowPlan
 
@@ -28,9 +28,7 @@ class HistoricalDataActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
                     HistoricalDataScreen(
-                        openAiLab = {
-                            startActivity(Intent(this, MetaBrainLabActivity::class.java))
-                        },
+                        openAiLab = { startActivity(Intent(this, MetaBrainLabActivity::class.java)) },
                     )
                 }
             }
@@ -40,12 +38,12 @@ class HistoricalDataActivity : ComponentActivity() {
 
 @Composable
 private fun HistoricalDataScreen(
-    vm: HistoricalCorpusTrainingViewModel = viewModel(),
+    vm: HistoricalDataViewModel = viewModel(),
     openAiLab: () -> Unit,
 ) {
     val state by vm.state.collectAsState()
-    val corpus = state.downloadedSummary
-    val busy = state.isDownloading || state.isRunning || state.isImporting
+    val corpus = state.summary
+    val storage = state.storage
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
@@ -53,7 +51,7 @@ private fun HistoricalDataScreen(
     ) {
         Text("VARDHANI HISTORICAL DATA", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         Text(
-            "Persistent read-only Upstox expired-option downloader · NIFTY + SENSEX · 1-minute CE/PE candles · resumable phone corpus",
+            "Persistent read-only Upstox expired-option corpus · NIFTY + SENSEX · 1-minute CE/PE OHLC + volume + OI · verified resume",
             style = MaterialTheme.typography.labelMedium,
         )
 
@@ -70,15 +68,30 @@ private fun HistoricalDataScreen(
                     DownloadMetric("SENSEX", corpus.sensexContracts.toString(), Modifier.weight(1f))
                     DownloadMetric("CE / PE", "${corpus.ceContracts}/${corpus.peContracts}", Modifier.weight(1f))
                 }
+                Text("Local coverage ${corpus.fromDate ?: "--"} → ${corpus.toDate ?: "--"}", style = MaterialTheme.typography.labelSmall)
                 Text(
-                    "Coverage ${corpus.fromDate ?: "--"} → ${corpus.toDate ?: "--"}",
-                    style = MaterialTheme.typography.labelSmall,
-                )
-                Text(
-                    if (corpus.bothMarketsPresent) "✓ BOTH-MARKET HISTORICAL CORPUS READY" else "Download BOTH to enable downloaded NIFTY + SENSEX joint training",
+                    if (corpus.bothMarketsPresent) "✓ BOTH-MARKET DOWNLOADED CORPUS AVAILABLE" else "Download BOTH so NIFTY + SENSEX can be trained/tested from the same source family",
                     color = if (corpus.bothMarketsPresent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     fontWeight = FontWeight.Bold,
                     fontSize = 10.sp,
+                )
+                corpus.errors.takeLast(3).forEach { Text("⚠ $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
+            }
+        }
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("PHONE STORAGE", fontWeight = FontWeight.Bold)
+                Row {
+                    DownloadMetric("Corpus", formatBytes(storage.corpusBytes), Modifier.weight(1f))
+                    DownloadMetric("Free", formatBytes(storage.freeBytes), Modifier.weight(1f))
+                    DownloadMetric("Safety floor", formatBytes(storage.minimumFreeBytes), Modifier.weight(1f))
+                }
+                Text(
+                    if (storage.canDownload) "Storage healthy" else "STORAGE PROTECTION ACTIVE · new historical downloads paused; verified data retained",
+                    color = if (storage.canDownload) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.labelSmall,
                 )
             }
         }
@@ -89,36 +102,39 @@ private fun HistoricalDataScreen(
                 Text("MARKET", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     HistoricalMarketScope.entries.forEach { scope ->
-                        DownloadChoice(scope.label, state.selectedMarketScope == scope, Modifier.weight(1f), !busy) { vm.selectMarketScope(scope) }
+                        DownloadChoice(scope.label, state.selectedScope == scope, Modifier.weight(1f), !state.isRunning) { vm.selectScope(scope) }
                     }
                 }
 
-                Text("HISTORY WINDOW", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                Text("REQUESTED WINDOW", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     listOf(1, 3, 6, 12, PrelabelledTrainingWindowPlan.FULL).forEach { months ->
                         DownloadChoice(
                             PrelabelledTrainingWindowPlan.label(months),
                             state.selectedMonths == months,
                             Modifier.weight(1f),
-                            !busy,
+                            !state.isRunning,
                         ) { vm.selectMonths(months) }
                     }
                 }
+                Text(
+                    "Upstox currently documents expired-expiry discovery as covering up to about six months. 12M/FULL therefore downloads every expiry Upstox currently exposes and keeps older locally accumulated downloads; the actual returned source coverage is shown below.",
+                    style = MaterialTheme.typography.labelSmall,
+                )
 
                 Text("OPTION STRIKE DENSITY / EXPIRY", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     HistoricalCorpusDownloadManager.ALLOWED_STRIKE_RADII.sorted().forEach { radius ->
-                        val strikes = radius * 2 + 1
                         DownloadChoice(
-                            "$strikes STRIKES",
-                            state.downloadStrikeRadius == radius,
+                            "${radius * 2 + 1} STRIKES",
+                            state.strikeRadius == radius,
                             Modifier.weight(1f),
-                            !busy,
-                        ) { vm.selectDownloadStrikeRadius(radius) }
+                            !state.isRunning,
+                        ) { vm.selectStrikeRadius(radius) }
                     }
                 }
                 Text(
-                    "Each selected strike downloads both available CE and PE contracts. 11 strikes/expiry is the balanced default; 21 is broader but takes substantially more time/storage.",
+                    "Strike bands are anchored to a NIFTY/SENSEX underlying close observed no later than the start of each option research window. 11 strikes/expiry is the balanced default; each selected strike keeps CE + PE when available.",
                     style = MaterialTheme.typography.labelSmall,
                 )
             }
@@ -127,29 +143,35 @@ private fun HistoricalDataScreen(
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("DOWNLOAD / RESUME", fontWeight = FontWeight.Bold)
-                if (state.isDownloading) {
-                    LinearProgressIndicator({ state.downloadProgress }, Modifier.fillMaxWidth())
-                    Text(
-                        "${state.downloadStage} · ${state.downloadCompleted}/${state.downloadTotal.coerceAtLeast(1)}",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 10.sp,
-                    )
-                    Text(state.downloadMessage, style = MaterialTheme.typography.labelSmall)
+                if (state.isRunning) {
+                    LinearProgressIndicator({ state.progress }, Modifier.fillMaxWidth())
+                    Text("${state.stage} · ${state.completed}/${state.total.coerceAtLeast(1)}", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                    Text(state.message, style = MaterialTheme.typography.labelSmall)
                     Row {
-                        DownloadMetric("Cache", state.downloadCacheHits.toString(), Modifier.weight(1f))
-                        DownloadMetric("Network", state.downloadNetworkRequests.toString(), Modifier.weight(1f))
+                        DownloadMetric("Cache", state.cacheHits.toString(), Modifier.weight(1f))
+                        DownloadMetric("Network", state.networkRequests.toString(), Modifier.weight(1f))
                     }
                     OutlinedButton(vm::cancel, Modifier.fillMaxWidth()) { Text("STOP DOWNLOAD SAFELY") }
                 } else {
-                    Button(vm::downloadHistoricalCorpus, Modifier.fillMaxWidth(), enabled = !busy) {
-                        Text("DOWNLOAD / RESUME ${state.selectedMarketScope.label} ${state.windowLabel}")
+                    Button(vm::downloadOrResume, Modifier.fillMaxWidth(), enabled = storage.canDownload) {
+                        Text("DOWNLOAD / RESUME ${state.selectedScope.label} ${state.windowLabel}")
                     }
-                    Text(state.downloadMessage, style = MaterialTheme.typography.labelSmall)
+                    Text(state.message, style = MaterialTheme.typography.labelSmall)
                     Row {
-                        DownloadMetric("Cache", state.downloadCacheHits.toString(), Modifier.weight(1f))
-                        DownloadMetric("Network", state.downloadNetworkRequests.toString(), Modifier.weight(1f))
-                        DownloadMetric("Errors", state.downloadErrors.toString(), Modifier.weight(1f))
+                        DownloadMetric("Cache", state.cacheHits.toString(), Modifier.weight(1f))
+                        DownloadMetric("Network", state.networkRequests.toString(), Modifier.weight(1f))
+                        DownloadMetric("Errors", state.errors.toString(), Modifier.weight(1f))
                     }
+                }
+
+                if (state.availableFrom != null || state.availableTo != null) {
+                    Text("Latest Upstox discovery coverage ${state.availableFrom ?: "?"} → ${state.availableTo ?: "?"}", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall)
+                }
+                if (state.sourceCoverageLimited) {
+                    Text("⚠ Requested window is longer than the history currently returned by Upstox expiry discovery; VARDHANI did not invent missing history.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                }
+                if (state.strikeReferenceFallbacks > 0) {
+                    Text("⚠ ${state.strikeReferenceFallbacks} expiry plan(s) could not obtain a causal underlying reference and used deterministic centre-strike fallback; this is recorded, not hidden.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
                 }
                 state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
             }
@@ -159,27 +181,24 @@ private fun HistoricalDataScreen(
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("TRAINING HANDOFF", fontWeight = FontWeight.Bold)
                 Text(
-                    "After download, AI LAB can use source DOWNLOADED for NIFTY, SENSEX or BOTH. Training reuses the saved phone corpus without another network download. Production remains frozen unless normal governance and manual promotion pass.",
+                    "After download: AI LAB → source DOWNLOADED → choose NIFTY, SENSEX or BOTH → choose the desired local window → RUN training. Training is offline from the saved corpus and keeps the existing leakage guards/locked holdout.",
                     style = MaterialTheme.typography.bodySmall,
                 )
-                Button(openAiLab, Modifier.fillMaxWidth(), enabled = !state.isDownloading) { Text("OPEN AI LAB") }
-                OutlinedButton(vm::refreshLocalSummary, Modifier.fillMaxWidth(), enabled = !busy) { Text("REFRESH CORPUS COUNTS") }
-                OutlinedButton(
-                    vm::clearDownloadedCorpus,
-                    Modifier.fillMaxWidth(),
-                    enabled = !busy && corpus.optionContracts > 0,
-                ) { Text("CLEAR DOWNLOADED HISTORICAL DATA") }
+                Button(openAiLab, Modifier.fillMaxWidth(), enabled = !state.isRunning && corpus.trainable) { Text("OPEN AI LAB") }
+                OutlinedButton(vm::refresh, Modifier.fillMaxWidth(), enabled = !state.isRunning) { Text("REFRESH CORPUS / STORAGE") }
+                OutlinedButton(vm::clearDownloaded, Modifier.fillMaxWidth(), enabled = !state.isRunning && corpus.optionContracts > 0) { Text("CLEAR DOWNLOADED HISTORICAL DATA") }
             }
         }
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("DATA SAFETY", fontWeight = FontWeight.Bold)
-                Text("• Download is read-only; no broker order endpoint is involved.", style = MaterialTheme.typography.bodySmall)
-                Text("• Each contract is written atomically and deduplicated by candle timestamp.", style = MaterialTheme.typography.bodySmall)
-                Text("• A request is marked complete only after its local contract file verifies successfully.", style = MaterialTheme.typography.bodySmall)
-                Text("• Interrupted downloads retain completed contracts and resume by skipping verified requests.", style = MaterialTheme.typography.bodySmall)
-                Text("• Downloaded history is isolated from your existing NIFTY-only pre-labelled corpus and from LIVE ARCHIVE data.", style = MaterialTheme.typography.bodySmall)
+                Text("• Read-only market-data APIs only; no broker order endpoint is involved.", style = MaterialTheme.typography.bodySmall)
+                Text("• Every saved contract is fully decoded, validated and SHA-256 fingerprinted before its resume marker is trusted.", style = MaterialTheme.typography.bodySmall)
+                Text("• Corrupt contract files are quarantined instead of silently entering training.", style = MaterialTheme.typography.bodySmall)
+                Text("• Interrupted downloads retain verified contracts and resume by skipping only verified request windows.", style = MaterialTheme.typography.bodySmall)
+                Text("• Historical D30/depth is never fabricated; missing depth features remain unavailable/zero in historical raw-series training.", style = MaterialTheme.typography.bodySmall)
+                Text("• Download storage is independent from your imported NIFTY corpus and LIVE ARCHIVE.", style = MaterialTheme.typography.bodySmall)
             }
         }
 
@@ -189,8 +208,11 @@ private fun HistoricalDataScreen(
 
 @Composable
 private fun DownloadChoice(label: String, selected: Boolean, modifier: Modifier, enabled: Boolean, onClick: () -> Unit) {
-    if (selected) Button({}, modifier, enabled = false, contentPadding = PaddingValues(horizontal = 3.dp)) { Text(label, fontSize = 9.sp, textAlign = TextAlign.Center) }
-    else OutlinedButton(onClick, modifier, enabled = enabled, contentPadding = PaddingValues(horizontal = 3.dp)) { Text(label, fontSize = 9.sp, textAlign = TextAlign.Center) }
+    if (selected) Button({}, modifier, enabled = false, contentPadding = PaddingValues(horizontal = 3.dp)) {
+        Text(label, fontSize = 9.sp, textAlign = TextAlign.Center)
+    } else OutlinedButton(onClick, modifier, enabled = enabled, contentPadding = PaddingValues(horizontal = 3.dp)) {
+        Text(label, fontSize = 9.sp, textAlign = TextAlign.Center)
+    }
 }
 
 @Composable
@@ -199,4 +221,11 @@ private fun DownloadMetric(label: String, value: String, modifier: Modifier) {
         Text(label, fontSize = 9.sp, style = MaterialTheme.typography.labelSmall)
         Text(value, fontWeight = FontWeight.Bold, fontSize = 13.sp, textAlign = TextAlign.Center)
     }
+}
+
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1024L * 1024L * 1024L -> "%.2f GB".format(bytes.toDouble() / (1024.0 * 1024.0 * 1024.0))
+    bytes >= 1024L * 1024L -> "%.1f MB".format(bytes.toDouble() / (1024.0 * 1024.0))
+    bytes >= 1024L -> "%.1f KB".format(bytes.toDouble() / 1024.0)
+    else -> "$bytes B"
 }

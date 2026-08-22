@@ -7,6 +7,7 @@ import java.time.LocalDate
 enum class HistoricalCorpusSource(val label: String) {
     UPSTOX("UPSTOX"),
     LOCAL("LOCAL"),
+    DOWNLOADED("DOWNLOADED"),
     LIVE_ARCHIVE("LIVE ARCHIVE"),
     COMBINED("COMBINED"),
 }

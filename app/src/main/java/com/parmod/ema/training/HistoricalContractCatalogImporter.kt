@@ -1,5 +1,6 @@
 package com.parmod.ema.training
 
+import com.parmod.ema.backtest.UpstoxPlusHistoricalClient
 import com.parmod.ema.model.MarketIndex
 import org.json.JSONArray
 import org.json.JSONObject
@@ -45,8 +46,10 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
                 if (++filesRead > MAX_ZIP_FILES) error("Historical catalogue ZIP contains too many files")
                 val normalized = entry.name.replace('\\', '/').lowercase()
                 if (!normalized.endsWith("contracts.json")) continue
-                val bytes = runCatching { zip.readBytesLimited(MAX_SINGLE_JSON_BYTES) }.getOrElse {
-                    errors += "${entry.name}: ${it.message}"
+                val bytes = try {
+                    zip.readBytesLimited(MAX_SINGLE_JSON_BYTES)
+                } catch (error: Throwable) {
+                    errors += "${entry.name}: ${(error.message ?: error::class.java.simpleName).take(180)}"
                     continue
                 }
                 val parsed = parsePayload(bytes, entry.name)
@@ -74,25 +77,29 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
     }
 
     private data class Parsed(
-        val grouped: Map<Pair<MarketIndex, LocalDate>, List<com.parmod.ema.backtest.UpstoxPlusHistoricalClient.ExpiredContract>>,
+        val grouped: Map<Pair<MarketIndex, LocalDate>, List<UpstoxPlusHistoricalClient.ExpiredContract>>,
         val read: Int,
         val rejected: Int,
         val errors: List<String>,
     )
 
     private fun parsePayload(bytes: ByteArray, pathHint: String): Parsed {
-        val errors = mutableListOf<String>()
         return runCatching {
-            val root = JSONObject(bytes.toString(Charsets.UTF_8))
+            val root = JSONObject(String(bytes, Charsets.UTF_8))
             val rows = when {
                 root.optJSONArray("data") != null -> root.getJSONArray("data")
                 root.optJSONArray("contracts") != null -> root.getJSONArray("contracts")
                 else -> JSONArray()
             }
-            val grouped = linkedMapOf<Pair<MarketIndex, LocalDate>, MutableList<com.parmod.ema.backtest.UpstoxPlusHistoricalClient.ExpiredContract>>()
+            require(rows.length() > 0) { "No option-contract rows found" }
+            val grouped = linkedMapOf<Pair<MarketIndex, LocalDate>, MutableList<UpstoxPlusHistoricalClient.ExpiredContract>>()
             var rejected = 0
             for (i in 0 until rows.length()) {
-                val item = rows.optJSONObject(i) ?: run { rejected++; continue }
+                val item = rows.optJSONObject(i)
+                if (item == null) {
+                    rejected++
+                    continue
+                }
                 val contract = HistoricalContractCatalogStore.parseContract(item)
                 val market = HistoricalContractCatalogStore.inferMarket(item, pathHint)
                 if (contract == null || market == null) {
@@ -101,7 +108,7 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
                 }
                 grouped.getOrPut(market to contract.expiry) { mutableListOf() } += contract
             }
-            Parsed(grouped, rows.length(), rejected, errors)
+            Parsed(grouped, rows.length(), rejected, emptyList())
         }.getOrElse {
             Parsed(emptyMap(), 0, 0, listOf("${pathHint.ifBlank { "contracts.json" }}: ${(it.message ?: it::class.java.simpleName).take(180)}"))
         }

@@ -88,11 +88,12 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         val contractKey = key(series.index, series.expiry, series.strike, type)
         val target = fileForKey(contractKey)
         val previous = if (target.isFile) {
-            runCatching { readStored(target) }.getOrElse {
-                quarantine(target, "decode")
-                null
-            }
-        } else null
+            val loaded = runCatching { readStored(target) }.getOrNull()
+            if (loaded == null) quarantine(target, "decode")
+            loaded
+        } else {
+            null
+        }
         if (previous != null) require(previous.header.contractKey == contractKey) { "Downloaded corpus contract identity mismatch" }
 
         val previousRows = previous?.candles.orEmpty()
@@ -162,7 +163,8 @@ class DownloadedHistoricalCorpusStore(context: Context) {
             if (months != PrelabelledTrainingWindowPlan.FULL && Instant.ofEpochMilli(header.maxEpochMs).atZone(zone).toLocalDate().isBefore(cutoff)) {
                 return@mapNotNull null
             }
-            val stored = runCatching { readStored(file) }.getOrElse {
+            val stored = runCatching { readStored(file) }.getOrNull()
+            if (stored == null) {
                 quarantine(file, "load")
                 return@mapNotNull null
             }
@@ -185,10 +187,9 @@ class DownloadedHistoricalCorpusStore(context: Context) {
     fun summary(): LocalCorpusSummary {
         val errors = mutableListOf<String>()
         val headers = contractFiles().mapNotNull { file ->
-            runCatching { readHeader(file) }.getOrElse {
-                errors += "Corrupt downloaded contract ${file.name.take(18)}…"
-                null
-            }
+            val header = runCatching { readHeader(file) }.getOrNull()
+            if (header == null) errors += "Corrupt downloaded contract ${file.name.take(18)}…"
+            header
         }
         if (headers.isEmpty()) return LocalCorpusSummary(errors = errors)
         val rows = headers.sumOf { it.count.toLong() }
@@ -213,7 +214,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
     }
 
     fun storageStatus(): StorageStatus = StorageStatus(
-        corpusBytes = root.walkTopDown().filter(File::isFile).sumOf(File::length),
+        corpusBytes = root.walkTopDown().filter { it.isFile }.sumOf { it.length() },
         freeBytes = root.usableSpace,
     )
 
@@ -271,14 +272,15 @@ class DownloadedHistoricalCorpusStore(context: Context) {
     }
 
     private fun replaceSafely(source: File, target: File) {
-        runCatching {
+        val atomicSucceeded = runCatching {
             Files.move(
                 source.toPath(),
                 target.toPath(),
                 StandardCopyOption.REPLACE_EXISTING,
                 StandardCopyOption.ATOMIC_MOVE,
             )
-        }.onSuccess { return }
+        }.isSuccess
+        if (atomicSucceeded) return
 
         val backup = File(temp, target.name + ".${System.nanoTime()}.bak")
         var backedUp = false
@@ -337,7 +339,9 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         Stored(header, rows)
     }
 
-    private fun readHeader(file: File): Header = DataInputStream(FileInputStream(file).buffered(BUFFER)).use { input -> readHeader(input) }
+    private fun readHeader(file: File): Header = DataInputStream(FileInputStream(file).buffered(BUFFER)).use { input ->
+        readHeader(input)
+    }
 
     private fun readHeader(input: DataInputStream): Header {
         require(input.readUTF() == MAGIC) { "Unsupported downloaded historical corpus schema" }
@@ -355,7 +359,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         require(header.optionType == "CE" || header.optionType == "PE")
         require(header.strike > 0.0 && header.lotSize > 0)
         require(header.count in 1..MAX_ROWS_PER_CONTRACT)
-        require(header.minEpochMs in 1..header.maxEpochMs)
+        require(header.minEpochMs in 1L..header.maxEpochMs)
         return header
     }
 

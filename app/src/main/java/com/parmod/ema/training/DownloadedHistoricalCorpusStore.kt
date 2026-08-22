@@ -139,6 +139,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
     /**
      * Reads the selected option window and attaches one shared immutable underlying list.
      * Every contract references the same NIFTY/SENSEX index list, avoiding N copies in RAM.
+     * DOWNLOADED training fails closed if matching native index context is incomplete.
      */
     fun loadSeriesWindow(index: MarketIndex, months: Int): List<HistoricalOptionSeries> {
         require(months in PrelabelledTrainingWindowPlan.ALLOWED_MONTHS)
@@ -159,9 +160,11 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         val earliestOptionDate = eligible.minOf { (_, header) ->
             Instant.ofEpochMilli(header.minEpochMs).atZone(zone).toLocalDate()
         }
+        val underlyingFrom = earliestOptionDate.minusDays(UNDERLYING_WARMUP_DAYS)
         val underlying = runCatching {
-            underlyingStore.load(index, earliestOptionDate.minusDays(UNDERLYING_WARMUP_DAYS), latestDate)
+            underlyingStore.load(index, underlyingFrom, latestDate)
         }.getOrDefault(emptyList())
+        if (!nativeUnderlyingComplete(underlying, earliestOptionDate, latestDate)) return emptyList()
 
         return eligible.mapNotNull { (file, header) ->
             val stored = runCatching { readStored(file) }.getOrNull()
@@ -184,6 +187,19 @@ class DownloadedHistoricalCorpusStore(context: Context) {
                 underlyingCandles = underlying,
             )
         }.sortedWith(compareBy<HistoricalOptionSeries> { it.expiry }.thenBy { it.strike }.thenBy { it.optionType })
+    }
+
+    private fun nativeUnderlyingComplete(
+        candles: List<UpstoxPlusHistoricalClient.Candle>,
+        earliestOptionDate: LocalDate,
+        latestOptionDate: LocalDate,
+    ): Boolean {
+        if (candles.size < MIN_NATIVE_UNDERLYING_ROWS) return false
+        val first = candles.first().time.toLocalDate()
+        val last = candles.last().time.toLocalDate()
+        val warmupReady = !first.isAfter(earliestOptionDate.minusDays(MIN_WARMUP_CALENDAR_DAYS))
+        val tailReady = !last.isBefore(latestOptionDate.minusDays(MAX_TAIL_GAP_DAYS))
+        return warmupReady && tailReady
     }
 
     fun summary(): LocalCorpusSummary {
@@ -365,6 +381,9 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         private const val TEMP_MAX_AGE_MS = 24L * 60L * 60L * 1000L
         private const val KEY_DEDUPED = "deduped_rows"
         private const val UNDERLYING_WARMUP_DAYS = 7L
+        private const val MIN_NATIVE_UNDERLYING_ROWS = 60
+        private const val MIN_WARMUP_CALENDAR_DAYS = 1L
+        private const val MAX_TAIL_GAP_DAYS = 3L
         const val MINIMUM_FREE_BYTES = 2L * 1024L * 1024L * 1024L
 
         fun key(index: MarketIndex, expiry: LocalDate, strike: Double, optionType: String): String =

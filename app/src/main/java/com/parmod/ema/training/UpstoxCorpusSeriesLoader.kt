@@ -38,9 +38,9 @@ class UpstoxCorpusSeriesLoader(private val client: UpstoxPlusHistoricalClient) {
         val expiries = if (requestedFrom == null) available else available.filter { !it.isBefore(requestedFrom) }
         val errors = mutableListOf<String>()
         if (requestedFrom != null && available.first().isAfter(requestedFrom.plusDays(7))) {
-            errors += "${index.name}: requested ${months}M but Upstox expiry discovery currently starts at ${available.first()}"
+            errors += "${index.name}: requested ${months}M but current Upstox expiry discovery starts at ${available.first()}; known locally accumulated history is handled by DOWNLOADED mode"
         } else if (requestedFrom == null) {
-            errors += "${index.name}: FULL means every expired expiry currently returned by Upstox; older locally accumulated data is not invented"
+            errors += "${index.name}: direct FULL uses every expiry currently discoverable by Upstox; persistent older history belongs to DOWNLOADED mode"
         }
 
         val work = mutableListOf<Work>()
@@ -75,6 +75,28 @@ class UpstoxCorpusSeriesLoader(private val client: UpstoxPlusHistoricalClient) {
             }.onFailure { errors += "$index $expiry contract discovery: ${it.message}" }
         }
 
+        if (work.isEmpty()) return Result(emptyList(), expiries.size, 0, errors.distinct().takeLast(80))
+
+        val contextFrom = work.minOf { it.start }.minusDays(UNDERLYING_WARMUP_DAYS)
+        val contextTo = work.maxOf { it.contract.expiry }
+        val underlying = mutableListOf<UpstoxPlusHistoricalClient.Candle>()
+        val chunks = HistoricalDownloadPlanner.monthChunks(contextFrom, contextTo)
+        chunks.forEachIndexed { i, (from, to) ->
+            if (shouldCancel()) error("Training cancelled")
+            onProgress(HistoricalCorpusTrainer.Progress("INDEX_CONTEXT", i, chunks.size, "${index.name} 1m $from → $to · causal index context"))
+            runCatching { client.getHistoricalUnderlyingMinuteCandles(index, from, to) }
+                .onSuccess { underlying += it }
+                .onFailure { errors += "${index.name} index context $from → $to: ${it.message}" }
+        }
+        val sharedUnderlying = underlying
+            .filter { it.close > 0.0 }
+            .sortedBy { it.time.toInstant().toEpochMilli() }
+            .distinctBy { it.time.toInstant().toEpochMilli() }
+        if (sharedUnderlying.size < MIN_UNDERLYING_ROWS) {
+            errors += "${index.name}: native 1-minute underlying context incomplete; direct Upstox research will fail closed rather than claim full-quality context"
+            return Result(emptyList(), expiries.size, work.size, errors.distinct().takeLast(80))
+        }
+
         val result = mutableListOf<HistoricalOptionSeries>()
         work.forEachIndexed { i, item ->
             if (shouldCancel()) error("Training cancelled")
@@ -99,6 +121,7 @@ class UpstoxCorpusSeriesLoader(private val client: UpstoxPlusHistoricalClient) {
                         symbol = item.contract.tradingSymbol,
                         source = "UPSTOX_PLUS",
                         candles = candles,
+                        underlyingCandles = sharedUnderlying,
                     )
                 } else {
                     errors += "${item.contract.expiry} ${item.contract.strike.toInt()} ${item.contract.optionType}: no candles returned"
@@ -111,6 +134,8 @@ class UpstoxCorpusSeriesLoader(private val client: UpstoxPlusHistoricalClient) {
     private companion object {
         const val CONTRACT_LOOKBACK_DAYS = 7L
         const val SPOT_REFERENCE_LOOKBACK_DAYS = 10L
+        const val UNDERLYING_WARMUP_DAYS = 7L
+        const val MIN_UNDERLYING_ROWS = 60
     }
 }
 
@@ -122,9 +147,11 @@ object HistoricalSeriesMerger {
             val candles = ordered.flatMap { it.candles }
                 .sortedBy { it.time.toInstant().toEpochMilli() }
                 .distinctBy { it.time.toInstant().toEpochMilli() }
+            val underlying = ordered.firstOrNull { it.underlyingCandles.isNotEmpty() }?.underlyingCandles.orEmpty()
             preferred.copy(
                 source = ordered.map { it.source }.distinct().joinToString("+"),
                 candles = candles,
+                underlyingCandles = underlying,
             )
         }.sortedWith(compareBy<HistoricalOptionSeries> { it.expiry }.thenBy { it.strike }.thenBy { it.optionType })
 

@@ -14,7 +14,7 @@ import java.time.LocalDate
 import java.time.OffsetDateTime
 import kotlin.math.min
 
-/** Read-only Upstox Plus client for historical/expired-instrument research. */
+/** Read-only Upstox client for historical/expired-instrument research. */
 class UpstoxPlusHistoricalClient(
     private val accessToken: String,
     private val minimumRequestSpacingMillis: Long = 350L,
@@ -48,14 +48,11 @@ class UpstoxPlusHistoricalClient(
         val cacheWrites: Long = 0,
     )
 
-    @Volatile
-    private var stats = RequestStats()
+    @Volatile private var stats = RequestStats()
     private val throttleLock = Any()
     private var lastRequestStartedMillis = 0L
 
-    init {
-        cacheDirectory?.mkdirs()
-    }
+    init { cacheDirectory?.mkdirs() }
 
     fun requestStats(): RequestStats = stats
 
@@ -64,18 +61,13 @@ class UpstoxPlusHistoricalClient(
         val json = get("https://api.upstox.com/v2/expired-instruments/expiries?instrument_key=$key")
         val data = json.getJSONArray("data")
         return buildList {
-            for (i in 0 until data.length()) {
-                runCatching { LocalDate.parse(data.getString(i)) }.getOrNull()?.let(::add)
-            }
+            for (i in 0 until data.length()) runCatching { LocalDate.parse(data.getString(i)) }.getOrNull()?.let(::add)
         }.distinct().sorted()
     }
 
     fun getExpiredOptionContracts(index: MarketIndex, expiry: LocalDate): List<ExpiredContract> {
         val key = encodedUnderlying(index)
-        val json = get(
-            "https://api.upstox.com/v2/expired-instruments/option/contract" +
-                "?instrument_key=$key&expiry_date=$expiry",
-        )
+        val json = get("https://api.upstox.com/v2/expired-instruments/option/contract?instrument_key=$key&expiry_date=$expiry")
         val data = json.getJSONArray("data")
         return buildList {
             for (i in 0 until data.length()) {
@@ -102,50 +94,50 @@ class UpstoxPlusHistoricalClient(
         fromDate: LocalDate,
         toDate: LocalDate,
     ): List<Candle> {
-        require(interval in setOf("1minute", "3minute", "5minute", "15minute", "30minute", "day")) {
-            "Unsupported expired-candle interval: $interval"
-        }
-        require(!fromDate.isAfter(toDate)) { "fromDate must not be after toDate" }
-
+        require(interval in setOf("1minute", "3minute", "5minute", "15minute", "30minute", "day"))
+        require(!fromDate.isAfter(toDate))
         val cacheFile = candleCacheFile("EXPIRED|$expiredInstrumentKey", interval, fromDate, toDate)
         readCachedCandles(cacheFile)?.let {
             stats = stats.copy(cacheHits = stats.cacheHits + 1)
             return it
         }
-
         val key = URLEncoder.encode(expiredInstrumentKey, Charsets.UTF_8.name())
-        val json = get(
-            "https://api.upstox.com/v2/expired-instruments/historical-candle/" +
-                "$key/$interval/$toDate/$fromDate",
-        )
+        val json = get("https://api.upstox.com/v2/expired-instruments/historical-candle/$key/$interval/$toDate/$fromDate")
         val candles = parseCandles(json.getJSONObject("data").getJSONArray("candles"))
         writeCachedCandles(cacheFile, candles)
         return candles
     }
 
-    /**
-     * Causal underlying reference data used only to choose an option strike band.
-     * The caller asks for candles ending at (not after) the option research-window start,
-     * so expiry-day/future spot cannot leak into contract selection.
-     */
-    fun getHistoricalUnderlyingDailyCandles(
+    /** Causal daily reference used for strike-band selection. */
+    fun getHistoricalUnderlyingDailyCandles(index: MarketIndex, fromDate: LocalDate, toDate: LocalDate): List<Candle> =
+        getHistoricalUnderlyingCandles(index, "days", 1, fromDate, toDate)
+
+    /** 1-minute underlying bars used to reconstruct NIFTY/SENSEX signal context for option labels. */
+    fun getHistoricalUnderlyingMinuteCandles(index: MarketIndex, fromDate: LocalDate, toDate: LocalDate): List<Candle> =
+        getHistoricalUnderlyingCandles(index, "minutes", 1, fromDate, toDate)
+
+    private fun getHistoricalUnderlyingCandles(
         index: MarketIndex,
+        unit: String,
+        interval: Int,
         fromDate: LocalDate,
         toDate: LocalDate,
     ): List<Candle> {
-        require(!fromDate.isAfter(toDate)) { "fromDate must not be after toDate" }
+        require(unit in setOf("minutes", "hours", "days", "weeks", "months"))
+        require(interval >= 1)
+        require(!fromDate.isAfter(toDate))
+        if (unit == "minutes" && interval <= 15) {
+            require(!fromDate.isBefore(toDate.minusMonths(1))) { "Upstox V3 1-15 minute requests are limited to one month per request" }
+        }
         val rawKey = underlyingKey(index)
-        val cacheFile = candleCacheFile("UNDERLYING|$rawKey", "v3-days-1", fromDate, toDate)
+        val cacheTag = "v3-$unit-$interval"
+        val cacheFile = candleCacheFile("UNDERLYING|$rawKey", cacheTag, fromDate, toDate)
         readCachedCandles(cacheFile)?.let {
             stats = stats.copy(cacheHits = stats.cacheHits + 1)
             return it
         }
-
         val key = URLEncoder.encode(rawKey, Charsets.UTF_8.name())
-        val json = get(
-            "https://api.upstox.com/v3/historical-candle/" +
-                "$key/days/1/$toDate/$fromDate",
-        )
+        val json = get("https://api.upstox.com/v3/historical-candle/$key/$unit/$interval/$toDate/$fromDate")
         val candles = parseCandles(json.getJSONObject("data").getJSONArray("candles"))
         writeCachedCandles(cacheFile, candles)
         return candles
@@ -170,8 +162,7 @@ class UpstoxPlusHistoricalClient(
 
     private fun candleCacheFile(key: String, interval: String, from: LocalDate, to: LocalDate): File? {
         val root = cacheDirectory ?: return null
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest("$key|$interval|$from|$to".toByteArray())
+        val digest = MessageDigest.getInstance("SHA-256").digest("$key|$interval|$from|$to".toByteArray())
             .joinToString("") { "%02x".format(it) }
         return File(root, "$digest.json")
     }
@@ -192,25 +183,12 @@ class UpstoxPlusHistoricalClient(
             val temp = File(file.parentFile, "${file.name}.${System.nanoTime()}.tmp")
             val rows = JSONArray()
             candles.forEach { candle ->
-                rows.put(
-                    JSONArray().apply {
-                        put(candle.time.toString())
-                        put(candle.open)
-                        put(candle.high)
-                        put(candle.low)
-                        put(candle.close)
-                        put(candle.volume)
-                        put(candle.openInterest)
-                    },
-                )
+                rows.put(JSONArray().apply {
+                    put(candle.time.toString()); put(candle.open); put(candle.high); put(candle.low); put(candle.close)
+                    put(candle.volume); put(candle.openInterest)
+                })
             }
-            temp.writeText(
-                JSONObject()
-                    .put("version", CACHE_VERSION)
-                    .put("complete", true)
-                    .put("candles", rows)
-                    .toString(),
-            )
+            temp.writeText(JSONObject().put("version", CACHE_VERSION).put("complete", true).put("candles", rows).toString())
             moveReplacing(temp, file)
             stats = stats.copy(cacheWrites = stats.cacheWrites + 1)
         }
@@ -221,26 +199,18 @@ class UpstoxPlusHistoricalClient(
         MarketIndex.SENSEX -> "BSE_INDEX|SENSEX"
     }
 
-    private fun encodedUnderlying(index: MarketIndex): String =
-        URLEncoder.encode(underlyingKey(index), Charsets.UTF_8.name())
+    private fun encodedUnderlying(index: MarketIndex): String = URLEncoder.encode(underlyingKey(index), Charsets.UTF_8.name())
 
     private fun moveReplacing(source: File, target: File) {
-        runCatching {
-            Files.move(
-                source.toPath(),
-                target.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE,
-            )
-        }.getOrElse {
-            Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-        }
+        val atomic = runCatching {
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        }.isSuccess
+        if (!atomic) Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
     }
 
     private fun get(url: String): JSONObject {
-        require(accessToken.isNotBlank()) { "Upstox access token is required" }
-        require(maximumAttempts >= 1) { "maximumAttempts must be positive" }
-
+        require(accessToken.isNotBlank())
+        require(maximumAttempts >= 1)
         var lastFailure = "Unknown Upstox error"
         for (attempt in 1..maximumAttempts) {
             awaitRequestSlot()
@@ -255,21 +225,13 @@ class UpstoxPlusHistoricalClient(
                 val stream = if (code in 200..299) connection.inputStream else connection.errorStream
                 val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
                 stats = stats.copy(requests = stats.requests + 1)
-
                 if (code in 200..299) return JSONObject(body)
                 lastFailure = "Upstox HTTP $code: ${body.take(500)}"
-
                 val retryable = code == 429 || code == 408 || code in 500..599
                 if (!retryable || attempt == maximumAttempts) error(lastFailure)
-
-                stats = stats.copy(
-                    retries = stats.retries + 1,
-                    rateLimits = stats.rateLimits + if (code == 429) 1 else 0,
-                )
+                stats = stats.copy(retries = stats.retries + 1, rateLimits = stats.rateLimits + if (code == 429) 1 else 0)
                 Thread.sleep(retryDelayMillis(connection, attempt))
-            } finally {
-                connection.disconnect()
-            }
+            } finally { connection.disconnect() }
         }
         error(lastFailure)
     }
@@ -285,15 +247,11 @@ class UpstoxPlusHistoricalClient(
 
     private fun retryDelayMillis(connection: HttpURLConnection, attempt: Int): Long {
         val retryAfterSeconds = connection.getHeaderField("Retry-After")?.trim()?.toLongOrNull()
-        if (retryAfterSeconds != null && retryAfterSeconds > 0) {
-            return min(retryAfterSeconds * 1_000L, 60_000L)
-        }
+        if (retryAfterSeconds != null && retryAfterSeconds > 0) return min(retryAfterSeconds * 1_000L, 60_000L)
         val exponential = 1_000L shl (attempt - 1).coerceAtMost(5)
         val jitter = System.nanoTime() and 511L
         return min(exponential + jitter, 30_000L)
     }
 
-    private companion object {
-        const val CACHE_VERSION = 1
-    }
+    private companion object { const val CACHE_VERSION = 1 }
 }

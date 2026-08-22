@@ -92,10 +92,12 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
 
     fun selectMonths(months: Int) {
         if (busy() || months !in PrelabelledTrainingWindowPlan.ALLOWED_MONTHS) return
+        val source = _state.value.selectedSource
+        val scope = _state.value.selectedMarketScope
         _state.value = _state.value.copy(
             selectedMonths = months, result = null, installedCandidate = false, error = null,
-            checkpointAvailable = checkpointFor(_state.value.selectedMarketScope, months),
-            message = "${PrelabelledTrainingWindowPlan.label(months)} ${_state.value.selectedMarketScope.label} research window selected · chronological roles + ${PrelabelledTrainingWindowPlan.EMBARGO_MINUTES}m embargo",
+            checkpointAvailable = checkpointFor(source, scope, months),
+            message = "${PrelabelledTrainingWindowPlan.label(months)} ${scope.label} research window selected · chronological roles + ${PrelabelledTrainingWindowPlan.EMBARGO_MINUTES}m embargo",
         )
     }
 
@@ -103,23 +105,27 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
 
     fun selectMarketScope(scope: HistoricalMarketScope) {
         if (busy()) return
+        val source = _state.value.selectedSource
         _state.value = _state.value.copy(
             selectedMarketScope = scope,
             selectedIndex = scope.singleIndexOrNull() ?: _state.value.selectedIndex,
             result = null, installedCandidate = false, error = null,
-            checkpointAvailable = checkpointFor(scope, _state.value.selectedMonths),
+            checkpointAvailable = checkpointFor(source, scope, _state.value.selectedMonths),
             message = if (scope == HistoricalMarketScope.BOTH) "BOTH selected · one shared Candidate and shared timestamps for NIFTY + SENSEX" else "${scope.label} historical AI corpus selected",
         )
     }
 
     fun selectSource(source: HistoricalCorpusSource) {
         if (busy()) return
+        val scope = _state.value.selectedMarketScope
+        val months = _state.value.selectedMonths
         _state.value = _state.value.copy(
             selectedSource = source, result = null, installedCandidate = false, error = null,
+            checkpointAvailable = checkpointFor(source, scope, months),
             message = when (source) {
-                HistoricalCorpusSource.UPSTOX -> "Upstox Plus expired-option corpus selected"
-                HistoricalCorpusSource.LOCAL -> if (prelabelledStore.ready()) "Pre-labelled LOCAL corpus selected · timestamp roles re-derived" else "Local imported corpus selected · no Upstox token required"
-                HistoricalCorpusSource.DOWNLOADED -> "DOWNLOADED selected · persistent phone NIFTY/SENSEX 1-minute expired-option corpus · no network required for training"
+                HistoricalCorpusSource.UPSTOX -> "Upstox Plus expired-option corpus selected · native NIFTY/SENSEX index context required"
+                HistoricalCorpusSource.LOCAL -> if (prelabelledStore.ready()) "Pre-labelled LOCAL corpus selected · timestamp roles re-derived · compatible generation checkpoint eligible" else "Local imported corpus selected · no Upstox token required"
+                HistoricalCorpusSource.DOWNLOADED -> "DOWNLOADED selected · persistent phone option corpus + matching 1-minute index context · no network required for training"
                 HistoricalCorpusSource.LIVE_ARCHIVE -> "LIVE ARCHIVE selected · exact saved feature vectors + actual resolved outcomes · no broker token required"
                 HistoricalCorpusSource.COMBINED -> "COMBINED selected · historical/local + LIVE ARCHIVE + Upstox refinement with source-level dedupe"
             },
@@ -130,7 +136,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         if (busy() || radius !in HistoricalCorpusDownloadManager.ALLOWED_STRIKE_RADII) return
         _state.value = _state.value.copy(
             downloadStrikeRadius = radius,
-            downloadMessage = "Download density selected · ${radius * 2 + 1} centre strikes/expiry × CE/PE",
+            downloadMessage = "Download density selected · ${radius * 2 + 1} causal spot-centred strikes/expiry × CE/PE",
             error = null,
         )
     }
@@ -179,20 +185,33 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                     )
                 }
                 val bothReady = result.summary.bothMarketsPresent
+                val completedWork = result.contractsDownloaded + result.contractsSkipped
                 _state.value = _state.value.copy(
                     isDownloading = false,
-                    downloadStage = "COMPLETE",
-                    downloadCompleted = result.contractsPlanned,
+                    downloadStage = if (result.allAvailableWorkComplete) "COMPLETE" else "PARTIAL",
+                    downloadCompleted = completedWork,
                     downloadTotal = result.contractsPlanned,
-                    downloadMessage = "Download complete · ${result.contractsDownloaded} new request(s) · ${result.contractsSkipped} resume skip(s) · NIFTY ${result.summary.niftyContracts} · SENSEX ${result.summary.sensexContracts}",
+                    downloadMessage = buildString {
+                        append(if (result.allAvailableWorkComplete) "Download verified" else "Partial download retained safely")
+                        append(" · ").append(result.contractsDownloaded).append(" new request(s)")
+                        append(" · ").append(result.contractsSkipped).append(" resume skip(s)")
+                        append(" · NIFTY ").append(result.summary.niftyContracts)
+                        append(" · SENSEX ").append(result.summary.sensexContracts)
+                        append(" · index rows ").append(result.underlyingRows)
+                    },
                     downloadedSummary = result.summary,
                     selectedSource = HistoricalCorpusSource.DOWNLOADED,
+                    checkpointAvailable = false,
                     downloadCacheHits = result.stats.cacheHits,
                     downloadNetworkRequests = result.stats.requests,
                     downloadErrors = result.errors.size,
                     result = null,
                     installedCandidate = false,
-                    message = if (bothReady) "Downloaded NIFTY + SENSEX corpus ready · select BOTH and RUN / RESUME DOWNLOADED training" else "Downloaded corpus updated · ${if (result.summary.niftyContracts == 0) "NIFTY missing" else "NIFTY ready"} · ${if (result.summary.sensexContracts == 0) "SENSEX missing" else "SENSEX ready"}",
+                    message = when {
+                        !result.allAvailableWorkComplete -> "Downloaded corpus is partial · use HISTORICAL DATA → DOWNLOAD / RESUME before official training"
+                        bothReady -> "Downloaded NIFTY + SENSEX option/index corpus ready · select BOTH and RUN DOWNLOADED training"
+                        else -> "Downloaded corpus updated · ${if (result.summary.niftyContracts == 0) "NIFTY missing" else "NIFTY ready"} · ${if (result.summary.sensexContracts == 0) "SENSEX missing" else "SENSEX ready"}"
+                    },
                     error = result.errors.lastOrNull()?.take(260),
                 )
             } catch (error: Throwable) {
@@ -202,6 +221,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                     downloadStage = if (wasCancelled) "CANCELLED" else "ERROR",
                     downloadMessage = if (wasCancelled) "Historical download stopped safely · completed contracts retained · press DOWNLOAD / RESUME to continue" else "Historical download stopped safely · completed contracts retained",
                     downloadedSummary = downloadedStore.summary(),
+                    checkpointAvailable = false,
                     error = if (wasCancelled) null else (error.message ?: error::class.java.simpleName).take(300),
                 )
             } finally { cancelRequested = false; job = null }
@@ -217,8 +237,9 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                     downloadCompleted = 0,
                     downloadTotal = 0,
                     downloadErrors = 0,
-                    downloadMessage = "Downloaded NIFTY/SENSEX corpus cleared · imported/pre-labelled/live archive data unchanged",
+                    downloadMessage = "Downloaded NIFTY/SENSEX candles cleared · contract catalogue retained",
                     selectedSource = if (_state.value.selectedSource == HistoricalCorpusSource.DOWNLOADED) HistoricalCorpusSource.UPSTOX else _state.value.selectedSource,
+                    checkpointAvailable = false,
                     error = null,
                 )
             }
@@ -300,6 +321,7 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         val token = vault.read().upstoxAccessToken.trim()
         val prelabelledReady = prelabelledStore.ready()
         val downloaded = downloadedStore.summary()
+        val compatibleCheckpoint = checkpointFor(source, scope, months)
 
         if (source in setOf(HistoricalCorpusSource.UPSTOX, HistoricalCorpusSource.COMBINED) && token.isBlank()) {
             _state.value = _state.value.copy(error = "Save a valid Upstox access token first, or choose LOCAL / DOWNLOADED / LIVE ARCHIVE")
@@ -334,8 +356,8 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         _state.value = _state.value.copy(
             isRunning = true, stage = "STARTING", completed = 0, total = 0, result = null,
             installedCandidate = false, error = null,
-            checkpointAvailable = checkpointFor(scope, months),
-            message = "Starting ${source.label} ${scope.label} $label AI research · Production frozen${if (checkpointFor(scope, months)) " · compatible checkpoint will resume where supported" else ""}",
+            checkpointAvailable = compatibleCheckpoint,
+            message = "Starting ${source.label} ${scope.label} $label AI research · Production frozen${if (compatibleCheckpoint) " · compatible pre-labelled checkpoint will resume" else ""}",
         )
 
         job = viewModelScope.launch {
@@ -385,17 +407,17 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
                     message = finalMessage, result = result, installedCandidate = installed,
                     error = result.errors.lastOrNull()?.take(220), cacheHits = stats.cacheHits, networkRequests = stats.requests,
                     localSummary = effectiveLocalSummary(), downloadedSummary = downloadedStore.summary(), prelabelledCorpusReady = prelabelledStore.ready(),
-                    checkpointAvailable = checkpointFor(scope, months),
+                    checkpointAvailable = checkpointFor(source, scope, months),
                 )
                 saveSummary(_state.value)
             } catch (error: Throwable) {
                 val stats = client?.requestStats() ?: UpstoxPlusHistoricalClient.RequestStats(); val wasCancelled = cancelled(error)
                 _state.value = _state.value.copy(
                     isRunning = false, stage = if (wasCancelled) "CANCELLED" else "ERROR",
-                    message = if (wasCancelled) "Training stopped safely · compatible checkpoint/corpus retained" else "Historical AI training stopped safely · corpus/checkpoint retained",
+                    message = if (wasCancelled) "Training stopped safely · compatible corpus/checkpoint retained" else "Historical AI training stopped safely · corpus/checkpoint retained",
                     error = if (wasCancelled) null else (error.message ?: error::class.java.simpleName).take(300),
                     cacheHits = stats.cacheHits, networkRequests = stats.requests, localSummary = effectiveLocalSummary(), downloadedSummary = downloadedStore.summary(),
-                    prelabelledCorpusReady = prelabelledStore.ready(), checkpointAvailable = checkpointFor(scope, months),
+                    prelabelledCorpusReady = prelabelledStore.ready(), checkpointAvailable = checkpointFor(source, scope, months),
                 )
             } finally { cancelRequested = false; job = null }
         }
@@ -457,7 +479,13 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
 
     private fun runSingleRawOrUpstox(source: HistoricalCorpusSource, index: MarketIndex, months: Int): Pair<HistoricalCorpusTrainer.Result, UpstoxPlusHistoricalClient?> {
         val pair = loadSeries(source, if (index == MarketIndex.NIFTY) HistoricalMarketScope.NIFTY else HistoricalMarketScope.SENSEX, months)
-        val merged = HistoricalSeriesMerger.merge(pair.first); if (merged.isEmpty()) error("No trainable ${index.name} option series available from ${source.label}")
+        val merged = HistoricalSeriesMerger.merge(pair.first)
+        if (merged.isEmpty()) {
+            val reason = if (source == HistoricalCorpusSource.DOWNLOADED) {
+                "No trainable ${index.name} DOWNLOADED series with complete matching 1-minute index context · HISTORICAL DATA → DOWNLOAD / RESUME first"
+            } else "No trainable ${index.name} option series available from ${source.label}"
+            error(reason)
+        }
         return HistoricalSeriesTrainer(MetaBrainRuntime.productionSnapshotForResearch()).run(
             index = index, series = merged, config = HistoricalCorpusTrainer.Config(months = months.toLong()),
             sourceLabel = "${source.label} ${PrelabelledTrainingWindowPlan.label(months)}", onProgress = { publishProgress(it, pair.second) }, shouldCancel = { cancelRequested },
@@ -466,7 +494,12 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
 
     private fun runJointRawOrUpstox(source: HistoricalCorpusSource, months: Int): Pair<HistoricalCorpusTrainer.Result, UpstoxPlusHistoricalClient?> {
         val pair = loadSeries(source, HistoricalMarketScope.BOTH, months); val merged = HistoricalSeriesMerger.merge(pair.first)
-        if (merged.none { it.index == MarketIndex.NIFTY } || merged.none { it.index == MarketIndex.SENSEX }) error("BOTH historical research requires trainable NIFTY and SENSEX option series")
+        if (merged.none { it.index == MarketIndex.NIFTY } || merged.none { it.index == MarketIndex.SENSEX }) {
+            val reason = if (source == HistoricalCorpusSource.DOWNLOADED) {
+                "BOTH DOWNLOADED research requires NIFTY + SENSEX options with complete matching 1-minute index context"
+            } else "BOTH historical research requires trainable NIFTY and SENSEX option series"
+            error(reason)
+        }
         return JointHistoricalSeriesTrainer(MetaBrainRuntime.productionSnapshotForResearch()).run(
             series = merged, config = HistoricalCorpusTrainer.Config(months = months.toLong()),
             sourceLabel = "${source.label} ${PrelabelledTrainingWindowPlan.label(months)}", onProgress = { publishProgress(it, pair.second) }, shouldCancel = { cancelRequested },
@@ -482,8 +515,16 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
         }
         if (source == HistoricalCorpusSource.DOWNLOADED) {
             markets.forEach { index ->
-                series += downloadedStore.loadSeriesWindow(index, months)
-                _state.value = _state.value.copy(stage = "DOWNLOADED_READY", message = "Downloaded ${scope.label} corpus · ${series.size} contracts loaded from phone")
+                val loaded = downloadedStore.loadSeriesWindow(index, months)
+                series += loaded
+                _state.value = _state.value.copy(
+                    stage = "DOWNLOADED_READY",
+                    message = if (loaded.isEmpty()) {
+                        "Downloaded ${index.name} option data found but matching 1-minute index context is missing/incomplete"
+                    } else {
+                        "Downloaded ${scope.label} corpus · ${series.size} contracts + native index context loaded from phone"
+                    },
+                )
             }
         }
         if (source in setOf(HistoricalCorpusSource.UPSTOX, HistoricalCorpusSource.COMBINED)) {
@@ -528,27 +569,35 @@ class HistoricalCorpusTrainingViewModel(application: Application) : AndroidViewM
     fun clearLocalCorpus() {
         if (busy()) return
         runCatching { prelabelledStore.clear(); localStore.clear(); checkpointStore.clearAll() }
-            .onSuccess { _state.value = _state.value.copy(localSummary = LocalCorpusSummary(), selectedSource = HistoricalCorpusSource.UPSTOX, message = "Imported/pre-labelled corpus + incompatible training checkpoints cleared · downloaded/live archive data unchanged", error = null, prelabelledCorpusReady = false, prelabelledTrainRows = 0, prelabelledValidationRows = 0, prelabelledTestRows = 0, checkpointAvailable = false) }
+            .onSuccess { _state.value = _state.value.copy(localSummary = LocalCorpusSummary(), selectedSource = HistoricalCorpusSource.UPSTOX, message = "Imported/pre-labelled corpus + compatible training checkpoints cleared · downloaded/live archive data unchanged", error = null, prelabelledCorpusReady = false, prelabelledTrainRows = 0, prelabelledValidationRows = 0, prelabelledTestRows = 0, checkpointAvailable = false) }
             .onFailure { _state.value = _state.value.copy(error = "Could not clear local corpus: ${it.message}") }
     }
 
     fun refreshLocalSummary() {
         if (busy()) return
         val ready = prelabelledStore.ready()
+        val source = _state.value.selectedSource
+        val scope = _state.value.selectedMarketScope
+        val months = _state.value.selectedMonths
         _state.value = _state.value.copy(
             localSummary = effectiveLocalSummary(), downloadedSummary = downloadedStore.summary(), prelabelledCorpusReady = ready,
             prelabelledTrainRows = if (ready) prelabelledStore.rows(AimlHistoricalOptionCorpusV1Store.Split.TRAIN) else 0L,
             prelabelledValidationRows = if (ready) prelabelledStore.rows(AimlHistoricalOptionCorpusV1Store.Split.VALIDATION) else 0L,
             prelabelledTestRows = if (ready) prelabelledStore.rows(AimlHistoricalOptionCorpusV1Store.Split.TEST) else 0L,
-            checkpointAvailable = checkpointFor(_state.value.selectedMarketScope, _state.value.selectedMonths),
+            checkpointAvailable = checkpointFor(source, scope, months),
         )
     }
 
-    private fun checkpointFor(scope: HistoricalMarketScope, months: Int): Boolean = when (scope) {
-        HistoricalMarketScope.BOTH -> checkpointStore.has("joint_both", months)
-        HistoricalMarketScope.NIFTY -> checkpointStore.has("single_NIFTY", months)
-        HistoricalMarketScope.SENSEX -> checkpointStore.has("single_SENSEX", months)
+    /** Only pre-labelled LOCAL/COMBINED stages own these deterministic generation checkpoints. */
+    private fun checkpointFor(source: HistoricalCorpusSource, scope: HistoricalMarketScope, months: Int): Boolean {
+        if (!prelabelledStore.ready() || source !in setOf(HistoricalCorpusSource.LOCAL, HistoricalCorpusSource.COMBINED)) return false
+        return when (scope) {
+            HistoricalMarketScope.BOTH -> checkpointStore.has("joint_both", months)
+            HistoricalMarketScope.NIFTY -> checkpointStore.has("single_NIFTY", months)
+            HistoricalMarketScope.SENSEX -> checkpointStore.has("single_SENSEX", months)
+        }
     }
+
     private fun effectiveLocalSummary(): LocalCorpusSummary = if (prelabelledStore.ready()) prelabelledStore.summary() else localStore.summary()
     private fun busy(): Boolean = job?.isActive == true || _state.value.isRunning || _state.value.isImporting || _state.value.isDownloading
     private fun cancelled(error: Throwable): Boolean = cancelRequested || error is kotlinx.coroutines.CancellationException || error.message?.contains("cancel", true) == true

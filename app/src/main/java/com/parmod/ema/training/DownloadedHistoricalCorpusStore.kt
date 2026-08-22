@@ -71,6 +71,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
     private val corrupt = File(root, "corrupt").apply { mkdirs() }
     private val prefs = appContext.getSharedPreferences("vardhani_downloaded_historical_stats", 0)
     private val zone = ZoneId.of("Asia/Kolkata")
+    private val underlyingStore = DownloadedUnderlyingCorpusStore(appContext)
 
     init {
         temp.listFiles()?.forEach { file ->
@@ -91,9 +92,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
             val loaded = runCatching { readStored(target) }.getOrNull()
             if (loaded == null) quarantine(target, "decode")
             loaded
-        } else {
-            null
-        }
+        } else null
         if (previous != null) require(previous.header.contractKey == contractKey) { "Downloaded corpus contract identity mismatch" }
 
         val previousRows = previous?.candles.orEmpty()
@@ -109,20 +108,9 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         val duplicates = (series.candles.size - added).coerceAtLeast(0)
 
         if (added > 0 || previous == null) {
-            writeAtomic(
-                target = target,
-                index = series.index,
-                optionType = type,
-                strike = series.strike,
-                expiry = series.expiry,
-                lotSize = series.lotSize,
-                symbol = series.symbol,
-                candles = merged,
-            )
+            writeAtomic(target, series.index, type, series.strike, series.expiry, series.lotSize, series.symbol, merged)
         }
-        if (duplicates > 0) {
-            prefs.edit().putLong(KEY_DEDUPED, prefs.getLong(KEY_DEDUPED, 0L) + duplicates).apply()
-        }
+        if (duplicates > 0) prefs.edit().putLong(KEY_DEDUPED, prefs.getLong(KEY_DEDUPED, 0L) + duplicates).apply()
         val verification = verifyFile(target, contractKey)
         require(verification.verified) { "Downloaded corpus verification failed: ${verification.reason}" }
         return SaveResult(added, duplicates, verification.rows, verification.fingerprint, verification.fileBytes)
@@ -148,21 +136,34 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         return verification
     }
 
-    /** Reads the selected window from phone storage. FULL means all locally downloaded history. */
+    /**
+     * Reads the selected option window and attaches one shared immutable underlying list.
+     * Every contract references the same NIFTY/SENSEX index list, avoiding N copies in RAM.
+     */
     fun loadSeriesWindow(index: MarketIndex, months: Int): List<HistoricalOptionSeries> {
         require(months in PrelabelledTrainingWindowPlan.ALLOWED_MONTHS)
         val headers = contractFiles().mapNotNull { file ->
             runCatching { readHeader(file) }.getOrNull()?.let { file to it }
         }.filter { it.second.index == index }
         if (headers.isEmpty()) return emptyList()
+
         val latestEpoch = headers.maxOf { it.second.maxEpochMs }
         val latestDate = Instant.ofEpochMilli(latestEpoch).atZone(zone).toLocalDate()
         val cutoff = if (months == PrelabelledTrainingWindowPlan.FULL) LocalDate.MIN else latestDate.minusMonths(months.toLong())
+        val eligible = headers.filter { (_, header) ->
+            months == PrelabelledTrainingWindowPlan.FULL ||
+                !Instant.ofEpochMilli(header.maxEpochMs).atZone(zone).toLocalDate().isBefore(cutoff)
+        }
+        if (eligible.isEmpty()) return emptyList()
 
-        return headers.mapNotNull { (file, header) ->
-            if (months != PrelabelledTrainingWindowPlan.FULL && Instant.ofEpochMilli(header.maxEpochMs).atZone(zone).toLocalDate().isBefore(cutoff)) {
-                return@mapNotNull null
-            }
+        val earliestOptionDate = eligible.minOf { (_, header) ->
+            Instant.ofEpochMilli(header.minEpochMs).atZone(zone).toLocalDate()
+        }
+        val underlying = runCatching {
+            underlyingStore.load(index, earliestOptionDate.minusDays(UNDERLYING_WARMUP_DAYS), latestDate)
+        }.getOrDefault(emptyList())
+
+        return eligible.mapNotNull { (file, header) ->
             val stored = runCatching { readStored(file) }.getOrNull()
             if (stored == null) {
                 quarantine(file, "load")
@@ -180,6 +181,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
                 symbol = header.symbol,
                 source = "UPSTOX_DOWNLOADED",
                 candles = candles,
+                underlyingCandles = underlying,
             )
         }.sortedWith(compareBy<HistoricalOptionSeries> { it.expiry }.thenBy { it.strike }.thenBy { it.optionType })
     }
@@ -255,12 +257,8 @@ class DownloadedHistoricalCorpusStore(context: Context) {
             candles.forEach { c ->
                 out.writeLong(c.time.toInstant().toEpochMilli())
                 out.writeInt(c.time.offset.totalSeconds)
-                out.writeDouble(c.open)
-                out.writeDouble(c.high)
-                out.writeDouble(c.low)
-                out.writeDouble(c.close)
-                out.writeLong(c.volume)
-                out.writeLong(c.openInterest)
+                out.writeDouble(c.open); out.writeDouble(c.high); out.writeDouble(c.low); out.writeDouble(c.close)
+                out.writeLong(c.volume); out.writeLong(c.openInterest)
             }
         }
         val expectedKey = key(index, expiry, strike, optionType)
@@ -273,15 +271,9 @@ class DownloadedHistoricalCorpusStore(context: Context) {
 
     private fun replaceSafely(source: File, target: File) {
         val atomicSucceeded = runCatching {
-            Files.move(
-                source.toPath(),
-                target.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-                StandardCopyOption.ATOMIC_MOVE,
-            )
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
         }.isSuccess
         if (atomicSucceeded) return
-
         val backup = File(temp, target.name + ".${System.nanoTime()}.bak")
         var backedUp = false
         try {
@@ -293,9 +285,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
             if (backedUp) backup.delete()
         } catch (error: Throwable) {
             if (target.exists()) target.delete()
-            if (backedUp && backup.exists()) runCatching {
-                Files.move(backup.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            }
+            if (backedUp && backup.exists()) runCatching { Files.move(backup.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING) }
             source.delete()
             throw error
         }
@@ -306,12 +296,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         return runCatching {
             val stored = readStored(file)
             require(stored.header.contractKey == expectedKey) { "contract identity mismatch" }
-            Verification(
-                verified = true,
-                rows = stored.header.count,
-                fingerprint = sha256(file),
-                fileBytes = file.length(),
-            )
+            Verification(true, stored.header.count, sha256(file), file.length())
         }.getOrElse { Verification(false, reason = (it.message ?: it::class.java.simpleName).take(160)) }
     }
 
@@ -339,9 +324,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         Stored(header, rows)
     }
 
-    private fun readHeader(file: File): Header = DataInputStream(FileInputStream(file).buffered(BUFFER)).use { input ->
-        readHeader(input)
-    }
+    private fun readHeader(file: File): Header = DataInputStream(FileInputStream(file).buffered(BUFFER)).use { input -> readHeader(input) }
 
     private fun readHeader(input: DataInputStream): Header {
         require(input.readUTF() == MAGIC) { "Unsupported downloaded historical corpus schema" }
@@ -370,9 +353,7 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         if (!file.renameTo(target)) file.delete()
     }
 
-    private fun contractFiles(): List<File> =
-        contracts.listFiles { f -> f.isFile && f.extension == EXT }?.sortedBy { it.name }.orEmpty()
-
+    private fun contractFiles(): List<File> = contracts.listFiles { f -> f.isFile && f.extension == EXT }?.sortedBy { it.name }.orEmpty()
     private fun fileForKey(contractKey: String): File = File(contracts, "${sha256(contractKey)}.$EXT")
 
     companion object {
@@ -383,14 +364,14 @@ class DownloadedHistoricalCorpusStore(context: Context) {
         private const val MAX_ROWS_PER_CONTRACT = 1_000_000
         private const val TEMP_MAX_AGE_MS = 24L * 60L * 60L * 1000L
         private const val KEY_DEDUPED = "deduped_rows"
+        private const val UNDERLYING_WARMUP_DAYS = 7L
         const val MINIMUM_FREE_BYTES = 2L * 1024L * 1024L * 1024L
 
         fun key(index: MarketIndex, expiry: LocalDate, strike: Double, optionType: String): String =
             "${index.name}|$expiry|$strike|${optionType.uppercase()}"
 
         private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
-            .digest(value.toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
+            .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
         private fun sha256(file: File): String {
             val digest = MessageDigest.getInstance("SHA-256")

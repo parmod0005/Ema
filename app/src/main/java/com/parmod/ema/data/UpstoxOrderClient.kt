@@ -308,15 +308,16 @@ class UpstoxOrderClient(private val accessToken: String) {
             error("Partial LIVE exit blocked because residual quantity cannot be protected")
         }
 
+        val priorClosed = sellPlan.reconciledPriorClosedQuantity
         val preFillAverage = latestProtection?.averageFillPrice
             ?.takeIf {
-                sellPlan.preFilledQuantity <= 0 ||
-                    (it > 0.0 && latestProtection.pricedFilledQuantity >= sellPlan.preFilledQuantity)
+                priorClosed <= 0 ||
+                    (it > 0.0 && latestProtection.pricedFilledQuantity >= priorClosed)
             }
             ?: 0.0
-        if (sellPlan.preFilledQuantity > 0 && preFillAverage <= 0.0) {
+        if (priorClosed > 0 && preFillAverage <= 0.0) {
             UpstoxComplianceRegistry.setProtectionFault(
-                "Broker quantity reduced before LIVE exit but prior fill price is unavailable",
+                "Broker quantity reduced before LIVE exit but full prior fill pricing is unavailable",
             )
             error("LIVE exit requires broker recovery because prior closed quantity is unpriced")
         }
@@ -441,48 +442,69 @@ class UpstoxOrderClient(private val accessToken: String) {
     }
 
     /**
-     * Translate broker reconciliation into quantities the existing runtime can safely book.
-     * A caller-visible filled quantity is never larger than the quantity with known prices.
-     * When a safety flatten proves the broker flat and all reconciled quantity is priced,
-     * the full broker-side position size is returned even if the original request was only
-     * a T1 partial. That lets the state layer remove the now-zero local position immediately.
+     * Translate full broker history into quantities the runtime may safely book.
+     * Prior exchange-held protective fills are included even when they exceed the current
+     * T1 request. Only quantity with a trustworthy broker price is exposed as filled.
      */
     private fun normalizeSellExecutionForCaller(
         placement: Placement,
         execution: Execution,
     ): Execution {
-        val reconciledTarget = placement.protectionBeforeQuantity
+        val localPositionQuantity = placement.protectionBeforeQuantity
             .coerceAtLeast(execution.requestedQuantity)
             .coerceAtLeast(0)
-        val normalClosed = execution.filledQuantity.coerceAtLeast(0)
-        val normalPriced = execution.pricedQuantity.coerceIn(0, normalClosed)
+        if (localPositionQuantity <= 0) return execution
+
+        val stateFilled = execution.states.sumOf { it.filledQuantity.coerceAtLeast(0) }
+        val statePricedQuantity = execution.states.sumOf { status ->
+            if (status.filledQuantity > 0 && status.averagePrice > 0.0) status.filledQuantity else 0
+        }
+        val statePricedValue = execution.states.sumOf { status ->
+            if (status.filledQuantity > 0 && status.averagePrice > 0.0) {
+                status.filledQuantity * status.averagePrice
+            } else {
+                0.0
+            }
+        }
+
         val safetyClosed = execution.safetyFlattenedQuantity.coerceAtLeast(0)
         val safetyPriced = if (safetyClosed > 0 && execution.safetyFlattenAveragePrice > 0.0) {
             safetyClosed
         } else {
             0
         }
-        val observedClosed = min(reconciledTarget, normalClosed + safetyClosed)
-        val observedPriced = min(observedClosed, normalPriced + safetyPriced)
-        val weighted = weightedAverage(
-            firstQty = normalPriced,
-            firstAvg = execution.averagePrice,
-            secondQty = safetyPriced,
-            secondAvg = execution.safetyFlattenAveragePrice,
+        val safetyValue = safetyPriced * execution.safetyFlattenAveragePrice
+
+        val networkFilled = (stateFilled - safetyClosed).coerceAtLeast(0)
+        val networkPriced = (statePricedQuantity - safetyPriced)
+            .coerceAtLeast(0)
+            .coerceAtMost(networkFilled)
+        val networkValue = (statePricedValue - safetyValue).coerceAtLeast(0.0)
+        val networkAverage = if (networkPriced > 0) networkValue / networkPriced else 0.0
+
+        val accounting = LiveExitAccounting.reconcileFullBrokerHistory(
+            localPositionQuantity = localPositionQuantity,
+            brokerLongBeforeQuantity = placement.brokerLongBeforeQuantity,
+            priorClosedAveragePrice = placement.preFillAveragePrice,
+            networkFilledQuantity = networkFilled,
+            networkPricedQuantity = networkPriced,
+            networkAveragePrice = networkAverage,
+            safetyFlattenedQuantity = safetyClosed,
+            safetyFlattenAveragePrice = execution.safetyFlattenAveragePrice,
+            brokerFlatAfterSafetyAction = execution.brokerFlatAfterSafetyAction,
         )
 
-        if (observedPriced < observedClosed) {
+        if (accounting.requiresPnlUncertaintyLock) {
             UpstoxComplianceRegistry.setProtectionFault(
                 "LIVE SELL closed quantity has incomplete fill pricing; P&L reconciliation locked",
             )
         }
 
-        val callerFilled = observedPriced
-        val callerAverage = if (callerFilled > 0) weighted else 0.0
+        val callerFilled = accounting.knownPricedQuantity
         return execution.copy(
             filledQuantity = callerFilled,
-            pendingQuantity = (reconciledTarget - callerFilled).coerceAtLeast(0),
-            averagePrice = callerAverage,
+            pendingQuantity = (localPositionQuantity - callerFilled).coerceAtLeast(0),
+            averagePrice = accounting.knownWeightedAveragePrice,
             pricedQuantity = callerFilled,
         )
     }

@@ -138,9 +138,6 @@ object TradingRecoveryRegistry {
                     matching.instrumentKey != fragment.instrumentKey ||
                     matching.realizedPartialPnl != fragment.realizedPartialPnl
             records[matching.key] = merge(matching, fragment)
-            // Ordinary LTP/high/stop copies can occur many times per second and are
-            // throttled. Quantity, T1, contract and realized-partial changes must become
-            // durable immediately so a crash cannot resurrect already-exited exposure.
             persistLocked(force = safetyCriticalChange)
         }
     }
@@ -151,6 +148,14 @@ object TradingRecoveryRegistry {
         val key = tradeKey(entry)
         val identity = identity(entry.executionMode, entry.brokerEntryOrderId, entry.entryTimeMillis)
         val previous = records[key]
+        val pnlUncertain = entry.executionMode == ExecutionMode.LIVE && LivePnlUncertaintyRegistry.isMarked(entry)
+        val safePnl = if (pnlUncertain) null else entry.pnl
+        val safeExitReason = if (pnlUncertain && entry.status == TradeStatus.CLOSED) {
+            entry.exitReason.takeIf { it.contains("P&L UNPRICED", ignoreCase = true) }
+                ?: "${entry.exitReason.ifBlank { "LIVE EXIT" }} · P&L UNPRICED"
+        } else {
+            entry.exitReason
+        }
         var record = Record(
             key = key,
             index = entry.index,
@@ -178,8 +183,8 @@ object TradingRecoveryRegistry {
             brokerExitOrderId = entry.brokerExitOrderId,
             exitPrice = entry.exitPrice,
             exitTimeMillis = entry.exitTimeMillis,
-            pnl = entry.pnl,
-            exitReason = entry.exitReason,
+            pnl = safePnl,
+            exitReason = safeExitReason,
             recoveryResolved = previous?.recoveryResolved ?: false,
         )
         fragments[identity]?.let { record = merge(record, it) }
@@ -189,8 +194,8 @@ object TradingRecoveryRegistry {
                 brokerExitOrderId = entry.brokerExitOrderId,
                 exitPrice = entry.exitPrice,
                 exitTimeMillis = entry.exitTimeMillis,
-                pnl = entry.pnl,
-                exitReason = entry.exitReason,
+                pnl = safePnl,
+                exitReason = safeExitReason,
                 recoveryResolved = true,
                 updatedAtMillis = System.currentTimeMillis(),
             )
@@ -206,11 +211,6 @@ object TradingRecoveryRegistry {
         .filter { it.executionMode == ExecutionMode.LIVE && it.status == TradeStatus.OPEN && !it.recoveryResolved && it.currentQuantity > 0 }
         .sortedBy { it.entryTimeMillis }
 
-    /**
-     * Rehydrates pre-restart trade rows so PAPER and LIVE use the same daily trade count.
-     * Resolved recovery records are displayed as closed/broker-flat rather than as a phantom
-     * open position in the new dashboard process.
-     */
     @Synchronized
     fun startupTradeLog(index: MarketIndex): List<TradeLogEntry> = startupRecords
         .asSequence()
@@ -269,15 +269,6 @@ object TradingRecoveryRegistry {
         }
     }
 
-    /**
-     * A resolved LIVE position can be proven broker-flat without the local process knowing
-     * the exact exit fill/P&L (for example when the exchange-held disaster stop fired while
-     * the app was dead, or an emergency safety flatten completed with an unpriced broker
-     * pre-fill). Treat that uncertainty as a daily safety lock instead of silently assuming
-     * zero loss. CLOSED rows with null P&L are intentionally included so runtime broker-flat
-     * reconciliation can present the trade as closed immediately and still remain locked
-     * after restart.
-     */
     @Synchronized
     fun startupHasUnpricedRecoveredLive(index: MarketIndex? = null): Boolean {
         val today = LocalDate.now(zone)

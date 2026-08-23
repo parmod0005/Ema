@@ -7,7 +7,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
-/** Read-only Upstox bootstrap client. No order endpoint exists in this class. */
+/** Read-only Upstox bootstrap client. Broker order calls live only in UpstoxOrderClient. */
 class UpstoxLiveClient(private val accessToken: String) {
     data class Snapshot(
         val spot: Double,
@@ -22,8 +22,13 @@ class UpstoxLiveClient(private val accessToken: String) {
             MarketIndex.NIFTY -> "NSE_INDEX|Nifty 50"
             MarketIndex.SENSEX -> "BSE_INDEX|SENSEX"
         }
+        val contracts = UpstoxOptionDiscoveryClient(accessToken)
+            .discover(index)
+            .contractsByExpiry[expiryDate]
+            .orEmpty()
+        val lotSizeByInstrument = contracts.associate { it.instrumentKey to it.lotSize }
         val spot = fetchLtp(underlying)
-        val chain = fetchOptionChain(underlying, expiryDate, spot, index)
+        val chain = fetchOptionChain(underlying, expiryDate, spot, index, lotSizeByInstrument)
         return Snapshot(spot, chain, underlying)
     }
 
@@ -40,7 +45,13 @@ class UpstoxLiveClient(private val accessToken: String) {
         return item.getDouble("last_price")
     }
 
-    private fun fetchOptionChain(underlying: String, expiryDate: String, spot: Double, index: MarketIndex): List<OptionQuote> {
+    private fun fetchOptionChain(
+        underlying: String,
+        expiryDate: String,
+        spot: Double,
+        index: MarketIndex,
+        lotSizeByInstrument: Map<String, Int>,
+    ): List<OptionQuote> {
         val encoded = URLEncoder.encode(underlying, Charsets.UTF_8.name())
         val json = getJson("https://api.upstox.com/v2/option/chain?instrument_key=$encoded&expiry_date=$expiryDate")
         val rows = json.getJSONArray("data")
@@ -51,19 +62,26 @@ class UpstoxLiveClient(private val accessToken: String) {
             val row = rows.getJSONObject(i)
             val strike = row.getDouble("strike_price")
             if (strike < atm - 5 * step || strike > atm + 5 * step) continue
-            parseOption(row.optJSONObject("call_options"), strike, "CE", strike.toInt() == atm)?.let(result::add)
-            parseOption(row.optJSONObject("put_options"), strike, "PE", strike.toInt() == atm)?.let(result::add)
+            parseOption(row.optJSONObject("call_options"), strike, "CE", strike.toInt() == atm, lotSizeByInstrument)?.let(result::add)
+            parseOption(row.optJSONObject("put_options"), strike, "PE", strike.toInt() == atm, lotSizeByInstrument)?.let(result::add)
         }
         if (result.isEmpty()) error("No option-chain rows for selected expiry")
         return result.sortedWith(compareBy<OptionQuote> { it.strike }.thenBy { it.type })
     }
 
-    private fun parseOption(node: JSONObject?, strike: Double, type: String, isAtm: Boolean): OptionQuote? {
+    private fun parseOption(
+        node: JSONObject?,
+        strike: Double,
+        type: String,
+        isAtm: Boolean,
+        lotSizeByInstrument: Map<String, Int>,
+    ): OptionQuote? {
         node ?: return null
         val market = node.optJSONObject("market_data") ?: return null
         val greeks = node.optJSONObject("option_greeks") ?: JSONObject()
         val oi = market.optLong("oi", 0L)
         val previousOi = market.optLong("prev_oi", oi)
+        val instrumentKey = node.optString("instrument_key")
         return OptionQuote(
             strike = strike,
             type = type,
@@ -73,10 +91,11 @@ class UpstoxLiveClient(private val accessToken: String) {
             delta = greeks.optDouble("delta", 0.0),
             gamma = greeks.optDouble("gamma", 0.0),
             isAtm = isAtm,
-            instrumentKey = node.optString("instrument_key"),
+            instrumentKey = instrumentKey,
             bid = market.optDouble("bid_price", 0.0),
             ask = market.optDouble("ask_price", 0.0),
             volume = market.optLong("volume", 0L),
+            lotSize = lotSizeByInstrument[instrumentKey] ?: 0,
         )
     }
 

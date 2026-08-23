@@ -102,11 +102,25 @@ class HistoricalDataViewModel(application: Application) : AndroidViewModel(appli
                     input.use { manager.importCatalogue(it, name) }
                 }
                 val catalog = manager.catalogueSummary()
+                val audit = result.manifestAudit
                 _state.value = _state.value.copy(
                     isImportingCatalogue = false,
                     stage = "CATALOGUE_READY",
                     catalogue = catalog,
-                    message = "Catalogue import complete · NIFTY expiries ${catalog.niftyExpiries} · SENSEX ${catalog.sensexExpiries} · contracts ${catalog.contracts} · newly added ${result.contractsAdded}",
+                    message = buildString {
+                        append("Catalogue import complete · NIFTY expiries ").append(catalog.niftyExpiries)
+                        append(" · SENSEX ").append(catalog.sensexExpiries)
+                        append(" · contracts ").append(catalog.contracts)
+                        append(" · newly added ").append(result.contractsAdded)
+                        if (audit.rows > 0) {
+                            append(" · manifest NIFTY option ").append(audit.niftyExpiredOptionRows)
+                            append(" · SENSEX index ").append(audit.sensexUnderlyingRows)
+                            append(" · SENSEX option ").append(audit.sensexExpiredOptionRows)
+                            if (!audit.hasVerifiedSensexContractMetadata && audit.sensexUnderlyingRows > 0) {
+                                append(" · SENSEX underlying found but no verified SENSEX contracts.json; no BSE keys invented")
+                            }
+                        }
+                    },
                     errors = result.errors.size,
                     error = result.errors.lastOrNull(),
                 )

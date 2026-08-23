@@ -1,5 +1,6 @@
 package com.parmod.ema
 
+import android.content.Intent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -37,21 +38,44 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
     var reveal by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
 
+    fun saveCredentials() {
+        val old = vault.read()
+        vault.save(
+            old.copy(
+                upstoxApiKey = apiKey,
+                upstoxApiSecret = apiSecret,
+                upstoxRedirectUri = redirectUri,
+            ),
+        )
+        onAccessTokenSaved(old.upstoxAccessToken)
+        reveal = false
+        message = "Upstox app credentials encrypted and saved"
+    }
+
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(Modifier.weight(1f)) {
                     Text("UPSTOX APP CREDENTIALS", fontWeight = FontWeight.Bold)
                     Text(
-                        if (apiKey.isNotBlank() && apiSecret.isNotBlank()) "API key and secret saved securely" else "Optional API key, secret and redirect URI",
+                        if (apiKey.isNotBlank() && apiSecret.isNotBlank()) {
+                            "API key and secret saved securely"
+                        } else {
+                            "API key, secret, redirect URI + OAuth token workflow"
+                        },
                         style = MaterialTheme.typography.labelSmall,
                     )
                 }
-                OutlinedButton(onClick = { expanded = !expanded }) { Text(if (expanded) "CLOSE" else "EDIT") }
+                OutlinedButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "CLOSE" else "EDIT")
+                }
             }
 
             if (expanded) {
-                Text("The access token is entered only in the connection card above. Values are encrypted with Android Keystore.", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    "Values are encrypted with Android Keystore. Upstox password/TOTP are entered only on Upstox's hosted login page.",
+                    style = MaterialTheme.typography.labelSmall,
+                )
                 CredentialField("Upstox API key", apiKey, reveal) { apiKey = it.trim() }
                 CredentialField("Upstox API secret", apiSecret, reveal) { apiSecret = it.trim() }
                 OutlinedTextField(
@@ -62,20 +86,27 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(onClick = { reveal = !reveal }, modifier = Modifier.weight(1f)) { Text(if (reveal) "HIDE" else "REVEAL") }
+                    OutlinedButton(
+                        onClick = { reveal = !reveal },
+                        modifier = Modifier.weight(1f),
+                    ) { Text(if (reveal) "HIDE" else "REVEAL") }
                     Button(
                         onClick = {
-                            val old = vault.read()
-                            vault.save(old.copy(upstoxApiKey = apiKey, upstoxApiSecret = apiSecret, upstoxRedirectUri = redirectUri))
-                            onAccessTokenSaved(old.upstoxAccessToken)
-                            reveal = false
+                            saveCredentials()
                             expanded = false
-                            message = "Upstox app credentials encrypted and saved"
                         },
                         enabled = apiKey.isNotBlank() || apiSecret.isNotBlank() || redirectUri.isNotBlank(),
                         modifier = Modifier.weight(1f),
                     ) { Text("SAVE") }
                 }
+                Button(
+                    onClick = {
+                        saveCredentials()
+                        context.startActivity(Intent(context, OAuthLauncherActivity::class.java))
+                    },
+                    enabled = apiKey.isNotBlank() && apiSecret.isNotBlank() && redirectUri.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("OPEN UPSTOX OAUTH LOGIN") }
             }
 
             if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.labelSmall)
@@ -84,7 +115,12 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
 }
 
 @Composable
-private fun CredentialField(label: String, value: String, reveal: Boolean, onValueChange: (String) -> Unit) {
+private fun CredentialField(
+    label: String,
+    value: String,
+    reveal: Boolean,
+    onValueChange: (String) -> Unit,
+) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,

@@ -13,13 +13,15 @@ import kotlin.math.min
 /**
  * Shared causal sample builder for raw/downloaded/direct-Upstox historical option series.
  *
- * Preferred path:
+ * Official raw-series training path:
  *  - NIFTY/SENSEX underlying 1m bars determine direction and trend-quality features.
  *  - CE requires bullish underlying confirmation; PE requires bearish confirmation.
  *  - option premium/OI determines the trade outcome and option-side pressure.
  *
- * Legacy imported raw corpora may not contain underlying bars. Those retain the historical
- * option-premium proxy path for backwards compatibility, and callers report that fallback.
+ * Legacy imported raw corpora may not contain underlying bars. They remain identifiable in
+ * storage/provenance reporting, but they are deliberately NOT converted into official
+ * training samples. This prevents option-premium direction from silently standing in for
+ * the underlying index when a Candidate is evaluated for promotion.
  */
 internal object HistoricalSeriesSampleBuilder {
     data class Sample(
@@ -57,11 +59,13 @@ internal object HistoricalSeriesSampleBuilder {
             .filter { it.close > 0.0 }
             .sortedBy { it.time.toInstant().toEpochMilli() }
             .distinctBy { it.time.toInstant().toEpochMilli() }
-        return if (underlying.size >= MIN_SIGNAL_BARS) {
-            buildNative(contract, optionCandles, underlying, config, signalEngine)
-        } else {
-            buildLegacyProxy(contract, optionCandles, config, signalEngine)
+        if (underlying.size < MIN_SIGNAL_BARS) {
+            // Fail closed for official historical training. The old premium-proxy builder is
+            // intentionally retained below for reproducibility/audit reference, but it is not
+            // part of the Candidate-qualifying sample path anymore.
+            return Result(emptyList(), nativeUnderlying = false, alignedUnderlyingBars = underlying.size)
         }
+        return buildNative(contract, optionCandles, underlying, config, signalEngine)
     }
 
     private fun buildNative(
@@ -136,6 +140,12 @@ internal object HistoricalSeriesSampleBuilder {
         return Result(out, nativeUnderlying = true, alignedUnderlyingBars = underlyingSeen.size)
     }
 
+    /**
+     * Historical audit reference only. This implementation is intentionally unreachable from
+     * [build] so legacy studies can be reproduced during code review without allowing proxy
+     * direction into an official Candidate corpus.
+     */
+    @Suppress("unused")
     private fun buildLegacyProxy(
         contract: HistoricalOptionSeries,
         options: List<UpstoxPlusHistoricalClient.Candle>,
@@ -150,8 +160,6 @@ internal object HistoricalSeriesSampleBuilder {
             bars += SignalEngineV2.Bar(candle.open, candle.high, candle.low, candle.close, candle.volume)
             if (i < MIN_OPTION_SIGNAL_INDEX || i % config.sampleStrideBars != 0 || i + 1 >= options.size) return@forEachIndexed
             val evaluation = signalEngine.evaluate(bars, engineConfig)
-            // Legacy raw files contain option premiums but no underlying. A bought option
-            // still needs bullish premium structure, regardless of CE/PE identity.
             if (evaluation.direction != SignalEngineV2.Direction.BULLISH || evaluation.score < config.minimumSignalScore) return@forEachIndexed
             val outcome = HistoricalPremiumLabeler.label(options, i, contract.lotSize, config.labelConfig) ?: return@forEachIndexed
             val range = max(candle.high - candle.low, 0.01)

@@ -24,6 +24,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.parmod.ema.data.LocalCredentialVault
+import com.parmod.ema.model.UpstoxComplianceRegistry
 
 @Composable
 fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
@@ -34,6 +35,7 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
     var apiKey by remember { mutableStateOf(initial.upstoxApiKey) }
     var apiSecret by remember { mutableStateOf(initial.upstoxApiSecret) }
     var redirectUri by remember { mutableStateOf(initial.upstoxRedirectUri) }
+    var algoName by remember { mutableStateOf(initial.upstoxAlgoName) }
     var expanded by remember { mutableStateOf(false) }
     var reveal by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
@@ -45,11 +47,13 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
                 upstoxApiKey = apiKey,
                 upstoxApiSecret = apiSecret,
                 upstoxRedirectUri = redirectUri,
+                upstoxAlgoName = algoName,
             ),
         )
+        UpstoxComplianceRegistry.configureAlgoName(algoName)
         onAccessTokenSaved(old.upstoxAccessToken)
         reveal = false
-        message = "Upstox app credentials encrypted and saved"
+        message = "Upstox credentials / Algo Name encrypted and saved"
     }
 
     Card(Modifier.fillMaxWidth()) {
@@ -59,9 +63,9 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
                     Text("UPSTOX APP CREDENTIALS", fontWeight = FontWeight.Bold)
                     Text(
                         if (apiKey.isNotBlank() && apiSecret.isNotBlank()) {
-                            "API key and secret saved securely"
+                            "API credentials saved · AUTO LIVE Algo Name ${if (algoName.isBlank()) "NOT SET" else "SET"}"
                         } else {
-                            "API key, secret, redirect URI + OAuth token workflow"
+                            "API key, secret, redirect URI, Algo Name + OAuth workflow"
                         },
                         style = MaterialTheme.typography.labelSmall,
                     )
@@ -73,7 +77,7 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
 
             if (expanded) {
                 Text(
-                    "Values are encrypted with Android Keystore. Upstox password/TOTP are entered only on Upstox's hosted login page.",
+                    "Values are encrypted with Android Keystore. Upstox password/TOTP are entered only on Upstox's hosted login page. AUTO LIVE also requires the exact Algo Name configured/approved for your Upstox Algo App; static-IP registration is checked again before an order is sent.",
                     style = MaterialTheme.typography.labelSmall,
                 )
                 CredentialField("Upstox API key", apiKey, reveal) { apiKey = it.trim() }
@@ -82,6 +86,14 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
                     value = redirectUri,
                     onValueChange = { redirectUri = it.trim() },
                     label = { Text("Upstox redirect URI") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = algoName,
+                    onValueChange = { algoName = it.trim() },
+                    label = { Text("Upstox Algo Name · required for AUTO LIVE") },
+                    supportingText = { Text("Use the exact configured Algo Name; do not invent one.") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -95,7 +107,7 @@ fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
                             saveCredentials()
                             expanded = false
                         },
-                        enabled = apiKey.isNotBlank() || apiSecret.isNotBlank() || redirectUri.isNotBlank(),
+                        enabled = apiKey.isNotBlank() || apiSecret.isNotBlank() || redirectUri.isNotBlank() || algoName.isNotBlank(),
                         modifier = Modifier.weight(1f),
                     ) { Text("SAVE") }
                 }

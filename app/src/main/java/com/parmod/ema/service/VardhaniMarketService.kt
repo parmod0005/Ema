@@ -13,7 +13,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.parmod.ema.R
-import com.parmod.ema.VardhaniFullActivity
+import com.parmod.ema.VardhaniEntryActivity
 
 /**
  * Foreground process/network keeper for the full VARDHANI runtime.
@@ -97,7 +97,7 @@ class VardhaniMarketService : Service() {
         val openIntent = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, VardhaniFullActivity::class.java),
+            Intent(this, VardhaniEntryActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)

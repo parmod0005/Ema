@@ -11,3 +11,4 @@ Release discipline:
 - Historical BSE/NSE instrument keys must come from verified metadata and are never invented.
 - A new APK is not labelled verified until the complete build actually executes and its artifact can be inspected.
 - The trusted default-branch workflow and development workflow are synchronized before this source-only build trigger.
+- Trusted `pull_request_target` build is triggered from the default branch and checks out only the guarded same-repository VARDHANI PR head.

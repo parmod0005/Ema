@@ -6,14 +6,18 @@ import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
 import android.graphics.drawable.Icon
 import android.os.Build
+import com.parmod.ema.data.TradingRecoveryStore
 import com.parmod.ema.engine.MetaBrainPrefsMigration
 import com.parmod.ema.engine.MetaBrainRuntime
+import com.parmod.ema.model.TradingRecoveryRegistry
 import com.parmod.ema.training.DualMarketLiveTrainingCoordinator
 import com.parmod.ema.training.LiveResearchArchive
 
 class VardhaniApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        // Initialize the crash ledger before any dashboard/trading model can be created.
+        TradingRecoveryRegistry.initialize(TradingRecoveryStore(this))
         MetaBrainPrefsMigration.migrateV2ToV3IfNeeded(this)
         LiveResearchArchive.initialize(this)
         MetaBrainRuntime.initialize(this)

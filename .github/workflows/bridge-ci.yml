@@ -1,19 +1,24 @@
 name: Bridge CI
 
 on:
-  pull_request:
-    paths:
-      - 'bridge/**'
-      - '.github/workflows/bridge-ci.yml'
   push:
-    branches: ['develop/ema-android-foundation']
+    branches: [main]
     paths:
       - 'bridge/**'
       - '.github/workflows/bridge-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridge-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

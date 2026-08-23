@@ -13,6 +13,7 @@ import kotlin.math.min
 internal object SellReconciliation {
     data class Plan(
         val reconciledPositionQuantity: Int,
+        val reconciledPriorClosedQuantity: Int,
         val preFilledQuantity: Int,
         val networkSellQuantity: Int,
         val residualBrokerLongIfFilled: Int,
@@ -28,8 +29,12 @@ internal object SellReconciliation {
         require(brokerLongQuantity >= 0)
 
         val reconciledPositionQuantity = max(requestedQuantity, protectedQuantity)
-        val preFilledQuantity =
-            (reconciledPositionQuantity - brokerLongQuantity).coerceIn(0, requestedQuantity)
+        val reconciledPriorClosedQuantity =
+            (reconciledPositionQuantity - brokerLongQuantity).coerceAtLeast(0)
+        // Only the part relevant to this caller's requested SELL may be credited to the
+        // current execution. The uncapped reconciledPriorClosedQuantity is retained so a
+        // later broker-flat safety reconciliation can clear the entire local position.
+        val preFilledQuantity = reconciledPriorClosedQuantity.coerceAtMost(requestedQuantity)
         val networkSellQuantity =
             min((requestedQuantity - preFilledQuantity).coerceAtLeast(0), brokerLongQuantity)
         val residualBrokerLongIfFilled =
@@ -37,6 +42,7 @@ internal object SellReconciliation {
 
         return Plan(
             reconciledPositionQuantity = reconciledPositionQuantity,
+            reconciledPriorClosedQuantity = reconciledPriorClosedQuantity,
             preFilledQuantity = preFilledQuantity,
             networkSellQuantity = networkSellQuantity,
             residualBrokerLongIfFilled = residualBrokerLongIfFilled,

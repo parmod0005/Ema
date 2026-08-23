@@ -35,8 +35,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.FlowPreview
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -71,6 +69,7 @@ import com.parmod.ema.model.TradeLogEntry
 import com.parmod.ema.model.TradeStatus
 import com.parmod.ema.model.TradingMode
 import com.parmod.ema.service.VardhaniMarketService
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.sample
 import java.time.Instant
 import java.time.ZoneId
@@ -123,7 +122,9 @@ private fun FullVardhaniApp(vm: VardhaniFullViewModel = viewModel()) {
         val arm = requestedArm!!
         AlertDialog(
             onDismissRequest = { requestedArm = null },
-            title = { Text(if (arm == LiveArmMode.AUTO_ARMED) "Arm automatic LIVE orders?" else "Arm manual LIVE orders?") },
+            title = {
+                Text(if (arm == LiveArmMode.AUTO_ARMED) "Arm automatic LIVE orders?" else "Arm manual LIVE orders?")
+            },
             text = {
                 Text(
                     if (arm == LiveArmMode.AUTO_ARMED) {
@@ -236,30 +237,9 @@ private fun FullVardhaniApp(vm: VardhaniFullViewModel = viewModel()) {
                         onExpiry = { vm.setExpiry(market.index, it) },
                     )
                 }
-                item {
-                    EngineRuntimeCard(
-                        market = market,
-                        engine = market.engine1,
-                        state = state,
-                        vm = vm,
-                    )
-                }
-                item {
-                    EngineRuntimeCard(
-                        market = market,
-                        engine = market.engine2,
-                        state = state,
-                        vm = vm,
-                    )
-                }
-                item {
-                    EngineRuntimeCard(
-                        market = market,
-                        engine = market.engine3,
-                        state = state,
-                        vm = vm,
-                    )
-                }
+                item { EngineRuntimeCard(market, market.engine1, state, vm) }
+                item { EngineRuntimeCard(market, market.engine2, state, vm) }
+                item { EngineRuntimeCard(market, market.engine3, state, vm) }
                 item { OptionChainCard(market) }
                 item { TradeLogCard(market) }
             }
@@ -411,9 +391,13 @@ private fun EngineConfigRow(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold, fontSize = 11.sp)
             if (enabled) {
-                Button(onClick = { vm.toggleEngine(id) }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("✓ ON", fontSize = 9.sp) }
+                Button(onClick = { vm.toggleEngine(id) }, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                    Text("✓ ON", fontSize = 9.sp)
+                }
             } else {
-                OutlinedButton(onClick = { vm.toggleEngine(id) }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("OFF", fontSize = 9.sp) }
+                OutlinedButton(onClick = { vm.toggleEngine(id) }, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                    Text("OFF", fontSize = 9.sp)
+                }
             }
         }
         if (editableTimeframe) {
@@ -526,10 +510,18 @@ private fun ToolCard() {
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                OutlinedButton(onClick = { context.startActivity(Intent(context, MetaBrainLabActivity::class.java)) }) { Text("AI TRAINING CENTER", fontSize = 9.sp) }
-                OutlinedButton(onClick = { context.startActivity(Intent(context, HistoricalDataActivity::class.java)) }) { Text("HISTORICAL DATA", fontSize = 9.sp) }
-                OutlinedButton(onClick = { context.startActivity(Intent(context, ResearchArchiveActivity::class.java)) }) { Text("RESEARCH ARCHIVE", fontSize = 9.sp) }
-                OutlinedButton(onClick = { context.startActivity(Intent(context, MainActivity::class.java)) }) { Text("BACKTEST / LEGACY TOOLS", fontSize = 9.sp) }
+                OutlinedButton(onClick = { context.startActivity(Intent(context, MetaBrainLabActivity::class.java)) }) {
+                    Text("AI TRAINING CENTER", fontSize = 9.sp)
+                }
+                OutlinedButton(onClick = { context.startActivity(Intent(context, HistoricalDataActivity::class.java)) }) {
+                    Text("HISTORICAL DATA", fontSize = 9.sp)
+                }
+                OutlinedButton(onClick = { context.startActivity(Intent(context, ResearchArchiveActivity::class.java)) }) {
+                    Text("RESEARCH ARCHIVE", fontSize = 9.sp)
+                }
+                OutlinedButton(onClick = { context.startActivity(Intent(context, MainActivity::class.java)) }) {
+                    Text("BACKTEST / LEGACY TOOLS", fontSize = 9.sp)
+                }
             }
         }
     }
@@ -626,7 +618,9 @@ private fun EngineRuntimeCard(
                 fontSize = 11.sp,
             )
             Text(engine.signal.setup, style = MaterialTheme.typography.labelSmall)
-            engine.signal.reasons.takeLast(3).forEach { Text("• $it", style = MaterialTheme.typography.labelSmall) }
+            engine.signal.reasons.takeLast(3).forEach {
+                Text("• $it", style = MaterialTheme.typography.labelSmall)
+            }
 
             val p = engine.position
             if (p != null) {
@@ -695,7 +689,9 @@ private fun OptionChainCard(market: FullMarketState) {
 private fun OptionStrikeRow(strike: Double, ce: OptionQuote?, pe: OptionQuote?) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(
-            ce?.let { "CE ${money(it.ltp)}\n${money(it.bid)}/${money(it.ask)}\nOI ${compact(it.openInterest)} Δ ${"%.2f".format(it.delta)}" } ?: "—",
+            ce?.let {
+                "CE ${money(it.ltp)}\n${money(it.bid)}/${money(it.ask)}\nOI ${compact(it.openInterest)} Δ ${"%.2f".format(it.delta)}"
+            } ?: "—",
             modifier = Modifier.weight(1f),
             fontSize = 9.sp,
             textAlign = TextAlign.Start,
@@ -708,7 +704,9 @@ private fun OptionStrikeRow(strike: Double, ce: OptionQuote?, pe: OptionQuote?) 
             textAlign = TextAlign.Center,
         )
         Text(
-            pe?.let { "PE ${money(it.ltp)}\n${money(it.bid)}/${money(it.ask)}\nOI ${compact(it.openInterest)} Δ ${"%.2f".format(it.delta)}" } ?: "—",
+            pe?.let {
+                "PE ${money(it.ltp)}\n${money(it.bid)}/${money(it.ask)}\nOI ${compact(it.openInterest)} Δ ${"%.2f".format(it.delta)}"
+            } ?: "—",
             modifier = Modifier.weight(1f),
             fontSize = 9.sp,
             textAlign = TextAlign.End,
@@ -737,7 +735,11 @@ private fun TradeRow(trade: TradeLogEntry) {
         .format(DateTimeFormatter.ofPattern("HH:mm:ss"))
     Text(
         "$time · ${trade.executionMode.name} · ${trade.engineId.name.removePrefix("ENGINE_")} · ${trade.side.name} ${trade.strike.toInt()} · ${trade.quantity} qty · " +
-            if (trade.status == TradeStatus.CLOSED) "CLOSED ₹${money(trade.pnl ?: 0.0)} ${trade.exitReason}" else "OPEN @ ${money(trade.entryPrice)}",
+            if (trade.status == TradeStatus.CLOSED) {
+                "CLOSED ₹${money(trade.pnl ?: 0.0)} ${trade.exitReason}"
+            } else {
+                "OPEN @ ${money(trade.entryPrice)}"
+            },
         fontSize = 9.sp,
     )
 }

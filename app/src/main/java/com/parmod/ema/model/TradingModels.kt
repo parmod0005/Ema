@@ -25,6 +25,7 @@ data class OptionQuote(
     val bid: Double = 0.0,
     val ask: Double = 0.0,
     val volume: Long = 0L,
+    val lotSize: Int = 0,
 )
 
 data class SignalSnapshot(
@@ -57,6 +58,9 @@ data class TradeLogEntry(
     val exitTimeMillis: Long? = null,
     val pnl: Double? = null,
     val exitReason: String = "",
+    val executionMode: ExecutionMode = ExecutionMode.PAPER,
+    val brokerEntryOrderId: String = "",
+    val brokerExitOrderId: String = "",
 )
 
 data class PaperPosition(
@@ -80,6 +84,9 @@ data class PaperPosition(
     val target1ExitQuantity: Int = 0,
     val realizedPartialPnl: Double = 0.0,
     val maxHoldMinutes: Int = 0,
+    val instrumentKey: String = "",
+    val executionMode: ExecutionMode = ExecutionMode.PAPER,
+    val brokerEntryOrderId: String = "",
 ) {
     val pnl: Double get() = (currentPrice - entryPrice) * quantity + realizedPartialPnl
 }
@@ -116,8 +123,11 @@ data class EngineState(
 
 data class DashboardState(
     val index: MarketIndex = MarketIndex.NIFTY,
+    val marketSelection: MarketSelection = MarketSelection.NIFTY,
     val tradingMode: TradingMode = TradingMode.AUTO,
     val executionMode: ExecutionMode = ExecutionMode.PAPER,
+    val liveArmMode: LiveArmMode = LiveArmMode.DISARMED,
+    val emergencyKill: Boolean = false,
     val appMode: AppMode = AppMode.LIVE_MARKET,
     val connectionMode: ConnectionMode = ConnectionMode.DEMO,
     val isConnected: Boolean = false,
@@ -128,10 +138,16 @@ data class DashboardState(
     val engine2: EngineState = EngineState(EngineId.ENGINE_2_AVWAP_LIQUIDITY, "ENGINE 2 · AVWAP / LIQUIDITY + D30"),
     val engine3: EngineState = EngineState(EngineId.ENGINE_3_V76_SCALPER, "ENGINE 3 · V7.6 REVERSAL RUNNER"),
     val enabledEngines: Set<EngineId> = EngineId.entries.toSet(),
+    val engineTimeframes: Map<EngineId, EngineTimeframeConfig> = mapOf(
+        EngineId.ENGINE_1_TREND to EngineTimeframeConfig.E1_DEFAULT,
+        EngineId.ENGINE_2_AVWAP_LIQUIDITY to EngineTimeframeConfig.E2_DEFAULT,
+        EngineId.ENGINE_3_V76_SCALPER to EngineTimeframeConfig.E3_DEFAULT,
+    ),
     val niftyLots: Int = 1,
     val sensexLots: Int = 1,
     val dailyTradeLimit: Int = 15,
-    val message: String = "Ready · live paper trading only",
+    val riskConfig: TradingRiskConfig = TradingRiskConfig(),
+    val message: String = "Ready · PAPER default · LIVE requires explicit arm",
     val lastTickMillis: Long = 0L,
     val ticksReceived: Long = 0L,
     val riskLocked: Boolean = false,
@@ -141,6 +157,7 @@ data class DashboardState(
     val marketDepthLevels: Int = 0,
 ) {
     val selectedLots: Int get() = if (index == MarketIndex.NIFTY) niftyLots else sensexLots
+    val selectedIndexes: Set<MarketIndex> get() = marketSelection.indexes
     val combinedRealizedPnl: Double get() = engine1.performance.realizedPnl + engine2.performance.realizedPnl + engine3.performance.realizedPnl
     val combinedOpenPnl: Double get() = engine1.openPnl + engine2.openPnl + engine3.openPnl
     val combinedEquity: Double get() = startingCapital + combinedRealizedPnl + combinedOpenPnl

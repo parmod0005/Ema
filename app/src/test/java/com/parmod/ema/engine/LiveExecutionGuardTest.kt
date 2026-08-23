@@ -1,0 +1,66 @@
+package com.parmod.ema.engine
+
+import com.parmod.ema.model.ExecutionMode
+import com.parmod.ema.model.LiveArmMode
+import com.parmod.ema.model.LiveExecutionGuard
+import com.parmod.ema.model.LiveGateInput
+import com.parmod.ema.model.MarketIndex
+import com.parmod.ema.model.MarketSelection
+import com.parmod.ema.model.TradingRiskConfig
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class LiveExecutionGuardTest {
+    private val risk = TradingRiskConfig()
+    private val valid = LiveGateInput(
+        executionMode = ExecutionMode.LIVE,
+        armMode = LiveArmMode.AUTO_ARMED,
+        automatic = true,
+        connected = true,
+        upstoxTokenPresent = true,
+        instrumentKeyPresent = true,
+        quantity = 65,
+        riskLocked = false,
+        emergencyKill = false,
+        marketOpen = true,
+        entriesAllowed = true,
+        tickAgeMillis = 100L,
+        confidence = 82,
+        spreadPercent = 0.5,
+        tradesToday = 0,
+        risk = risk,
+    )
+
+    @Test
+    fun both_market_selection_is_really_dual_market() {
+        assertTrue(MarketSelection.BOTH.includes(MarketIndex.NIFTY))
+        assertTrue(MarketSelection.BOTH.includes(MarketIndex.SENSEX))
+        assertTrue(MarketSelection.BOTH.indexes.size == 2)
+    }
+
+    @Test
+    fun automatic_live_order_requires_explicit_auto_arm() {
+        assertTrue(LiveExecutionGuard.evaluate(valid).allowed)
+        assertFalse(LiveExecutionGuard.evaluate(valid.copy(armMode = LiveArmMode.DISARMED)).allowed)
+        assertFalse(LiveExecutionGuard.evaluate(valid.copy(armMode = LiveArmMode.MANUAL_ONLY)).allowed)
+    }
+
+    @Test
+    fun stale_market_data_blocks_live_order() {
+        assertFalse(LiveExecutionGuard.evaluate(valid.copy(tickAgeMillis = risk.maximumTickAgeMillis + 1)).allowed)
+    }
+
+    @Test
+    fun risk_and_kill_switches_fail_closed() {
+        assertFalse(LiveExecutionGuard.evaluate(valid.copy(riskLocked = true)).allowed)
+        assertFalse(LiveExecutionGuard.evaluate(valid.copy(emergencyKill = true)).allowed)
+        assertFalse(LiveExecutionGuard.evaluate(valid.copy(marketOpen = false)).allowed)
+    }
+
+    @Test
+    fun manual_live_can_be_armed_without_auto_authority() {
+        val manual = valid.copy(automatic = false, armMode = LiveArmMode.MANUAL_ONLY, confidence = 0)
+        assertTrue(LiveExecutionGuard.evaluate(manual).allowed)
+    }
+}

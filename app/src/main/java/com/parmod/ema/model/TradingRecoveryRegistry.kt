@@ -198,7 +198,6 @@ object TradingRecoveryRegistry {
         }
         records[key] = record
         pruneLocked()
-        // Entries and terminal trade-log changes are safety-significant.
         persistLocked(force = true)
     }
 
@@ -207,7 +206,51 @@ object TradingRecoveryRegistry {
         .filter { it.executionMode == ExecutionMode.LIVE && it.status == TradeStatus.OPEN && !it.recoveryResolved && it.currentQuantity > 0 }
         .sortedBy { it.entryTimeMillis }
 
-    /** Persisted trades that existed before this process started, grouped by market. */
+    /**
+     * Rehydrates pre-restart trade rows so PAPER and LIVE use the same daily trade count.
+     * Resolved recovery records are displayed as closed/broker-flat rather than as a phantom
+     * open position in the new dashboard process.
+     */
+    @Synchronized
+    fun startupTradeLog(index: MarketIndex): List<TradeLogEntry> = startupRecords
+        .asSequence()
+        .filter { it.index == index }
+        .sortedBy { it.entryTimeMillis }
+        .map { record ->
+            val recoveredClosed = record.recoveryResolved && record.status == TradeStatus.OPEN
+            TradeLogEntry(
+                id = record.entryTimeMillis,
+                engineId = record.engineId,
+                engineName = when (record.engineId) {
+                    EngineId.ENGINE_1_TREND -> "ENGINE 1 · TREND / BREAKOUT"
+                    EngineId.ENGINE_2_AVWAP_LIQUIDITY -> "ENGINE 2 · AVWAP / LIQUIDITY + D30"
+                    EngineId.ENGINE_3_V76_SCALPER -> "ENGINE 3 · V7.6 REVERSAL RUNNER"
+                },
+                index = record.index,
+                side = record.side,
+                strike = record.strike,
+                quantity = record.originalQuantity,
+                lots = record.lots,
+                entryPrice = record.entryPrice,
+                entrySpot = 0.0,
+                entryTimeMillis = record.entryTimeMillis,
+                setup = record.strategy.ifBlank { "RECOVERED SESSION" },
+                status = if (recoveredClosed) TradeStatus.CLOSED else record.status,
+                exitPrice = record.exitPrice,
+                exitSpot = null,
+                exitTimeMillis = record.exitTimeMillis,
+                pnl = record.pnl,
+                exitReason = when {
+                    recoveredClosed && record.exitReason.isBlank() -> "RECOVERED / BROKER FLAT"
+                    else -> record.exitReason
+                },
+                executionMode = record.executionMode,
+                brokerEntryOrderId = record.brokerEntryOrderId,
+                brokerExitOrderId = record.brokerExitOrderId,
+            )
+        }
+        .toList()
+
     @Synchronized
     fun startupTodayTradeCounts(): Map<MarketIndex, Int> {
         val today = LocalDate.now(zone)
@@ -216,7 +259,6 @@ object TradingRecoveryRegistry {
         }
     }
 
-    /** Persisted closed P&L that existed before this process started, grouped by market. */
     @Synchronized
     fun startupTodayRealizedPnl(): Map<MarketIndex, Double> {
         val today = LocalDate.now(zone)
@@ -227,12 +269,6 @@ object TradingRecoveryRegistry {
         }
     }
 
-    /**
-     * Conservative restart protection for the existing LiveExecutionGuard, which receives
-     * the current market's in-memory count but not the market id. This only consults the
-     * baseline loaded at process start, so normal current-process NIFTY/SENSEX limits remain
-     * independent. After a crash, either market may be blocked slightly early, never late.
-     */
     @Synchronized
     fun restartBaselineTradeCount(): Int = startupTodayTradeCounts().values.maxOrNull() ?: 0
 

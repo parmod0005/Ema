@@ -9,9 +9,11 @@ import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.MarketSelection
 import com.parmod.ema.model.SignalTimeframe
 import com.parmod.ema.model.TradingRiskConfig
+import com.parmod.ema.model.UpstoxComplianceRegistry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 class LiveExecutionGuardTest {
@@ -36,6 +38,12 @@ class LiveExecutionGuardTest {
         risk = risk,
     )
 
+    @Before
+    fun resetCompliance() {
+        UpstoxComplianceRegistry.configureAlgoName("VARDHANI_TEST")
+        UpstoxComplianceRegistry.clearProtectionFault()
+    }
+
     @Test
     fun both_market_selection_is_really_dual_market() {
         assertTrue(MarketSelection.BOTH.includes(MarketIndex.NIFTY))
@@ -55,6 +63,18 @@ class LiveExecutionGuardTest {
         assertTrue(LiveExecutionGuard.evaluate(valid).allowed)
         assertFalse(LiveExecutionGuard.evaluate(valid.copy(armMode = LiveArmMode.DISARMED)).allowed)
         assertFalse(LiveExecutionGuard.evaluate(valid.copy(armMode = LiveArmMode.MANUAL_ONLY)).allowed)
+    }
+
+    @Test
+    fun automatic_live_requires_configured_algo_name() {
+        UpstoxComplianceRegistry.configureAlgoName("")
+        assertFalse(LiveExecutionGuard.evaluate(valid).allowed)
+    }
+
+    @Test
+    fun broker_protection_fault_blocks_new_live_entries() {
+        UpstoxComplianceRegistry.setProtectionFault("test protection failure")
+        assertFalse(LiveExecutionGuard.evaluate(valid).allowed)
     }
 
     @Test

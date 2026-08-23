@@ -77,6 +77,74 @@ internal object LiveExitAccounting {
         )
     }
 
+    /**
+     * Reconcile the full local LIVE position across all broker-side closure legs.
+     *
+     * [localPositionQuantity] is the quantity VARDHANI believed was open before the SELL.
+     * [brokerLongBeforeQuantity] is the broker position observed immediately before the
+     * current network order. Their difference is quantity already closed before this request
+     * (normally an exchange-held protective stop). [priorClosedAveragePrice] may be supplied
+     * only when that entire prior-closed quantity has a trustworthy broker fill price.
+     *
+     * This function is intentionally independent of the requested T1 slice. A 50-qty T1
+     * request can therefore correctly discover that a 100-qty local position is already
+     * broker-flat, without sending an extra SELL or leaving a phantom local residual.
+     */
+    fun reconcileFullBrokerHistory(
+        localPositionQuantity: Int,
+        brokerLongBeforeQuantity: Int,
+        priorClosedAveragePrice: Double,
+        networkFilledQuantity: Int,
+        networkPricedQuantity: Int = networkFilledQuantity,
+        networkAveragePrice: Double,
+        safetyFlattenedQuantity: Int,
+        safetyFlattenAveragePrice: Double,
+        brokerFlatAfterSafetyAction: Boolean,
+    ): Result {
+        require(localPositionQuantity > 0) { "localPositionQuantity must be positive" }
+        require(brokerLongBeforeQuantity >= 0) { "brokerLongBeforeQuantity cannot be negative" }
+
+        val brokerBefore = brokerLongBeforeQuantity.coerceAtMost(localPositionQuantity)
+        val priorClosed = (localPositionQuantity - brokerBefore).coerceAtLeast(0)
+        val remainingAfterPrior = (localPositionQuantity - priorClosed).coerceAtLeast(0)
+
+        val networkFilled = networkFilledQuantity.coerceIn(0, remainingAfterPrior)
+        val remainingAfterNetwork = (remainingAfterPrior - networkFilled).coerceAtLeast(0)
+        val safetyFilled = safetyFlattenedQuantity.coerceIn(0, remainingAfterNetwork)
+
+        val explicitlyObservedClosed = min(localPositionQuantity, priorClosed + networkFilled + safetyFilled)
+        val effectiveClosed = if (brokerFlatAfterSafetyAction) localPositionQuantity else explicitlyObservedClosed
+        val remaining = (localPositionQuantity - effectiveClosed).coerceAtLeast(0)
+
+        val pricedPrior = if (priorClosed > 0 && priorClosedAveragePrice > 0.0) priorClosed else 0
+        val pricedNetwork = if (networkAveragePrice > 0.0) {
+            networkPricedQuantity.coerceIn(0, networkFilled)
+        } else {
+            0
+        }
+        val pricedSafety = if (safetyFilled > 0 && safetyFlattenAveragePrice > 0.0) safetyFilled else 0
+        val pricedQty = min(effectiveClosed, pricedPrior + pricedNetwork + pricedSafety)
+        val pricedValue =
+            pricedPrior * priorClosedAveragePrice +
+                pricedNetwork * networkAveragePrice +
+                pricedSafety * safetyFlattenAveragePrice
+        val weightedAverage = if (pricedQty > 0) pricedValue / pricedQty else 0.0
+        val unpriced = (effectiveClosed - pricedQty).coerceAtLeast(0)
+
+        return Result(
+            requestedQuantity = localPositionQuantity,
+            effectiveClosedQuantity = effectiveClosed,
+            remainingLocalQuantity = remaining,
+            networkFilledQuantity = networkFilled,
+            brokerPreFilledQuantity = priorClosed,
+            safetyFlattenedQuantity = safetyFilled,
+            unpricedClosedQuantity = unpriced,
+            knownPricedQuantity = pricedQty,
+            knownWeightedAveragePrice = weightedAverage,
+            brokerFlatAfterSafetyAction = brokerFlatAfterSafetyAction,
+        )
+    }
+
     fun reconcile(
         requestedQuantity: Int,
         executionFilledQuantity: Int,

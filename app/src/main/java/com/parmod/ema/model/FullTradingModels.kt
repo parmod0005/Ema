@@ -12,16 +12,17 @@ data class FullMarketState(
     val engine2: EngineState = EngineState(EngineId.ENGINE_2_AVWAP_LIQUIDITY, "ENGINE 2 · AVWAP / LIQUIDITY + D30"),
     val engine3: EngineState = EngineState(EngineId.ENGINE_3_V76_SCALPER, "ENGINE 3 · V7.6 REVERSAL RUNNER"),
     val recoveredRealizedPnl: Double = TradingRecoveryRegistry.startupTodayRealizedPnl()[index] ?: 0.0,
+    val recoveredPnlUncertain: Boolean = TradingRecoveryRegistry.startupHasUnpricedRecoveredLive(index),
     val tradeLog: List<TradeLogEntry> = TradingRecoveryRegistry.startupTradeLog(index),
     val lastTickMillis: Long = 0L,
     val ticksReceived: Long = 0L,
     val marketDepthMode: String = "WAITING",
     val marketDepthLevels: Int = 0,
-    val riskLocked: Boolean = recoveredRealizedPnl <= -TradingRiskConfig().dailyLossLimitInr,
-    val riskReason: String = if (riskLocked) {
-        "Recovered daily loss lock is active"
-    } else {
-        "Risk gates clear"
+    val riskLocked: Boolean = recoveredPnlUncertain || recoveredRealizedPnl <= -TradingRiskConfig().dailyLossLimitInr,
+    val riskReason: String = when {
+        recoveredPnlUncertain -> "Recovered LIVE exit P&L is unpriced · daily safety lock active"
+        riskLocked -> "Recovered daily loss lock is active"
+        else -> "Risk gates clear"
     },
     val message: String = "Ready",
 ) {

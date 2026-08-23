@@ -42,7 +42,8 @@ data class EngineTimeframeConfig(
     companion object {
         val E1_DEFAULT = EngineTimeframeConfig(SignalTimeframe.M1, SignalTimeframe.M3, SignalTimeframe.M5)
         val E2_DEFAULT = EngineTimeframeConfig(SignalTimeframe.M1, SignalTimeframe.M3, SignalTimeframe.M5)
-        val E3_DEFAULT = EngineTimeframeConfig(SignalTimeframe.M1, SignalTimeframe.M3, SignalTimeframe.M15)
+        // Exact V7.6 source: 1m trigger -> 3m setup -> 5m directional bias.
+        val E3_DEFAULT = EngineTimeframeConfig(SignalTimeframe.M1, SignalTimeframe.M3, SignalTimeframe.M5)
     }
 }
 
@@ -55,6 +56,7 @@ enum class LiveArmMode {
 /** Runtime risk controls that are adjustable from the app without changing engine code. */
 data class TradingRiskConfig(
     val dailyLossLimitInr: Double = 3_500.0,
+    val maxRiskPerTradeInr: Double = 3_500.0,
     val maxTradesPerIndex: Int = 15,
     val maxLotsPerOrder: Int = 20,
     val minimumAutoLiveConfidence: Int = 75,
@@ -63,6 +65,7 @@ data class TradingRiskConfig(
 ) {
     init {
         require(dailyLossLimitInr > 0.0)
+        require(maxRiskPerTradeInr > 0.0)
         require(maxTradesPerIndex in 1..100)
         require(maxLotsPerOrder in 1..100)
         require(minimumAutoLiveConfidence in 1..100)
@@ -79,6 +82,7 @@ data class LiveGateInput(
     val upstoxTokenPresent: Boolean,
     val instrumentKeyPresent: Boolean,
     val quantity: Int,
+    val plannedRiskInr: Double,
     val riskLocked: Boolean,
     val emergencyKill: Boolean,
     val marketOpen: Boolean,
@@ -107,6 +111,8 @@ object LiveExecutionGuard {
         if (!input.upstoxTokenPresent) return deny("Upstox access token is missing")
         if (!input.instrumentKeyPresent) return deny("Selected option instrument key is missing")
         if (input.quantity <= 0) return deny("Order quantity is invalid")
+        if (!input.plannedRiskInr.isFinite() || input.plannedRiskInr <= 0.0) return deny("Per-trade risk could not be verified")
+        if (input.plannedRiskInr > input.risk.maxRiskPerTradeInr) return deny("Per-trade risk exceeds live limit")
         if (input.riskLocked) return deny("Daily risk lock is active")
         if (input.emergencyKill) return deny("Emergency kill switch is active")
         if (!input.marketOpen) return deny("Live intraday orders are blocked outside market hours")
@@ -115,8 +121,8 @@ object LiveExecutionGuard {
             return deny("Market data is stale")
         }
         if (input.tradesToday >= input.risk.maxTradesPerIndex) return deny("Daily trade limit reached")
-        if (input.spreadPercent.isFinite() && input.spreadPercent > input.risk.maximumSpreadPercent) {
-            return deny("Option spread exceeds live limit")
+        if (!input.spreadPercent.isFinite() || input.spreadPercent > input.risk.maximumSpreadPercent) {
+            return deny("Option spread is unavailable or exceeds live limit")
         }
 
         if (input.automatic) {

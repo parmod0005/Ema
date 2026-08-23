@@ -12,3 +12,7 @@ Release discipline:
 - A new APK is not labelled verified until the complete build actually executes and its artifact can be inspected.
 - The trusted default-branch workflow and development workflow are synchronized before this source-only build trigger.
 - Trusted `pull_request_target` build is triggered from the default branch and checks out only the guarded same-repository VARDHANI PR head.
+
+## Current full-source build trigger
+
+Fresh trusted build requested on 2026-08-23 after the full dual-market/LIVE-safety/recovery implementation. This commit is documentation-only and exists only to synchronize PR #1 so the trusted workflow builds the exact current `develop/ema-android-foundation` head.

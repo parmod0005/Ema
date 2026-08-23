@@ -17,8 +17,12 @@ data class FullMarketState(
     val ticksReceived: Long = 0L,
     val marketDepthMode: String = "WAITING",
     val marketDepthLevels: Int = 0,
-    val riskLocked: Boolean = false,
-    val riskReason: String = "Risk gates clear",
+    val riskLocked: Boolean = recoveredRealizedPnl <= -TradingRiskConfig().dailyLossLimitInr,
+    val riskReason: String = if (riskLocked) {
+        "Recovered daily loss lock is active"
+    } else {
+        "Risk gates clear"
+    },
     val message: String = "Ready",
 ) {
     val engines: List<EngineState> get() = listOf(engine1, engine2, engine3)

@@ -54,7 +54,9 @@ class OAuthLauncherActivity : ComponentActivity() {
                         openBrowser = { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it))) },
                         continueToApp = { token ->
                             LocalCredentialVault(this).updateUpstoxAccessToken(token)
-                            startActivity(Intent(this, VardhaniFullActivity::class.java))
+                            // Always return through the crash-recovery router. OAuth must never
+                            // bypass an unresolved LIVE broker position from a prior process.
+                            startActivity(Intent(this, VardhaniEntryActivity::class.java))
                             finish()
                         },
                         copyToken = { token ->
@@ -193,7 +195,7 @@ private fun OAuthScreen(
                                 onClick = { continueToApp(token) },
                                 modifier = Modifier.weight(1f),
                                 contentPadding = PaddingValues(horizontal = 6.dp),
-                            ) { Text("OPEN FULL VARDHANI") }
+                            ) { Text("CONTINUE TO VARDHANI") }
                         }
                     }
                 }

@@ -61,7 +61,11 @@ data class TradeLogEntry(
     val executionMode: ExecutionMode = ExecutionMode.PAPER,
     val brokerEntryOrderId: String = "",
     val brokerExitOrderId: String = "",
-)
+) {
+    init {
+        TradingRecoveryRegistry.observeTrade(this)
+    }
+}
 
 data class PaperPosition(
     val side: PositionSide,
@@ -88,6 +92,10 @@ data class PaperPosition(
     val executionMode: ExecutionMode = ExecutionMode.PAPER,
     val brokerEntryOrderId: String = "",
 ) {
+    init {
+        TradingRecoveryRegistry.observePosition(this)
+    }
+
     val pnl: Double get() = (currentPrice - entryPrice) * quantity + realizedPartialPnl
 }
 

@@ -5,8 +5,10 @@ import com.parmod.ema.model.MarketIndex
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.io.InputStreamReader
 import java.time.LocalDate
 import java.util.zip.ZipInputStream
 
@@ -19,6 +21,7 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
         val niftyExpiries: Int = 0,
         val sensexExpiries: Int = 0,
         val rejectedRows: Int = 0,
+        val manifestAudit: HistoricalArchiveManifestAudit.Summary = HistoricalArchiveManifestAudit.Summary(),
         val errors: List<String> = emptyList(),
     )
 
@@ -39,13 +42,20 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
         var rejected = 0
         val errors = mutableListOf<String>()
         val touched = linkedSetOf<Pair<MarketIndex, LocalDate>>()
+        val manifestAudit = HistoricalArchiveManifestAudit.Accumulator()
         ZipInputStream(BufferedInputStream(input)).use { zip ->
             while (true) {
                 val entry = zip.nextEntry ?: break
                 if (entry.isDirectory) continue
                 if (++filesRead > MAX_ZIP_FILES) error("Historical catalogue ZIP contains too many files")
                 val normalized = entry.name.replace('\\', '/').lowercase()
+
+                if (isManifestEntry(normalized)) {
+                    auditManifestEntry(zip, entry.name, manifestAudit, errors)
+                    continue
+                }
                 if (!normalized.endsWith("contracts.json")) continue
+
                 val bytes = try {
                     zip.readBytesLimited(MAX_SINGLE_JSON_BYTES)
                 } catch (error: Throwable) {
@@ -62,7 +72,7 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
                 }
             }
         }
-        return result(filesRead, readContracts, added, rejected, errors, touched)
+        return result(filesRead, readContracts, added, rejected, errors, touched, manifestAudit.snapshot())
     }
 
     private fun importJson(bytes: ByteArray, nameHint: String): Result {
@@ -73,7 +83,15 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
             added += store.merge(key.first, key.second, contracts)
             touched += key
         }
-        return result(1, parsed.read, added, parsed.rejected, parsed.errors, touched)
+        return result(
+            filesRead = 1,
+            read = parsed.read,
+            added = added,
+            rejected = parsed.rejected,
+            errors = parsed.errors,
+            touched = touched,
+            manifestAudit = HistoricalArchiveManifestAudit.Summary(),
+        )
     }
 
     private data class Parsed(
@@ -114,6 +132,28 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
         }
     }
 
+    private fun auditManifestEntry(
+        input: InputStream,
+        name: String,
+        accumulator: HistoricalArchiveManifestAudit.Accumulator,
+        errors: MutableList<String>,
+    ) {
+        try {
+            val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8), 32 * 1024)
+            var rows = 0
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (++rows > MAX_MANIFEST_ROWS) {
+                    errors += "$name: manifest audit stopped after $MAX_MANIFEST_ROWS rows safety limit"
+                    break
+                }
+                accumulator.accept(line)
+            }
+        } catch (error: Throwable) {
+            errors += "$name: manifest audit failed: ${(error.message ?: error::class.java.simpleName).take(180)}"
+        }
+    }
+
     private fun result(
         filesRead: Int,
         read: Int,
@@ -121,6 +161,7 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
         rejected: Int,
         errors: List<String>,
         touched: Set<Pair<MarketIndex, LocalDate>>,
+        manifestAudit: HistoricalArchiveManifestAudit.Summary,
     ) = Result(
         filesRead = filesRead,
         contractsRead = read,
@@ -128,6 +169,7 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
         niftyExpiries = touched.count { it.first == MarketIndex.NIFTY },
         sensexExpiries = touched.count { it.first == MarketIndex.SENSEX },
         rejectedRows = rejected,
+        manifestAudit = manifestAudit,
         errors = errors.distinct().takeLast(50),
     )
 
@@ -145,8 +187,14 @@ class HistoricalContractCatalogImporter(private val store: HistoricalContractCat
         return out.toByteArray()
     }
 
+    private fun isManifestEntry(normalizedPath: String): Boolean =
+        normalizedPath.substringAfterLast('/').let { name ->
+            name.startsWith("manifest") && (name.endsWith(".ndjson") || name.endsWith(".jsonl"))
+        }
+
     companion object {
         private const val MAX_SINGLE_JSON_BYTES = 16 * 1024 * 1024
         private const val MAX_ZIP_FILES = 25_000
+        private const val MAX_MANIFEST_ROWS = 500_000
     }
 }

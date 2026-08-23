@@ -1,5 +1,6 @@
 package com.parmod.ema.data
 
+import com.parmod.ema.model.LiveBrokerReconciliationRegistry
 import com.parmod.ema.model.UpstoxComplianceRegistry
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -173,11 +174,6 @@ class UpstoxOrderClient(private val accessToken: String) {
         }
     }
 
-    /**
-     * Reconciles every order returned by Upstox auto-slicing. On timeout, all non-terminal
-     * slices are cancelled and one final status snapshot is returned. BUY executions are
-     * then protected at the broker; SELL executions re-arm the actual broker residual.
-     */
     fun awaitExecution(
         placement: Placement,
         expectedQuantity: Int,
@@ -253,7 +249,6 @@ class UpstoxOrderClient(private val accessToken: String) {
         return combined
     }
 
-    /** Backward-compatible single-order helper used only by legacy code; it does not arm a new protection. */
     fun awaitFill(orderId: String, expectedQuantity: Int, timeoutMillis: Long = 8_000L): Status {
         val execution = awaitExecution(
             Placement(
@@ -441,11 +436,6 @@ class UpstoxOrderClient(private val accessToken: String) {
         return result
     }
 
-    /**
-     * Translate full broker history into quantities the runtime may safely book.
-     * Prior exchange-held protective fills are included even when they exceed the current
-     * T1 request. Only quantity with a trustworthy broker price is exposed as filled.
-     */
     private fun normalizeSellExecutionForCaller(
         placement: Placement,
         execution: Execution,
@@ -468,13 +458,8 @@ class UpstoxOrderClient(private val accessToken: String) {
         }
 
         val safetyClosed = execution.safetyFlattenedQuantity.coerceAtLeast(0)
-        val safetyPriced = if (safetyClosed > 0 && execution.safetyFlattenAveragePrice > 0.0) {
-            safetyClosed
-        } else {
-            0
-        }
+        val safetyPriced = if (safetyClosed > 0 && execution.safetyFlattenAveragePrice > 0.0) safetyClosed else 0
         val safetyValue = safetyPriced * execution.safetyFlattenAveragePrice
-
         val networkFilled = (stateFilled - safetyClosed).coerceAtLeast(0)
         val networkPriced = (statePricedQuantity - safetyPriced)
             .coerceAtLeast(0)
@@ -498,6 +483,14 @@ class UpstoxOrderClient(private val accessToken: String) {
             UpstoxComplianceRegistry.setProtectionFault(
                 "LIVE SELL closed quantity has incomplete fill pricing; P&L reconciliation locked",
             )
+            LiveBrokerReconciliationRegistry.observe(
+                instrumentKey = placement.instrumentKey,
+                localPositionQuantity = localPositionQuantity,
+                brokerRemainingQuantity = accounting.remainingLocalQuantity,
+                unpricedClosedQuantity = accounting.unpricedClosedQuantity,
+            )
+        } else {
+            LiveBrokerReconciliationRegistry.clear(placement.instrumentKey)
         }
 
         val callerFilled = accounting.knownPricedQuantity
@@ -518,12 +511,7 @@ class UpstoxOrderClient(private val accessToken: String) {
         quantity
     }.getOrNull()
 
-    private fun weightedAverage(
-        firstQty: Int,
-        firstAvg: Double,
-        secondQty: Int,
-        secondAvg: Double,
-    ): Double {
+    private fun weightedAverage(firstQty: Int, firstAvg: Double, secondQty: Int, secondAvg: Double): Double {
         val q1 = if (firstQty > 0 && firstAvg > 0.0) firstQty else 0
         val q2 = if (secondQty > 0 && secondAvg > 0.0) secondQty else 0
         val total = q1 + q2
@@ -537,8 +525,7 @@ class UpstoxOrderClient(private val accessToken: String) {
             entryTag.contains("-E3-") -> 14.0
             else -> 15.0
         }
-        val raw = entryPrice * (1.0 - stopPercent / 100.0)
-        return roundDownToTick(raw).coerceAtLeast(DEFAULT_TICK_SIZE)
+        return roundDownToTick(entryPrice * (1.0 - stopPercent / 100.0)).coerceAtLeast(DEFAULT_TICK_SIZE)
     }
 
     private fun protectionTag(instrumentKey: String): String {
@@ -547,8 +534,7 @@ class UpstoxOrderClient(private val accessToken: String) {
         return "$PROTECTION_TAG_PREFIX$hash-$stamp".take(40)
     }
 
-    private fun roundDownToTick(value: Double): Double =
-        floor((value + 1e-9) / DEFAULT_TICK_SIZE) * DEFAULT_TICK_SIZE
+    private fun roundDownToTick(value: Double): Double = floor((value + 1e-9) / DEFAULT_TICK_SIZE) * DEFAULT_TICK_SIZE
 
     private fun emergencyRawSell(instrumentKey: String, quantity: Int): Execution {
         val placement = placeOrderInternal(
@@ -559,11 +545,7 @@ class UpstoxOrderClient(private val accessToken: String) {
             orderType = "MARKET",
             triggerPrice = 0.0,
             slice = true,
-        ).copy(
-            instrumentKey = instrumentKey,
-            transactionType = TransactionType.SELL,
-            networkQuantity = quantity,
-        )
+        ).copy(instrumentKey = instrumentKey, transactionType = TransactionType.SELL, networkQuantity = quantity)
         return awaitNetworkExecution(placement, 8_000L)
     }
 
@@ -578,46 +560,24 @@ class UpstoxOrderClient(private val accessToken: String) {
     ): Placement {
         require(quantity > 0)
         val payload = JSONObject()
-            .put("quantity", quantity)
-            .put("product", "I")
-            .put("validity", "DAY")
-            .put("price", 0)
-            .put("tag", tag)
-            .put("instrument_token", instrumentKey)
-            .put("order_type", orderType)
-            .put("transaction_type", transactionType.name)
-            .put("disclosed_quantity", 0)
-            .put("trigger_price", triggerPrice)
-            .put("is_amo", false)
-            .put("slice", slice)
-            .put("market_protection", -1)
-
+            .put("quantity", quantity).put("product", "I").put("validity", "DAY")
+            .put("price", 0).put("tag", tag).put("instrument_token", instrumentKey)
+            .put("order_type", orderType).put("transaction_type", transactionType.name)
+            .put("disclosed_quantity", 0).put("trigger_price", triggerPrice)
+            .put("is_amo", false).put("slice", slice).put("market_protection", -1)
         val response = requestJson("POST", PLACE_ORDER_V3, payload)
         val data = response.getJSONObject("data")
         val ids = buildList {
             val array = data.optJSONArray("order_ids")
-            if (array != null) {
-                for (i in 0 until array.length()) {
-                    array.optString(i).takeIf(String::isNotBlank)?.let(::add)
-                }
-            }
+            if (array != null) for (i in 0 until array.length()) array.optString(i).takeIf(String::isNotBlank)?.let(::add)
             if (isEmpty()) data.optString("order_id").takeIf(String::isNotBlank)?.let(::add)
         }.distinct()
         if (ids.isEmpty()) error("Upstox accepted the request without an order id")
-        return Placement(
-            orderIds = ids,
-            latencyMillis = response.optJSONObject("metadata")?.optLong("latency", 0L) ?: 0L,
-            instrumentKey = instrumentKey,
-            transactionType = transactionType,
-            tag = tag,
-            networkQuantity = quantity,
-        )
+        return Placement(ids, response.optJSONObject("metadata")?.optLong("latency", 0L) ?: 0L, instrumentKey, transactionType, tag, quantity)
     }
 
     private fun awaitNetworkExecution(placement: Placement, timeoutMillis: Long): Execution {
-        if (placement.orderIds.isEmpty() || placement.networkQuantity <= 0) {
-            return Execution(emptyList(), placement.networkQuantity, 0, 0, 0.0, emptyList(), pricedQuantity = 0)
-        }
+        if (placement.orderIds.isEmpty() || placement.networkQuantity <= 0) return Execution(emptyList(), placement.networkQuantity, 0, 0, 0.0, emptyList(), pricedQuantity = 0)
         val timeout = timeoutMillis.coerceIn(1_000L, 30_000L)
         val deadline = System.currentTimeMillis() + timeout
         var statuses = placement.orderIds.map(::getOrderStatus)
@@ -627,78 +587,38 @@ class UpstoxOrderClient(private val accessToken: String) {
             Thread.sleep(250L)
             statuses = placement.orderIds.map(::getOrderStatus)
         }
-
         statuses.filterNot { it.terminal }.forEach { status -> runCatching { cancelOrder(status.orderId) } }
         Thread.sleep(200L)
-        statuses = placement.orderIds.map { id ->
-            runCatching { getOrderStatus(id) }.getOrElse { statuses.first { it.orderId == id } }
-        }
+        statuses = placement.orderIds.map { id -> runCatching { getOrderStatus(id) }.getOrElse { statuses.first { it.orderId == id } } }
         return aggregate(placement.orderIds, placement.networkQuantity, statuses)
     }
 
-    private fun combinePreFill(
-        placement: Placement,
-        expectedQuantity: Int,
-        network: Execution,
-    ): Execution {
+    private fun combinePreFill(placement: Placement, expectedQuantity: Int, network: Execution): Execution {
         val preQty = placement.preFilledQuantity.coerceIn(0, expectedQuantity)
         val networkQty = network.filledQuantity.coerceAtLeast(0)
         val total = (preQty + networkQty).coerceAtMost(expectedQuantity)
-        val preValue = if (preQty > 0 && placement.preFillAveragePrice > 0.0) {
-            preQty * placement.preFillAveragePrice
-        } else 0.0
+        val preValue = if (preQty > 0 && placement.preFillAveragePrice > 0.0) preQty * placement.preFillAveragePrice else 0.0
         val networkPricedQty = network.pricedQuantity.coerceIn(0, networkQty)
-        val networkValue = if (networkPricedQty > 0 && network.averagePrice > 0.0) {
-            networkPricedQty * network.averagePrice
-        } else 0.0
+        val networkValue = if (networkPricedQty > 0 && network.averagePrice > 0.0) networkPricedQty * network.averagePrice else 0.0
         val pricedQty = (if (preValue > 0.0) preQty else 0) + networkPricedQty
         val average = if (pricedQty > 0) (preValue + networkValue) / pricedQty else 0.0
-        return Execution(
-            orderIds = network.orderIds,
-            requestedQuantity = expectedQuantity,
-            filledQuantity = total,
-            pendingQuantity = (expectedQuantity - total).coerceAtLeast(0),
-            averagePrice = average,
-            states = network.states,
-            pricedQuantity = pricedQty.coerceAtMost(total),
-        )
+        return Execution(network.orderIds, expectedQuantity, total, (expectedQuantity - total).coerceAtLeast(0), average, network.states, pricedQuantity = pricedQty.coerceAtMost(total))
     }
 
     private fun aggregate(orderIds: List<String>, requestedQuantity: Int, statuses: List<Status>): Execution {
         val filled = statuses.sumOf { it.filledQuantity.coerceAtLeast(0) }
         val pending = statuses.sumOf { it.pendingQuantity.coerceAtLeast(0) }
-        val tradedValue = statuses.sumOf { status ->
-            if (status.filledQuantity > 0 && status.averagePrice > 0.0) status.averagePrice * status.filledQuantity else 0.0
-        }
-        val pricedQty = statuses.sumOf { status ->
-            if (status.averagePrice > 0.0) status.filledQuantity.coerceAtLeast(0) else 0
-        }
+        val tradedValue = statuses.sumOf { if (it.filledQuantity > 0 && it.averagePrice > 0.0) it.averagePrice * it.filledQuantity else 0.0 }
+        val pricedQty = statuses.sumOf { if (it.averagePrice > 0.0) it.filledQuantity.coerceAtLeast(0) else 0 }
         val avg = if (pricedQty > 0) tradedValue / pricedQty else 0.0
-        return Execution(
-            orderIds = orderIds,
-            requestedQuantity = requestedQuantity,
-            filledQuantity = filled,
-            pendingQuantity = pending,
-            averagePrice = avg,
-            states = statuses,
-            pricedQuantity = pricedQty.coerceAtMost(filled),
-        )
+        return Execution(orderIds, requestedQuantity, filled, pending, avg, statuses, pricedQuantity = pricedQty.coerceAtMost(filled))
     }
 
     private fun parseStatus(data: JSONObject, fallbackOrderId: String): Status = Status(
-        orderId = data.optString("order_id", fallbackOrderId),
-        state = data.optString("status"),
-        averagePrice = data.optDouble("average_price", 0.0),
-        quantity = data.optInt("quantity", 0),
-        filledQuantity = data.optInt("filled_quantity", 0),
-        pendingQuantity = data.optInt("pending_quantity", 0),
-        statusMessage = data.optString("status_message"),
-        instrumentKey = data.optString("instrument_token"),
-        orderType = data.optString("order_type"),
-        transactionType = data.optString("transaction_type"),
-        triggerPrice = data.optDouble("trigger_price", 0.0),
-        tag = data.optString("tag"),
-        orderTimestamp = data.optString("order_timestamp"),
+        data.optString("order_id", fallbackOrderId), data.optString("status"), data.optDouble("average_price", 0.0),
+        data.optInt("quantity", 0), data.optInt("filled_quantity", 0), data.optInt("pending_quantity", 0),
+        data.optString("status_message"), data.optString("instrument_token"), data.optString("order_type"),
+        data.optString("transaction_type"), data.optDouble("trigger_price", 0.0), data.optString("tag"), data.optString("order_timestamp"),
     )
 
     private fun ensureOrderCompliance() {
@@ -716,9 +636,7 @@ class UpstoxOrderClient(private val accessToken: String) {
             connection.readTimeout = 10_000
             connection.setRequestProperty("Accept", "application/json")
             connection.setRequestProperty("Authorization", "Bearer $accessToken")
-            UpstoxComplianceRegistry.algoName().takeIf { it.isNotBlank() }?.let {
-                connection.setRequestProperty("X-Algo-Name", it)
-            }
+            UpstoxComplianceRegistry.algoName().takeIf { it.isNotBlank() }?.let { connection.setRequestProperty("X-Algo-Name", it) }
             if (payload != null) {
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json")
@@ -729,9 +647,7 @@ class UpstoxOrderClient(private val accessToken: String) {
             val body = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
             if (code !in 200..299) error("Upstox order HTTP $code: $body")
             val json = JSONObject(body)
-            if (!json.optString("status").equals("success", ignoreCase = true)) {
-                error("Upstox order API did not return success: $body")
-            }
+            if (!json.optString("status").equals("success", ignoreCase = true)) error("Upstox order API did not return success: $body")
             json
         } finally {
             connection.disconnect()
@@ -739,12 +655,7 @@ class UpstoxOrderClient(private val accessToken: String) {
     }
 
     companion object {
-        private val TERMINAL_STATES = setOf(
-            "complete",
-            "rejected",
-            "cancelled",
-            "cancelled after market order",
-        )
+        private val TERMINAL_STATES = setOf("complete", "rejected", "cancelled", "cancelled after market order")
         private const val PROTECTION_TAG_PREFIX = "VRD-PSL-"
         private const val PROTECTION_RETRIES = 3
         private const val EMERGENCY_FLATTEN_RETRIES = 2

@@ -1,18 +1,16 @@
 package com.parmod.ema.data
 
+import kotlin.math.max
 import kotlin.math.min
 
 /**
  * Pure fail-closed accounting for a LIVE exit.
  *
- * UpstoxOrderClient.Execution.filledQuantity can include a broker-side pre-fill that was
- * discovered while reconciling an already-fired protective order. execution.states can
- * also include emergency safety-flatten order states appended after the normal SELL.
- *
- * This helper separates normal network fills, broker pre-fills and safety flatten fills,
- * and deliberately does not invent prices for any closed quantity whose fill price cannot
- * be established. Such quantity is reported as unpriced so the caller can persist a P&L
- * uncertainty safety lock.
+ * UpstoxOrderClient normalizes returned SELL executions so [UpstoxOrderClient.Execution.pricedQuantity]
+ * is the total quantity the runtime may safely book with [UpstoxOrderClient.Execution.averagePrice].
+ * execution.states can still expose a larger actually-closed quantity when a broker/network fill
+ * is missing its price; that difference is deliberately reported as unpriced instead of borrowing
+ * LTP/bid as historical P&L.
  */
 internal object LiveExitAccounting {
     data class Result(
@@ -34,51 +32,47 @@ internal object LiveExitAccounting {
         requestedQuantity: Int,
         execution: UpstoxOrderClient.Execution,
     ): Result {
+        require(requestedQuantity > 0) { "requestedQuantity must be positive" }
+
         val stateFilled = execution.states.sumOf { it.filledQuantity.coerceAtLeast(0) }
-        val statePricedQuantity = execution.states.sumOf { status ->
-            if (status.filledQuantity > 0 && status.averagePrice > 0.0) status.filledQuantity else 0
-        }
-        val stateValue = execution.states.sumOf { status ->
-            if (status.filledQuantity > 0 && status.averagePrice > 0.0) {
-                status.filledQuantity * status.averagePrice
-            } else {
-                0.0
-            }
-        }
+        val safetyFilled = execution.safetyFlattenedQuantity.coerceAtLeast(0)
+        val networkStateFilled = (stateFilled - safetyFilled).coerceAtLeast(0)
 
-        val safetyQuantity = execution.safetyFlattenedQuantity.coerceAtLeast(0)
-        val safetyPricedQuantity = if (safetyQuantity > 0 && execution.safetyFlattenAveragePrice > 0.0) {
-            safetyQuantity
+        // Returned filledQuantity is caller-safe/priced after SELL normalization. states may
+        // show additional unpriced closed quantity. Use the larger observed closure for risk,
+        // but only pricedQuantity for P&L.
+        val observedClosed = max(execution.filledQuantity.coerceAtLeast(0), stateFilled)
+        val effectiveClosed = if (execution.brokerFlatAfterSafetyAction) {
+            requestedQuantity
         } else {
-            0
+            min(requestedQuantity, observedClosed)
         }
-        val safetyValue = safetyPricedQuantity * execution.safetyFlattenAveragePrice
-
-        // emergencyFlattenResidual appends its Status rows to execution.states, so subtract
-        // the separately reported safety leg before deriving the current request's normal
-        // network fill. Clamp to execution.filledQuantity because that field intentionally
-        // excludes the later safety-flatten leg.
-        val networkFilled = (stateFilled - safetyQuantity)
-            .coerceAtLeast(0)
-            .coerceAtMost(execution.filledQuantity.coerceAtLeast(0))
-        val networkPricedQuantity = (statePricedQuantity - safetyPricedQuantity)
-            .coerceAtLeast(0)
-            .coerceAtMost(networkFilled)
-        val networkValue = (stateValue - safetyValue).coerceAtLeast(0.0)
-        val networkAverage = if (networkPricedQuantity > 0) {
-            networkValue / networkPricedQuantity
+        val pricedQty = execution.pricedQuantity.coerceIn(0, effectiveClosed)
+        val weightedAverage = if (pricedQty > 0 && execution.averagePrice > 0.0) {
+            execution.averagePrice
         } else {
             0.0
         }
+        val pricedSafety = if (safetyFilled > 0 && execution.safetyFlattenAveragePrice > 0.0) {
+            safetyFilled
+        } else {
+            0
+        }
+        val estimatedPricedNormal = (pricedQty - pricedSafety).coerceAtLeast(0)
+        val networkFilled = min(networkStateFilled, effectiveClosed)
+        val brokerPreFilled = (estimatedPricedNormal - networkFilled).coerceAtLeast(0)
+        val unpriced = (effectiveClosed - pricedQty).coerceAtLeast(0)
 
-        return reconcile(
+        return Result(
             requestedQuantity = requestedQuantity,
-            executionFilledQuantity = execution.filledQuantity,
+            effectiveClosedQuantity = effectiveClosed,
+            remainingLocalQuantity = (requestedQuantity - effectiveClosed).coerceAtLeast(0),
             networkFilledQuantity = networkFilled,
-            networkPricedQuantity = networkPricedQuantity,
-            networkAveragePrice = networkAverage,
-            safetyFlattenedQuantity = safetyQuantity,
-            safetyFlattenAveragePrice = execution.safetyFlattenAveragePrice,
+            brokerPreFilledQuantity = brokerPreFilled,
+            safetyFlattenedQuantity = min(safetyFilled, effectiveClosed),
+            unpricedClosedQuantity = unpriced,
+            knownPricedQuantity = pricedQty,
+            knownWeightedAveragePrice = weightedAverage,
             brokerFlatAfterSafetyAction = execution.brokerFlatAfterSafetyAction,
         )
     }
@@ -111,9 +105,6 @@ internal object LiveExitAccounting {
         val pricedValue =
             pricedNetwork * networkAveragePrice + pricedSafetyQty * safetyFlattenAveragePrice
         val weightedAverage = if (pricedQty > 0) pricedValue / pricedQty else 0.0
-
-        // Broker pre-fills, unpriced network rows and any broker-flat gap remain unknown.
-        // Never allocate a quote/LTP fallback to them: that would manufacture historical P&L.
         val unpriced = (effectiveClosed - pricedQty).coerceAtLeast(0)
 
         return Result(

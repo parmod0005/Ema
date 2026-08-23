@@ -47,6 +47,19 @@ data class FullMarketState(
         EngineId.ENGINE_2_AVWAP_LIQUIDITY -> copy(engine2 = value)
         EngineId.ENGINE_3_V76_SCALPER -> copy(engine3 = value)
     }
+
+    fun withRiskPolicy(dailyLossLimitInr: Double): FullMarketState {
+        val decision = RiskLockPolicy.evaluate(
+            recoveredPnlUncertain = recoveredPnlUncertain,
+            realizedPnl = realizedPnl,
+            dailyLossLimitInr = dailyLossLimitInr,
+        )
+        return if (riskLocked == decision.locked && riskReason == decision.reason) {
+            this
+        } else {
+            copy(riskLocked = decision.locked, riskReason = decision.reason)
+        }
+    }
 }
 
 data class FullDashboardState(
@@ -71,13 +84,17 @@ data class FullDashboardState(
     val message: String = "PAPER default · select markets and connect Upstox",
 ) {
     val visibleMarkets: List<FullMarketState>
-        get() = marketSelection.indexes.mapNotNull(markets::get)
+        get() = marketSelection.indexes.map(::market)
 
     val combinedRealizedPnl: Double get() = visibleMarkets.sumOf { it.realizedPnl }
     val combinedOpenPnl: Double get() = visibleMarkets.sumOf { it.openPnl }
     val combinedPnl: Double get() = combinedRealizedPnl + combinedOpenPnl
 
     fun lotsFor(index: MarketIndex): Int = if (index == MarketIndex.NIFTY) niftyLots else sensexLots
-    fun market(index: MarketIndex): FullMarketState = markets.getValue(index)
-    fun withMarket(index: MarketIndex, value: FullMarketState): FullDashboardState = copy(markets = markets + (index to value))
+
+    fun market(index: MarketIndex): FullMarketState =
+        markets.getValue(index).withRiskPolicy(riskConfig.dailyLossLimitInr)
+
+    fun withMarket(index: MarketIndex, value: FullMarketState): FullDashboardState =
+        copy(markets = markets + (index to value.withRiskPolicy(riskConfig.dailyLossLimitInr)))
 }

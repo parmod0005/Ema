@@ -1,10 +1,8 @@
 name: Android CI
 
 on:
-  pull_request:
-    branches: [main]
   push:
-    branches: [main]
+    branches: [main, develop/ema-android-foundation]
   workflow_dispatch:
 
 permissions:
@@ -16,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: windows-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

@@ -269,12 +269,31 @@ object TradingRecoveryRegistry {
         }
     }
 
+    /**
+     * A recovered LIVE position can be proven broker-flat without the local process knowing
+     * the exact exit fill/P&L (for example when the exchange-held disaster stop fired while
+     * the app was dead). Treat that uncertainty as a daily safety lock instead of silently
+     * assuming zero loss.
+     */
+    @Synchronized
+    fun startupHasUnpricedRecoveredLive(index: MarketIndex? = null): Boolean {
+        val today = LocalDate.now(zone)
+        return startupRecords.any { record ->
+            (index == null || record.index == index) &&
+                record.executionMode == ExecutionMode.LIVE &&
+                record.recoveryResolved &&
+                record.status == TradeStatus.OPEN &&
+                record.pnl == null &&
+                recordDate(record.entryTimeMillis) == today
+        }
+    }
+
     @Synchronized
     fun restartBaselineTradeCount(): Int = startupTodayTradeCounts().values.maxOrNull() ?: 0
 
     @Synchronized
     fun restartBaselineLossLock(limitInr: Double): Boolean =
-        startupTodayRealizedPnl().values.any { it <= -limitInr }
+        startupHasUnpricedRecoveredLive() || startupTodayRealizedPnl().values.any { it <= -limitInr }
 
     @Synchronized
     fun hasUnresolvedStartupLivePosition(): Boolean = startupOpenLivePositions().isNotEmpty()

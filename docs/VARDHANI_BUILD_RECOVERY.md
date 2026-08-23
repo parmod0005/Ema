@@ -10,3 +10,4 @@ Release discipline:
 - Official raw historical AI samples require native NIFTY/SENSEX underlying context; legacy option-premium proxy direction is not Candidate-qualifying.
 - Historical BSE/NSE instrument keys must come from verified metadata and are never invented.
 - A new APK is not labelled verified until the complete build actually executes and its artifact can be inspected.
+- The trusted default-branch workflow and development workflow are synchronized before this source-only build trigger.

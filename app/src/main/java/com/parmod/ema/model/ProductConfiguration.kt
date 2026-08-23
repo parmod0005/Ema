@@ -103,6 +103,10 @@ data class LiveGateDecision(
  * Final broker-order gate. Every live entry must pass this immediately before the
  * network request. Manual and automatic live trading share the same hard risk gate;
  * automatic mode additionally requires AUTO_ARMED and the configured confidence bar.
+ *
+ * Crash/restart baselines come from [TradingRecoveryRegistry]. The existing runtime
+ * supplies a per-market in-memory count; after a process restart the persisted baseline
+ * is applied conservatively so a restart can never reset a risk lock or trade counter.
  */
 object LiveExecutionGuard {
     fun evaluate(input: LiveGateInput): LiveGateDecision {
@@ -114,13 +118,20 @@ object LiveExecutionGuard {
         if (!input.plannedRiskInr.isFinite() || input.plannedRiskInr <= 0.0) return deny("Per-trade risk could not be verified")
         if (input.plannedRiskInr > input.risk.maxRiskPerTradeInr) return deny("Per-trade risk exceeds live limit")
         if (input.riskLocked) return deny("Daily risk lock is active")
+        if (TradingRecoveryRegistry.restartBaselineLossLock(input.risk.dailyLossLimitInr)) {
+            return deny("Recovered daily loss lock is active")
+        }
+        if (TradingRecoveryRegistry.hasUnresolvedStartupLivePosition()) {
+            return deny("Recovered LIVE position requires broker reconciliation")
+        }
         if (input.emergencyKill) return deny("Emergency kill switch is active")
         if (!input.marketOpen) return deny("Live intraday orders are blocked outside market hours")
         if (!input.entriesAllowed) return deny("Entry window is closed")
         if (input.tickAgeMillis < 0L || input.tickAgeMillis > input.risk.maximumTickAgeMillis) {
             return deny("Market data is stale")
         }
-        if (input.tradesToday >= input.risk.maxTradesPerIndex) return deny("Daily trade limit reached")
+        val effectiveTradeCount = maxOf(input.tradesToday, TradingRecoveryRegistry.restartBaselineTradeCount())
+        if (effectiveTradeCount >= input.risk.maxTradesPerIndex) return deny("Daily trade limit reached")
         if (!input.spreadPercent.isFinite() || input.spreadPercent > input.risk.maximumSpreadPercent) {
             return deny("Option spread is unavailable or exceeds live limit")
         }

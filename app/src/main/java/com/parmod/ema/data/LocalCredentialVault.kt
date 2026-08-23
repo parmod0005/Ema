@@ -4,7 +4,7 @@ import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
-/** Android Keystore-backed local storage for Upstox credentials only. */
+/** Android Keystore-backed local storage for Upstox credentials and order-app metadata. */
 class LocalCredentialVault(context: Context) {
     private val appContext = context.applicationContext
     private val masterKey = MasterKey.Builder(appContext)
@@ -24,6 +24,7 @@ class LocalCredentialVault(context: Context) {
         val upstoxApiSecret: String = "",
         val upstoxAccessToken: String = "",
         val upstoxRedirectUri: String = "",
+        val upstoxAlgoName: String = "",
     )
 
     fun read(): Credentials = Credentials(
@@ -31,6 +32,7 @@ class LocalCredentialVault(context: Context) {
         upstoxApiSecret = preferences.getString(KEY_UPSTOX_API_SECRET, "").orEmpty(),
         upstoxAccessToken = preferences.getString(KEY_UPSTOX_ACCESS_TOKEN, "").orEmpty(),
         upstoxRedirectUri = preferences.getString(KEY_UPSTOX_REDIRECT_URI, "").orEmpty(),
+        upstoxAlgoName = preferences.getString(KEY_UPSTOX_ALGO_NAME, "").orEmpty(),
     )
 
     fun save(credentials: Credentials) {
@@ -39,6 +41,7 @@ class LocalCredentialVault(context: Context) {
             .putString(KEY_UPSTOX_API_SECRET, credentials.upstoxApiSecret.trim())
             .putString(KEY_UPSTOX_ACCESS_TOKEN, credentials.upstoxAccessToken.trim())
             .putString(KEY_UPSTOX_REDIRECT_URI, credentials.upstoxRedirectUri.trim())
+            .putString(KEY_UPSTOX_ALGO_NAME, credentials.upstoxAlgoName.trim())
             .apply()
     }
 
@@ -54,5 +57,6 @@ class LocalCredentialVault(context: Context) {
         private const val KEY_UPSTOX_API_SECRET = "upstox_api_secret"
         private const val KEY_UPSTOX_ACCESS_TOKEN = "upstox_access_token"
         private const val KEY_UPSTOX_REDIRECT_URI = "upstox_redirect_uri"
+        private const val KEY_UPSTOX_ALGO_NAME = "upstox_algo_name"
     }
 }

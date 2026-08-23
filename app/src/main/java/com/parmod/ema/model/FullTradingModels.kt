@@ -11,7 +11,8 @@ data class FullMarketState(
     val engine1: EngineState = EngineState(EngineId.ENGINE_1_TREND, "ENGINE 1 · TREND / BREAKOUT"),
     val engine2: EngineState = EngineState(EngineId.ENGINE_2_AVWAP_LIQUIDITY, "ENGINE 2 · AVWAP / LIQUIDITY + D30"),
     val engine3: EngineState = EngineState(EngineId.ENGINE_3_V76_SCALPER, "ENGINE 3 · V7.6 REVERSAL RUNNER"),
-    val tradeLog: List<TradeLogEntry> = emptyList(),
+    val recoveredRealizedPnl: Double = TradingRecoveryRegistry.startupTodayRealizedPnl()[index] ?: 0.0,
+    val tradeLog: List<TradeLogEntry> = TradingRecoveryRegistry.startupTradeLog(index),
     val lastTickMillis: Long = 0L,
     val ticksReceived: Long = 0L,
     val marketDepthMode: String = "WAITING",
@@ -21,7 +22,7 @@ data class FullMarketState(
     val message: String = "Ready",
 ) {
     val engines: List<EngineState> get() = listOf(engine1, engine2, engine3)
-    val realizedPnl: Double get() = engines.sumOf { it.performance.realizedPnl }
+    val realizedPnl: Double get() = recoveredRealizedPnl + engines.sumOf { it.performance.realizedPnl }
     val openPnl: Double get() = engines.sumOf { it.openPnl }
     val totalPnl: Double get() = realizedPnl + openPnl
     val connectedAgeMillis: Long get() = if (lastTickMillis <= 0L) Long.MAX_VALUE else (System.currentTimeMillis() - lastTickMillis).coerceAtLeast(0L)

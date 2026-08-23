@@ -102,7 +102,8 @@ data class LiveGateDecision(
 /**
  * Final broker-order gate. Every live entry must pass this immediately before the
  * network request. Manual and automatic live trading share the same hard risk gate;
- * automatic mode additionally requires AUTO_ARMED and the configured confidence bar.
+ * automatic mode additionally requires AUTO_ARMED, a configured Upstox Algo Name,
+ * and the configured confidence bar.
  *
  * Crash/restart baselines come from [TradingRecoveryRegistry]. The existing runtime
  * supplies a per-market in-memory count; after a process restart the persisted baseline
@@ -124,6 +125,9 @@ object LiveExecutionGuard {
         if (TradingRecoveryRegistry.hasUnresolvedStartupLivePosition()) {
             return deny("Recovered LIVE position requires broker reconciliation")
         }
+        if (!UpstoxComplianceRegistry.protectionHealthy()) {
+            return deny("Broker protection fault: ${UpstoxComplianceRegistry.protectionFaultReason()}")
+        }
         if (input.emergencyKill) return deny("Emergency kill switch is active")
         if (!input.marketOpen) return deny("Live intraday orders are blocked outside market hours")
         if (!input.entriesAllowed) return deny("Entry window is closed")
@@ -138,6 +142,7 @@ object LiveExecutionGuard {
 
         if (input.automatic) {
             if (input.armMode != LiveArmMode.AUTO_ARMED) return deny("Automatic live trading is not armed")
+            if (!UpstoxComplianceRegistry.autoLiveAlgoConfigured()) return deny("Upstox Algo Name is required for AUTO LIVE")
             if (input.confidence < input.risk.minimumAutoLiveConfidence) return deny("Signal confidence below live-auto minimum")
         } else if (input.armMode == LiveArmMode.DISARMED) {
             return deny("Manual live trading is not armed")

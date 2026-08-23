@@ -38,6 +38,7 @@ class UpstoxOptionDiscoveryClient(private val accessToken: String) {
                 val expiry = item.optString("expiry")
                 val key = item.optString("instrument_key")
                 val type = item.optString("instrument_type")
+                val lotSize = item.optInt("lot_size", 0)
                 if (expiry.isBlank() || key.isBlank() || type !in setOf("CE", "PE")) continue
                 add(
                     Contract(
@@ -45,7 +46,7 @@ class UpstoxOptionDiscoveryClient(private val accessToken: String) {
                         expiry = expiry,
                         strike = item.optDouble("strike_price", 0.0),
                         optionType = type,
-                        lotSize = item.optInt("lot_size", if (index == MarketIndex.NIFTY) 65 else 20),
+                        lotSize = lotSize,
                     ),
                 )
             }

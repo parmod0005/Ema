@@ -19,8 +19,8 @@ import com.parmod.ema.VardhaniFullActivity
  * Foreground process/network keeper for the full VARDHANI runtime.
  *
  * Signal engines and broker-order authority live outside this service. It only keeps
- * the process/network scheduled while the phone is minimized or locked and provides
- * a STOP control that ends the keeper service itself.
+ * the process/network scheduled while the phone is minimized or locked. The service
+ * is stopped from the guarded in-app disconnect flow, not from an unguarded notification.
  */
 class VardhaniMarketService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
@@ -100,12 +100,6 @@ class VardhaniMarketService : Service() {
             Intent(this, VardhaniFullActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val stopIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, VardhaniMarketService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.vardhani_logo)
             .setContentTitle("VARDHANI market session")
@@ -115,7 +109,6 @@ class VardhaniMarketService : Service() {
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(0, "STOP KEEPER", stopIntent)
             .build()
     }
 

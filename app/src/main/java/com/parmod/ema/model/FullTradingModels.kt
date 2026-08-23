@@ -192,8 +192,9 @@ data class FullDashboardState(
         markets.getValue(index).withRiskPolicy(riskConfig.dailyLossLimitInr)
 
     fun withMarket(index: MarketIndex, value: FullMarketState): FullDashboardState {
-        val brokerSafetyFlatTransition = value.engines.any {
-            it.position?.executionMode == ExecutionMode.LIVE && it.position.quantity <= 0
+        val brokerSafetyFlatTransition = value.engines.any { engine ->
+            val position = engine.position
+            position != null && position.executionMode == ExecutionMode.LIVE && position.quantity <= 0
         }
         val adjusted = value.withRiskPolicy(riskConfig.dailyLossLimitInr)
         return copy(

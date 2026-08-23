@@ -46,6 +46,8 @@
         <activity
             android:name=".VardhaniFullActivity"
             android:exported="true"
+            android:launchMode="singleTask"
+            android:alwaysRetainTaskState="true"
             android:label="VARDHANI">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

@@ -3,11 +3,17 @@ package com.parmod.ema.engine
 import com.parmod.ema.model.EngineTimeframeConfig
 import com.parmod.ema.model.SignalTimeframe
 import com.parmod.ema.model.TrendDirection
+import java.time.Instant
+import java.time.ZoneId
 
 /**
  * Completed-candle confirmation layer for E1/E2.
  * The underlying tick-native engines remain authoritative; this layer can confirm or veto
  * a direction but never manufacture an opposite signal by itself.
+ *
+ * The full runtime uses this as the shared PAPER/LIVE automatic-entry clock gate, so E1/E2
+ * cannot keep producing actionable automatic entries after the configured 15:10 IST cutoff.
+ * Manual order buttons remain explicit user actions and do not depend on this signal gate.
  */
 class MultiTimeframeConfirmation(
     private val signalEngine: SignalEngineV2 = SignalEngineV2(),
@@ -36,11 +42,28 @@ class MultiTimeframeConfirmation(
     fun evaluate(
         oneMinuteBars: List<TimedBar>,
         config: EngineTimeframeConfig,
+        enforceEntryWindow: Boolean = true,
     ): Result {
         val base = oneMinuteBars.sortedBy { it.timestamp }
         val trigger = resample(base, config.trigger)
         val setup = resample(base, config.setup)
         val bias = resample(base, config.bias)
+
+        if (enforceEntryWindow && base.isNotEmpty() && !isEntryWindow(base.last().timestamp)) {
+            return Result(
+                ready = false,
+                direction = TrendDirection.NEUTRAL,
+                score = 0,
+                triggerBars = trigger.size,
+                setupBars = setup.size,
+                biasBars = bias.size,
+                reasons = listOf(
+                    "Automatic entry window closed",
+                    "E1/E2 entries allowed 09:25-15:10 IST",
+                ),
+            )
+        }
+
         if (trigger.size < 55 || setup.size < 55 || bias.size < 55) {
             return Result(
                 ready = false,
@@ -87,6 +110,13 @@ class MultiTimeframeConfirmation(
         )
     }
 
+    private fun isEntryWindow(timestamp: Long): Boolean {
+        if (timestamp <= 0L) return false
+        val local = Instant.ofEpochMilli(timestamp).atZone(INDIA_ZONE)
+        val minute = local.hour * 60 + local.minute
+        return minute in ENTRY_START_MINUTE..ENTRY_END_MINUTE
+    }
+
     private fun direction(e: SignalEngineV2.Evaluation): TrendDirection = when (e.direction) {
         SignalEngineV2.Direction.BULLISH -> TrendDirection.BULLISH
         SignalEngineV2.Direction.BEARISH -> TrendDirection.BEARISH
@@ -119,5 +149,11 @@ class MultiTimeframeConfirmation(
                     volume = group.sumOf { it.volume },
                 )
             }
+    }
+
+    companion object {
+        private val INDIA_ZONE: ZoneId = ZoneId.of("Asia/Kolkata")
+        private const val ENTRY_START_MINUTE = 9 * 60 + 25
+        private const val ENTRY_END_MINUTE = 15 * 60 + 10
     }
 }

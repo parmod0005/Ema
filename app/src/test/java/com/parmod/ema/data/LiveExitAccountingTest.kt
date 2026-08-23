@@ -98,6 +98,70 @@ class LiveExitAccountingTest {
     }
 
     @Test
+    fun `full broker history clears whole local position even when current request was only partial`() {
+        val result = LiveExitAccounting.reconcileFullBrokerHistory(
+            localPositionQuantity = 100,
+            brokerLongBeforeQuantity = 40,
+            priorClosedAveragePrice = 109.0,
+            networkFilledQuantity = 0,
+            networkAveragePrice = 0.0,
+            safetyFlattenedQuantity = 40,
+            safetyFlattenAveragePrice = 112.0,
+            brokerFlatAfterSafetyAction = true,
+        )
+
+        assertEquals(60, result.brokerPreFilledQuantity)
+        assertEquals(40, result.safetyFlattenedQuantity)
+        assertEquals(100, result.effectiveClosedQuantity)
+        assertEquals(0, result.remainingLocalQuantity)
+        assertEquals(100, result.knownPricedQuantity)
+        assertEquals(110.2, result.knownWeightedAveragePrice, 0.0001)
+        assertFalse(result.requiresPnlUncertaintyLock)
+    }
+
+    @Test
+    fun `broker already flat before partial request closes full local position without extra sell`() {
+        val result = LiveExitAccounting.reconcileFullBrokerHistory(
+            localPositionQuantity = 100,
+            brokerLongBeforeQuantity = 0,
+            priorClosedAveragePrice = 108.5,
+            networkFilledQuantity = 0,
+            networkAveragePrice = 0.0,
+            safetyFlattenedQuantity = 0,
+            safetyFlattenAveragePrice = 0.0,
+            brokerFlatAfterSafetyAction = false,
+        )
+
+        assertEquals(100, result.brokerPreFilledQuantity)
+        assertEquals(0, result.networkFilledQuantity)
+        assertEquals(100, result.effectiveClosedQuantity)
+        assertEquals(0, result.remainingLocalQuantity)
+        assertEquals(100, result.knownPricedQuantity)
+        assertEquals(108.5, result.knownWeightedAveragePrice, 0.0001)
+        assertFalse(result.requiresPnlUncertaintyLock)
+    }
+
+    @Test
+    fun `full broker history refuses to price prior closure when protective fill price is unknown`() {
+        val result = LiveExitAccounting.reconcileFullBrokerHistory(
+            localPositionQuantity = 100,
+            brokerLongBeforeQuantity = 40,
+            priorClosedAveragePrice = 0.0,
+            networkFilledQuantity = 40,
+            networkAveragePrice = 112.0,
+            safetyFlattenedQuantity = 0,
+            safetyFlattenAveragePrice = 0.0,
+            brokerFlatAfterSafetyAction = true,
+        )
+
+        assertEquals(100, result.effectiveClosedQuantity)
+        assertEquals(0, result.remainingLocalQuantity)
+        assertEquals(40, result.knownPricedQuantity)
+        assertEquals(60, result.unpricedClosedQuantity)
+        assertTrue(result.requiresPnlUncertaintyLock)
+    }
+
+    @Test
     fun `from execution reads normalized priced normal plus safety closure exactly once`() {
         val normal = status("NORMAL", filled = 40, average = 115.0)
         val safety = status("SAFETY", filled = 60, average = 112.0)

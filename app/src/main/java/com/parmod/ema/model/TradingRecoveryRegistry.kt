@@ -85,6 +85,7 @@ object TradingRecoveryRegistry {
     private val fragments = linkedMapOf<String, PositionFragment>()
     private var startupRecords: List<Record> = emptyList()
     private var initialized = false
+    private var lastPersistAtMillis = 0L
 
     @Synchronized
     fun initialize(storage: Backend) {
@@ -97,7 +98,7 @@ object TradingRecoveryRegistry {
             .forEach { records[it.key] = it }
         startupRecords = records.values.toList()
         initialized = true
-        persistLocked()
+        persistLocked(force = true)
     }
 
     @Synchronized
@@ -130,7 +131,9 @@ object TradingRecoveryRegistry {
         val matching = records.values.firstOrNull { recordIdentity(it) == identity && it.status == TradeStatus.OPEN }
         if (matching != null) {
             records[matching.key] = merge(matching, fragment)
-            persistLocked()
+            // Price/stop copies can be produced many times per second. One durable snapshot
+            // per second is enough for crash recovery and avoids storage work on every tick.
+            persistLocked(force = false)
         }
     }
 
@@ -187,7 +190,8 @@ object TradingRecoveryRegistry {
         }
         records[key] = record
         pruneLocked()
-        persistLocked()
+        // Entries, partial/terminal trade-log changes and exits are safety-significant.
+        persistLocked(force = true)
     }
 
     @Synchronized
@@ -238,13 +242,13 @@ object TradingRecoveryRegistry {
         startupRecords = startupRecords.map {
             if (it.key == key) it.copy(recoveryResolved = true, updatedAtMillis = System.currentTimeMillis()) else it
         }
-        persistLocked()
+        persistLocked(force = true)
     }
 
     @Synchronized
     fun clearResolvedHistoryBefore(date: LocalDate) {
         records.entries.removeAll { (_, record) -> record.recoveryResolved && recordDate(record.entryTimeMillis) < date }
-        persistLocked()
+        persistLocked(force = true)
     }
 
     private fun merge(base: Record, fragment: PositionFragment): Record = base.copy(
@@ -286,12 +290,16 @@ object TradingRecoveryRegistry {
         while (records.size > MAX_RECORDS) records.remove(records.keys.first())
     }
 
-    private fun persistLocked() {
+    private fun persistLocked(force: Boolean) {
         if (!initialized) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastPersistAtMillis < POSITION_SNAPSHOT_INTERVAL_MS) return
+        lastPersistAtMillis = now
         runCatching {
-            backend?.save(Snapshot(records.values.toList(), System.currentTimeMillis()))
+            backend?.save(Snapshot(records.values.toList(), now))
         }
     }
 
     private const val MAX_RECORDS = 2_000
+    private const val POSITION_SNAPSHOT_INTERVAL_MS = 1_000L
 }

@@ -8,6 +8,12 @@ package com.parmod.ema.model
  * phantom quantity larger than the broker position. This registry carries only quantity
  * reconciliation metadata; it contains no credentials and does not replace the persistent
  * crash ledger.
+ *
+ * Unpriced snapshots deliberately survive ordinary clear requests for the remainder of the
+ * process. The market is already fail-closed for that trade/day, and retaining the tiny
+ * snapshot prevents a concurrent UI read from consuming the only broker-quantity correction
+ * before the next state write persists it. Process restart clears this in-memory bridge and
+ * the persistent recovery ledger becomes authoritative.
  */
 internal object LiveBrokerReconciliationRegistry {
     data class Snapshot(
@@ -42,6 +48,8 @@ internal object LiveBrokerReconciliationRegistry {
 
     @Synchronized
     fun clear(instrumentKey: String) {
-        if (instrumentKey.isNotBlank()) snapshots.remove(instrumentKey)
+        if (instrumentKey.isBlank()) return
+        val current = snapshots[instrumentKey] ?: return
+        if (current.unpricedClosedQuantity <= 0) snapshots.remove(instrumentKey)
     }
 }

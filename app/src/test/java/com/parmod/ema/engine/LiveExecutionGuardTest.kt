@@ -1,12 +1,15 @@
 package com.parmod.ema.engine
 
+import com.parmod.ema.model.EngineTimeframeConfig
 import com.parmod.ema.model.ExecutionMode
 import com.parmod.ema.model.LiveArmMode
 import com.parmod.ema.model.LiveExecutionGuard
 import com.parmod.ema.model.LiveGateInput
 import com.parmod.ema.model.MarketIndex
 import com.parmod.ema.model.MarketSelection
+import com.parmod.ema.model.SignalTimeframe
 import com.parmod.ema.model.TradingRiskConfig
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -21,6 +24,7 @@ class LiveExecutionGuardTest {
         upstoxTokenPresent = true,
         instrumentKeyPresent = true,
         quantity = 65,
+        plannedRiskInr = 1_500.0,
         riskLocked = false,
         emergencyKill = false,
         marketOpen = true,
@@ -40,6 +44,13 @@ class LiveExecutionGuardTest {
     }
 
     @Test
+    fun exact_v76_profile_is_one_three_five() {
+        assertEquals(SignalTimeframe.M1, EngineTimeframeConfig.E3_DEFAULT.trigger)
+        assertEquals(SignalTimeframe.M3, EngineTimeframeConfig.E3_DEFAULT.setup)
+        assertEquals(SignalTimeframe.M5, EngineTimeframeConfig.E3_DEFAULT.bias)
+    }
+
+    @Test
     fun automatic_live_order_requires_explicit_auto_arm() {
         assertTrue(LiveExecutionGuard.evaluate(valid).allowed)
         assertFalse(LiveExecutionGuard.evaluate(valid.copy(armMode = LiveArmMode.DISARMED)).allowed)
@@ -49,6 +60,12 @@ class LiveExecutionGuardTest {
     @Test
     fun stale_market_data_blocks_live_order() {
         assertFalse(LiveExecutionGuard.evaluate(valid.copy(tickAgeMillis = risk.maximumTickAgeMillis + 1)).allowed)
+    }
+
+    @Test
+    fun per_trade_risk_blocks_oversized_live_order() {
+        assertFalse(LiveExecutionGuard.evaluate(valid.copy(plannedRiskInr = risk.maxRiskPerTradeInr + 1.0)).allowed)
+        assertFalse(LiveExecutionGuard.evaluate(valid.copy(plannedRiskInr = Double.NaN)).allowed)
     }
 
     @Test

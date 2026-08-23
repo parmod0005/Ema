@@ -38,7 +38,7 @@ internal object LiveBrokerReconciliationRegistry {
 
     @Synchronized
     fun snapshot(instrumentKey: String): Snapshot? =
-        snapshots[instrumentKey.takeIf(String::isNotBlank)]
+        if (instrumentKey.isBlank()) null else snapshots[instrumentKey]
 
     @Synchronized
     fun clear(instrumentKey: String) {

@@ -2,7 +2,7 @@ name: Android CI
 
 on:
   push:
-    branches: [main, develop/ema-android-foundation]
+    branches: [develop/ema-android-foundation]
   workflow_dispatch:
 
 permissions:

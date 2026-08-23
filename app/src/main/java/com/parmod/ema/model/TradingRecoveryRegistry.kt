@@ -270,10 +270,13 @@ object TradingRecoveryRegistry {
     }
 
     /**
-     * A recovered LIVE position can be proven broker-flat without the local process knowing
+     * A resolved LIVE position can be proven broker-flat without the local process knowing
      * the exact exit fill/P&L (for example when the exchange-held disaster stop fired while
-     * the app was dead). Treat that uncertainty as a daily safety lock instead of silently
-     * assuming zero loss.
+     * the app was dead, or an emergency safety flatten completed with an unpriced broker
+     * pre-fill). Treat that uncertainty as a daily safety lock instead of silently assuming
+     * zero loss. CLOSED rows with null P&L are intentionally included so runtime broker-flat
+     * reconciliation can present the trade as closed immediately and still remain locked
+     * after restart.
      */
     @Synchronized
     fun startupHasUnpricedRecoveredLive(index: MarketIndex? = null): Boolean {
@@ -282,7 +285,6 @@ object TradingRecoveryRegistry {
             (index == null || record.index == index) &&
                 record.executionMode == ExecutionMode.LIVE &&
                 record.recoveryResolved &&
-                record.status == TradeStatus.OPEN &&
                 record.pnl == null &&
                 recordDate(record.entryTimeMillis) == today
         }

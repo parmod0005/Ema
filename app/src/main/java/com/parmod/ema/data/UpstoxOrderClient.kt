@@ -6,6 +6,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import kotlin.math.floor
+import kotlin.math.min
 
 /**
  * Single audited broker-order adapter for VARDHANI LIVE execution.
@@ -20,7 +21,9 @@ import kotlin.math.floor
  * - if residual protection cannot be re-armed, a best-effort exact-quantity emergency
  *   flatten is attempted and the protection fault remains latched,
  * - broker-side stop fills are reconciled before another SELL so VARDHANI does not
- *   blindly create a short position after its protection already fired.
+ *   blindly create a short position after its protection already fired,
+ * - a LIVE SELL quantity is exposed to the runtime only to the extent that its fill price
+ *   is known; unpriced broker reductions fail closed instead of borrowing LTP as P&L.
  *
  * The phone-side AdaptiveExitEngine remains the primary/tighter exit manager. The SL-M
  * managed here is a disaster backstop for app/network/process failure, not a replacement
@@ -78,6 +81,7 @@ class UpstoxOrderClient(private val accessToken: String) {
         val safetyFlattenedQuantity: Int = 0,
         val safetyFlattenAveragePrice: Double = 0.0,
         val brokerFlatAfterSafetyAction: Boolean = false,
+        val pricedQuantity: Int = if (averagePrice > 0.0) filledQuantity.coerceAtLeast(0) else 0,
     ) {
         val fullyFilled: Boolean get() = filledQuantity >= requestedQuantity && requestedQuantity > 0
         val partiallyFilled: Boolean get() = filledQuantity in 1 until requestedQuantity
@@ -89,6 +93,7 @@ class UpstoxOrderClient(private val accessToken: String) {
         val tag: String,
         val quantity: Int,
         val filledQuantity: Int,
+        val pricedFilledQuantity: Int,
         val triggerPrice: Double,
         val averageFillPrice: Double,
         val states: List<Status>,
@@ -210,6 +215,7 @@ class UpstoxOrderClient(private val accessToken: String) {
                         safetyFlattenedQuantity = emergency.filledQuantity,
                         safetyFlattenAveragePrice = emergency.averagePrice,
                         brokerFlatAfterSafetyAction = true,
+                        pricedQuantity = 0,
                     )
                 }
             } else {
@@ -217,26 +223,31 @@ class UpstoxOrderClient(private val accessToken: String) {
             }
         }
 
-        if (placement.transactionType == TransactionType.SELL && placement.protectionBeforeQuantity > 0) {
-            val fallbackRemaining =
-                (placement.brokerLongBeforeQuantity - networkExecution.filledQuantity).coerceAtLeast(0)
-            val remaining = currentBrokerLongQuantity(placement.instrumentKey) ?: fallbackRemaining
-            if (remaining > 0) {
-                val trigger = placement.protectionTriggerPrice.takeIf { it > 0.0 }
-                if (trigger == null || !armProtectionWithRetry(placement.instrumentKey, remaining, trigger)) {
-                    UpstoxComplianceRegistry.setProtectionFault(
-                        "Could not re-arm protective stop after partial LIVE exit; emergency flatten required",
-                    )
-                    return emergencyFlattenResidual(
-                        placement = placement,
-                        combined = combined,
-                        trigger = trigger,
-                    )
+        if (placement.transactionType == TransactionType.SELL) {
+            var sellResult = combined
+            if (placement.protectionBeforeQuantity > 0) {
+                val fallbackRemaining =
+                    (placement.brokerLongBeforeQuantity - networkExecution.filledQuantity).coerceAtLeast(0)
+                val remaining = currentBrokerLongQuantity(placement.instrumentKey) ?: fallbackRemaining
+                if (remaining > 0) {
+                    val trigger = placement.protectionTriggerPrice.takeIf { it > 0.0 }
+                    if (trigger == null || !armProtectionWithRetry(placement.instrumentKey, remaining, trigger)) {
+                        UpstoxComplianceRegistry.setProtectionFault(
+                            "Could not re-arm protective stop after partial LIVE exit; emergency flatten required",
+                        )
+                        sellResult = emergencyFlattenResidual(
+                            placement = placement,
+                            combined = combined,
+                            trigger = trigger,
+                        )
+                    } else {
+                        UpstoxComplianceRegistry.clearProtectionFault()
+                    }
+                } else {
+                    UpstoxComplianceRegistry.clearProtectionFault()
                 }
-                UpstoxComplianceRegistry.clearProtectionFault()
-            } else {
-                UpstoxComplianceRegistry.clearProtectionFault()
             }
+            return normalizeSellExecutionForCaller(placement, sellResult)
         }
 
         return combined
@@ -297,12 +308,24 @@ class UpstoxOrderClient(private val accessToken: String) {
             error("Partial LIVE exit blocked because residual quantity cannot be protected")
         }
 
-        val preFillAverage = latestProtection?.averageFillPrice?.takeIf { it > 0.0 } ?: 0.0
+        val preFillAverage = latestProtection?.averageFillPrice
+            ?.takeIf {
+                sellPlan.preFilledQuantity <= 0 ||
+                    (it > 0.0 && latestProtection.pricedFilledQuantity >= sellPlan.preFilledQuantity)
+            }
+            ?: 0.0
+        if (sellPlan.preFilledQuantity > 0 && preFillAverage <= 0.0) {
+            UpstoxComplianceRegistry.setProtectionFault(
+                "Broker quantity reduced before LIVE exit but prior fill price is unavailable",
+            )
+            error("LIVE exit requires broker recovery because prior closed quantity is unpriced")
+        }
+
         return SellPreparation(
             networkQuantity = sellPlan.networkSellQuantity,
             preFilledQuantity = sellPlan.preFilledQuantity,
             preFillAveragePrice = preFillAverage,
-            protectionBeforeQuantity = brokerLongQuantity,
+            protectionBeforeQuantity = sellPlan.reconciledPositionQuantity,
             protectionTriggerPrice = trigger,
             brokerLongBeforeQuantity = brokerLongQuantity,
         )
@@ -322,14 +345,18 @@ class UpstoxOrderClient(private val accessToken: String) {
         } ?: return null
         val quantity = latest.sumOf { it.quantity.coerceAtLeast(it.filledQuantity + it.pendingQuantity) }
         val filled = latest.sumOf { it.filledQuantity.coerceAtLeast(0) }
+        val pricedFilled = latest.sumOf {
+            if (it.filledQuantity > 0 && it.averagePrice > 0.0) it.filledQuantity else 0
+        }
         val tradedValue = latest.sumOf {
             if (it.filledQuantity > 0 && it.averagePrice > 0.0) it.averagePrice * it.filledQuantity else 0.0
         }
-        val average = if (filled > 0) tradedValue / filled else 0.0
+        val average = if (pricedFilled > 0) tradedValue / pricedFilled else 0.0
         return ProtectionGroup(
             tag = latest.first().tag,
             quantity = quantity,
             filledQuantity = filled,
+            pricedFilledQuantity = pricedFilled,
             triggerPrice = latest.map { it.triggerPrice }.filter { it > 0.0 }.maxOrNull() ?: 0.0,
             averageFillPrice = average,
             states = latest,
@@ -411,6 +438,53 @@ class UpstoxOrderClient(private val accessToken: String) {
             )
         }
         return result
+    }
+
+    /**
+     * Translate broker reconciliation into quantities the existing runtime can safely book.
+     * A caller-visible filled quantity is never larger than the quantity with known prices.
+     * When a safety flatten proves the broker flat and all reconciled quantity is priced,
+     * the full broker-side position size is returned even if the original request was only
+     * a T1 partial. That lets the state layer remove the now-zero local position immediately.
+     */
+    private fun normalizeSellExecutionForCaller(
+        placement: Placement,
+        execution: Execution,
+    ): Execution {
+        val reconciledTarget = placement.protectionBeforeQuantity
+            .coerceAtLeast(execution.requestedQuantity)
+            .coerceAtLeast(0)
+        val normalClosed = execution.filledQuantity.coerceAtLeast(0)
+        val normalPriced = execution.pricedQuantity.coerceIn(0, normalClosed)
+        val safetyClosed = execution.safetyFlattenedQuantity.coerceAtLeast(0)
+        val safetyPriced = if (safetyClosed > 0 && execution.safetyFlattenAveragePrice > 0.0) {
+            safetyClosed
+        } else {
+            0
+        }
+        val observedClosed = min(reconciledTarget, normalClosed + safetyClosed)
+        val observedPriced = min(observedClosed, normalPriced + safetyPriced)
+        val weighted = weightedAverage(
+            firstQty = normalPriced,
+            firstAvg = execution.averagePrice,
+            secondQty = safetyPriced,
+            secondAvg = execution.safetyFlattenAveragePrice,
+        )
+
+        if (observedPriced < observedClosed) {
+            UpstoxComplianceRegistry.setProtectionFault(
+                "LIVE SELL closed quantity has incomplete fill pricing; P&L reconciliation locked",
+            )
+        }
+
+        val callerFilled = observedPriced
+        val callerAverage = if (callerFilled > 0) weighted else 0.0
+        return execution.copy(
+            filledQuantity = callerFilled,
+            pendingQuantity = (reconciledTarget - callerFilled).coerceAtLeast(0),
+            averagePrice = callerAverage,
+            pricedQuantity = callerFilled,
+        )
     }
 
     private fun currentBrokerLongQuantity(instrumentKey: String): Int? = runCatching {
@@ -520,7 +594,7 @@ class UpstoxOrderClient(private val accessToken: String) {
 
     private fun awaitNetworkExecution(placement: Placement, timeoutMillis: Long): Execution {
         if (placement.orderIds.isEmpty() || placement.networkQuantity <= 0) {
-            return Execution(emptyList(), placement.networkQuantity, 0, 0, 0.0, emptyList())
+            return Execution(emptyList(), placement.networkQuantity, 0, 0, 0.0, emptyList(), pricedQuantity = 0)
         }
         val timeout = timeoutMillis.coerceIn(1_000L, 30_000L)
         val deadline = System.currentTimeMillis() + timeout
@@ -551,10 +625,11 @@ class UpstoxOrderClient(private val accessToken: String) {
         val preValue = if (preQty > 0 && placement.preFillAveragePrice > 0.0) {
             preQty * placement.preFillAveragePrice
         } else 0.0
-        val networkValue = if (networkQty > 0 && network.averagePrice > 0.0) {
-            networkQty * network.averagePrice
+        val networkPricedQty = network.pricedQuantity.coerceIn(0, networkQty)
+        val networkValue = if (networkPricedQty > 0 && network.averagePrice > 0.0) {
+            networkPricedQty * network.averagePrice
         } else 0.0
-        val pricedQty = (if (preValue > 0.0) preQty else 0) + (if (networkValue > 0.0) networkQty else 0)
+        val pricedQty = (if (preValue > 0.0) preQty else 0) + networkPricedQty
         val average = if (pricedQty > 0) (preValue + networkValue) / pricedQty else 0.0
         return Execution(
             orderIds = network.orderIds,
@@ -563,6 +638,7 @@ class UpstoxOrderClient(private val accessToken: String) {
             pendingQuantity = (expectedQuantity - total).coerceAtLeast(0),
             averagePrice = average,
             states = network.states,
+            pricedQuantity = pricedQty.coerceAtMost(total),
         )
     }
 
@@ -576,7 +652,15 @@ class UpstoxOrderClient(private val accessToken: String) {
             if (status.averagePrice > 0.0) status.filledQuantity.coerceAtLeast(0) else 0
         }
         val avg = if (pricedQty > 0) tradedValue / pricedQty else 0.0
-        return Execution(orderIds, requestedQuantity, filled, pending, avg, statuses)
+        return Execution(
+            orderIds = orderIds,
+            requestedQuantity = requestedQuantity,
+            filledQuantity = filled,
+            pendingQuantity = pending,
+            averagePrice = avg,
+            states = statuses,
+            pricedQuantity = pricedQty.coerceAtMost(filled),
+        )
     }
 
     private fun parseStatus(data: JSONObject, fallbackOrderId: String): Status = Status(

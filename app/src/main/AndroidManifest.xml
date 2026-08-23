@@ -28,6 +28,10 @@
             android:name=".OAuthLauncherActivity"
             android:exported="false" />
         <activity
+            android:name=".LiveRecoveryActivity"
+            android:exported="false"
+            android:label="VARDHANI LIVE RECOVERY" />
+        <activity
             android:name=".MetaBrainLabActivity"
             android:exported="true"
             android:label="VARDHANI AI LAB" />
@@ -45,9 +49,14 @@
             android:label="VARDHANI BACKTEST / LEGACY TOOLS" />
         <activity
             android:name=".VardhaniFullActivity"
-            android:exported="true"
+            android:exported="false"
             android:launchMode="singleTask"
             android:alwaysRetainTaskState="true"
+            android:label="VARDHANI" />
+        <activity
+            android:name=".VardhaniEntryActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
             android:label="VARDHANI">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

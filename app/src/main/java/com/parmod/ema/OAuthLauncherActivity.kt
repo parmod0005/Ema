@@ -33,10 +33,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.parmod.ema.data.LocalCredentialVault
 import com.parmod.ema.data.UpstoxOptionDiscoveryClient
 import com.parmod.ema.model.MarketIndex
 import kotlinx.coroutines.Dispatchers
@@ -50,16 +52,9 @@ class OAuthLauncherActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize()) {
                     OAuthScreen(
                         openBrowser = { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it))) },
-                        continueToApp = { token, expiry ->
-                            getSharedPreferences("ema_secure_session", MODE_PRIVATE)
-                                .edit()
-                                .putString("access_token", token)
-                                .putString("nearest_expiry", expiry)
-                                .apply()
-                            startActivity(Intent(this, MainActivity::class.java).apply {
-                                putExtra("access_token", token)
-                                putExtra("nearest_expiry", expiry)
-                            })
+                        continueToApp = { token ->
+                            LocalCredentialVault(this).updateUpstoxAccessToken(token)
+                            startActivity(Intent(this, VardhaniFullActivity::class.java))
                             finish()
                         },
                         copyToken = { token ->
@@ -77,53 +72,102 @@ class OAuthLauncherActivity : ComponentActivity() {
 @Composable
 private fun OAuthScreen(
     openBrowser: (String) -> Unit,
-    continueToApp: (String, String) -> Unit,
+    continueToApp: (String) -> Unit,
     copyToken: (String) -> Unit,
     loginVm: UpstoxLoginViewModel = viewModel(),
 ) {
     val login by loginVm.state.collectAsState()
-    var apiKey by remember { mutableStateOf("") }
-    var apiSecret by remember { mutableStateOf("") }
-    var redirectUri by remember { mutableStateOf("") }
+    val context = LocalContext.current
+    val vault = remember(context) { LocalCredentialVault(context) }
+    val saved = remember(vault) { vault.read() }
+    var apiKey by remember { mutableStateOf(saved.upstoxApiKey) }
+    var apiSecret by remember { mutableStateOf(saved.upstoxApiSecret) }
+    var redirectUri by remember { mutableStateOf(saved.upstoxRedirectUri) }
     var authCode by remember { mutableStateOf("") }
     var discoveredExpiry by remember { mutableStateOf("") }
     var discoveryMessage by remember { mutableStateOf("") }
 
     LaunchedEffect(login.accessToken) {
         val token = login.accessToken ?: return@LaunchedEffect
-        discoveryMessage = "Detecting nearest NIFTY expiry…"
+        vault.updateUpstoxAccessToken(token)
+        discoveryMessage = "Authenticated · checking NIFTY option discovery…"
         runCatching {
             withContext(Dispatchers.IO) {
                 UpstoxOptionDiscoveryClient(token).discover(MarketIndex.NIFTY).nearestExpiry
             }
         }.onSuccess {
             discoveredExpiry = it
-            discoveryMessage = "Nearest expiry: $it"
+            discoveryMessage = "Authenticated · NIFTY nearest expiry $it · full dashboard will discover selected markets"
         }.onFailure {
-            discoveryMessage = it.message ?: "Expiry discovery failed"
+            discoveryMessage = "Token created · option discovery will retry in the full dashboard: ${it.message.orEmpty()}"
         }
     }
 
-    Scaffold(topBar = { TopAppBar(title = { Text("EMA · Upstox Login") }) }) { padding ->
+    Scaffold(topBar = { TopAppBar(title = { Text("VARDHANI · Upstox OAuth") }) }) { padding ->
         Column(
             Modifier.fillMaxSize().padding(padding).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                    Text("Real Upstox OAuth", fontWeight = FontWeight.Bold)
-                    Text("Use the API key, API secret and exact redirect URI from your Upstox Developer App. Your Upstox password and TOTP are entered only on the hosted Upstox page.")
-                    OutlinedTextField(apiKey, { apiKey = it.trim() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("API key / Client ID") })
-                    OutlinedTextField(apiSecret, { apiSecret = it.trim() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("API secret / Client secret") }, visualTransformation = PasswordVisualTransformation())
-                    OutlinedTextField(redirectUri, { redirectUri = it.trim() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Registered redirect URI") })
-                    Button(
-                        onClick = { openBrowser(loginVm.authorizationUrl(apiKey, redirectUri)) },
-                        modifier = Modifier.fillMaxWidth(),
-                        enabled = apiKey.isNotBlank() && redirectUri.isNotBlank(),
-                    ) { Text("OPEN UPSTOX LOGIN") }
-                    OutlinedTextField(authCode, { authCode = it.trim() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Authorization code returned by Upstox") })
+                    Text("Upstox OAuth", fontWeight = FontWeight.Bold)
+                    Text(
+                        "API key, secret and redirect URI are loaded from the encrypted VARDHANI credential vault. Your Upstox password/TOTP stay on the hosted Upstox login page.",
+                    )
+                    OutlinedTextField(
+                        apiKey,
+                        { apiKey = it.trim() },
+                        Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("API key / Client ID") },
+                    )
+                    OutlinedTextField(
+                        apiSecret,
+                        { apiSecret = it.trim() },
+                        Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("API secret / Client secret") },
+                        visualTransformation = PasswordVisualTransformation(),
+                    )
+                    OutlinedTextField(
+                        redirectUri,
+                        { redirectUri = it.trim() },
+                        Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("Registered redirect URI") },
+                    )
                     Button(
                         onClick = {
+                            val old = vault.read()
+                            vault.save(
+                                old.copy(
+                                    upstoxApiKey = apiKey,
+                                    upstoxApiSecret = apiSecret,
+                                    upstoxRedirectUri = redirectUri,
+                                ),
+                            )
+                            openBrowser(loginVm.authorizationUrl(apiKey, redirectUri))
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = apiKey.isNotBlank() && redirectUri.isNotBlank(),
+                    ) { Text("SAVE + OPEN UPSTOX LOGIN") }
+                    OutlinedTextField(
+                        authCode,
+                        { authCode = it.trim() },
+                        Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("Authorization code returned by Upstox") },
+                    )
+                    Button(
+                        onClick = {
+                            val old = vault.read()
+                            vault.save(
+                                old.copy(
+                                    upstoxApiKey = apiKey,
+                                    upstoxApiSecret = apiSecret,
+                                    upstoxRedirectUri = redirectUri,
+                                ),
+                            )
                             loginVm.exchangeAuthorizationCode(authCode, apiKey, apiSecret, redirectUri) { }
                         },
                         modifier = Modifier.fillMaxWidth(),
@@ -138,15 +182,18 @@ private fun OAuthScreen(
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("Authenticated", fontWeight = FontWeight.Bold)
-                        Text("Token is held in app memory and private app storage; it is never committed to GitHub.")
+                        Text("Access token has been encrypted in the local VARDHANI vault. It is never committed to GitHub.")
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = { copyToken(token) }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 6.dp)) { Text("COPY TOKEN") }
-                            Button(
-                                onClick = { continueToApp(token, discoveredExpiry) },
+                            OutlinedButton(
+                                onClick = { copyToken(token) },
                                 modifier = Modifier.weight(1f),
-                                enabled = discoveredExpiry.isNotBlank(),
                                 contentPadding = PaddingValues(horizontal = 6.dp),
-                            ) { Text("START LIVE APP") }
+                            ) { Text("COPY TOKEN") }
+                            Button(
+                                onClick = { continueToApp(token) },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 6.dp),
+                            ) { Text("OPEN FULL VARDHANI") }
                         }
                     }
                 }

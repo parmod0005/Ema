@@ -98,19 +98,20 @@ class LiveExitAccountingTest {
     }
 
     @Test
-    fun `from execution subtracts appended safety states exactly once`() {
+    fun `from execution reads normalized priced normal plus safety closure exactly once`() {
         val normal = status("NORMAL", filled = 40, average = 115.0)
         val safety = status("SAFETY", filled = 60, average = 112.0)
         val execution = UpstoxOrderClient.Execution(
             orderIds = listOf("NORMAL", "SAFETY"),
             requestedQuantity = 40,
-            filledQuantity = 40,
+            filledQuantity = 100,
             pendingQuantity = 0,
-            averagePrice = 115.0,
+            averagePrice = 113.2,
             states = listOf(normal, safety),
             safetyFlattenedQuantity = 60,
             safetyFlattenAveragePrice = 112.0,
             brokerFlatAfterSafetyAction = true,
+            pricedQuantity = 100,
         )
 
         val result = LiveExitAccounting.fromExecution(100, execution)
@@ -129,10 +130,11 @@ class LiveExitAccountingTest {
         val execution = UpstoxOrderClient.Execution(
             orderIds = listOf("NORMAL"),
             requestedQuantity = 20,
-            filledQuantity = 20,
-            pendingQuantity = 0,
+            filledQuantity = 0,
+            pendingQuantity = 20,
             averagePrice = 0.0,
             states = listOf(unpriced),
+            pricedQuantity = 0,
         )
 
         val result = LiveExitAccounting.fromExecution(50, execution)

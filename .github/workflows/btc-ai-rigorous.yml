@@ -1,0 +1,43 @@
+name: BTC AI Rigorous Research
+on:
+  push:
+    paths:
+      - 'btc_ai_ci/**'
+      - '.github/workflows/btc-ai-rigorous.yml'
+  pull_request:
+    paths:
+      - 'btc_ai_ci/**'
+      - '.github/workflows/btc-ai-rigorous.yml'
+  workflow_dispatch:
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reconstruct research program
+        shell: bash
+        run: |
+          { cat btc_ai_ci/part1.b64; head -c 12000 btc_ai_ci/part2.b64; cat btc_ai_ci/part3.b64; } | base64 -d > btc_ai_ci/btc_ai_rigorous_full.py
+          python -m py_compile btc_ai_ci/btc_ai_rigorous_full.py
+          sha256sum btc_ai_ci/btc_ai_rigorous_full.py
+      - name: Install research stack
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scipy scikit-learn lightgbm xgboost catboost joblib requests tabulate
+      - name: Run maximum-history BTC research
+        run: python btc_ai_ci/btc_ai_rigorous_full.py
+      - name: Upload research results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btc-ai-rigorous-results
+          path: btc_ai_ci/btc_ai_results/
+          if-no-files-found: warn
+          retention-days: 30

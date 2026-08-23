@@ -6,8 +6,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import kotlin.math.floor
-import kotlin.math.max
-import kotlin.math.min
 
 /**
  * Single audited broker-order adapter for VARDHANI LIVE execution.
@@ -285,15 +283,14 @@ class UpstoxOrderClient(private val accessToken: String) {
         val brokerLongQuantity = rawBrokerQuantity.coerceAtLeast(0)
 
         val protectedQuantity = latestProtection?.quantity ?: 0
-        val reconciledPositionQuantity = max(requestedQuantity, protectedQuantity)
-        val missingFromBroker =
-            (reconciledPositionQuantity - brokerLongQuantity).coerceIn(0, requestedQuantity)
-        val actualSellQuantity =
-            min((requestedQuantity - missingFromBroker).coerceAtLeast(0), brokerLongQuantity)
-        val residualIfFilled = (brokerLongQuantity - actualSellQuantity).coerceAtLeast(0)
+        val sellPlan = SellReconciliation.plan(
+            requestedQuantity = requestedQuantity,
+            protectedQuantity = protectedQuantity,
+            brokerLongQuantity = brokerLongQuantity,
+        )
 
         val trigger = latestProtection?.triggerPrice ?: 0.0
-        if (residualIfFilled > 0 && trigger <= 0.0) {
+        if (sellPlan.residualBrokerLongIfFilled > 0 && trigger <= 0.0) {
             UpstoxComplianceRegistry.setProtectionFault(
                 "Partial LIVE exit requested while broker protection is missing or unpriced",
             )
@@ -302,8 +299,8 @@ class UpstoxOrderClient(private val accessToken: String) {
 
         val preFillAverage = latestProtection?.averageFillPrice?.takeIf { it > 0.0 } ?: 0.0
         return SellPreparation(
-            networkQuantity = actualSellQuantity,
-            preFilledQuantity = missingFromBroker,
+            networkQuantity = sellPlan.networkSellQuantity,
+            preFilledQuantity = sellPlan.preFilledQuantity,
             preFillAveragePrice = preFillAverage,
             protectionBeforeQuantity = brokerLongQuantity,
             protectionTriggerPrice = trigger,

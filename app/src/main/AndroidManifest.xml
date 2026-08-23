@@ -41,7 +41,12 @@
             android:label="VARDHANI RESEARCH BACKUP" />
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="false"
+            android:label="VARDHANI BACKTEST / LEGACY TOOLS" />
+        <activity
+            android:name=".VardhaniFullActivity"
+            android:exported="true"
+            android:label="VARDHANI">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

@@ -130,10 +130,18 @@ object TradingRecoveryRegistry {
         fragments[identity] = fragment
         val matching = records.values.firstOrNull { recordIdentity(it) == identity && it.status == TradeStatus.OPEN }
         if (matching != null) {
+            val safetyCriticalChange =
+                matching.currentQuantity != fragment.currentQuantity ||
+                    matching.target1Hit != fragment.target1Hit ||
+                    matching.lots != fragment.lots ||
+                    matching.lotSize != fragment.lotSize ||
+                    matching.instrumentKey != fragment.instrumentKey ||
+                    matching.realizedPartialPnl != fragment.realizedPartialPnl
             records[matching.key] = merge(matching, fragment)
-            // Price/stop copies can be produced many times per second. One durable snapshot
-            // per second is enough for crash recovery and avoids storage work on every tick.
-            persistLocked(force = false)
+            // Ordinary LTP/high/stop copies can occur many times per second and are
+            // throttled. Quantity, T1, contract and realized-partial changes must become
+            // durable immediately so a crash cannot resurrect already-exited exposure.
+            persistLocked(force = safetyCriticalChange)
         }
     }
 
@@ -190,7 +198,7 @@ object TradingRecoveryRegistry {
         }
         records[key] = record
         pruneLocked()
-        // Entries, partial/terminal trade-log changes and exits are safety-significant.
+        // Entries and terminal trade-log changes are safety-significant.
         persistLocked(force = true)
     }
 

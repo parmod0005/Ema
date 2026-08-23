@@ -48,16 +48,66 @@ data class FullMarketState(
         EngineId.ENGINE_3_V76_SCALPER -> copy(engine3 = value)
     }
 
+    /**
+     * A zero/negative-quantity LIVE position is never a valid active local position.
+     * The only audited path that can produce one is broker reconciliation proving the
+     * position flat after a safety action. Drop the phantom position immediately, close
+     * its trade row with unknown P&L, and engage the daily uncertainty lock rather than
+     * manufacturing an exit price from LTP/bid data.
+     */
+    private fun normalizeBrokerFlatLivePositions(): FullMarketState {
+        var normalized = this
+        EngineId.entries.forEach { engineId ->
+            val state = normalized.engine(engineId)
+            val position = state.position ?: return@forEach
+            if (position.executionMode != ExecutionMode.LIVE || position.quantity > 0) return@forEach
+
+            val now = System.currentTimeMillis()
+            val log = normalized.tradeLog.toMutableList()
+            val row = log.indexOfLast {
+                it.engineId == engineId &&
+                    it.status == TradeStatus.OPEN &&
+                    it.entryTimeMillis == position.openedAtMillis
+            }
+            if (row >= 0) {
+                log[row] = log[row].copy(
+                    status = TradeStatus.CLOSED,
+                    exitPrice = null,
+                    exitSpot = normalized.spotPrice.takeIf { it > 0.0 },
+                    exitTimeMillis = now,
+                    pnl = null,
+                    exitReason = "BROKER SAFETY FLAT · P&L UNPRICED",
+                )
+            }
+            LivePnlUncertaintyRegistry.clear(position)
+            normalized = normalized
+                .withEngine(
+                    engineId,
+                    state.copy(
+                        position = null,
+                        message = "BROKER SAFETY FLAT · local position cleared · P&L unpriced",
+                    ),
+                )
+                .copy(
+                    recoveredPnlUncertain = true,
+                    tradeLog = log,
+                    message = "LIVE broker-flat reconciliation · P&L uncertainty lock active",
+                )
+        }
+        return normalized
+    }
+
     fun withRiskPolicy(dailyLossLimitInr: Double): FullMarketState {
+        val normalized = normalizeBrokerFlatLivePositions()
         val decision = RiskLockPolicy.evaluate(
-            recoveredPnlUncertain = recoveredPnlUncertain,
-            realizedPnl = realizedPnl,
+            recoveredPnlUncertain = normalized.recoveredPnlUncertain,
+            realizedPnl = normalized.realizedPnl,
             dailyLossLimitInr = dailyLossLimitInr,
         )
-        return if (riskLocked == decision.locked && riskReason == decision.reason) {
-            this
+        return if (normalized.riskLocked == decision.locked && normalized.riskReason == decision.reason) {
+            normalized
         } else {
-            copy(riskLocked = decision.locked, riskReason = decision.reason)
+            normalized.copy(riskLocked = decision.locked, riskReason = decision.reason)
         }
     }
 }
@@ -95,6 +145,15 @@ data class FullDashboardState(
     fun market(index: MarketIndex): FullMarketState =
         markets.getValue(index).withRiskPolicy(riskConfig.dailyLossLimitInr)
 
-    fun withMarket(index: MarketIndex, value: FullMarketState): FullDashboardState =
-        copy(markets = markets + (index to value.withRiskPolicy(riskConfig.dailyLossLimitInr)))
+    fun withMarket(index: MarketIndex, value: FullMarketState): FullDashboardState {
+        val adjusted = value.withRiskPolicy(riskConfig.dailyLossLimitInr)
+        return copy(
+            markets = markets + (index to adjusted),
+            liveArmMode = if (executionMode == ExecutionMode.LIVE && adjusted.riskLocked) {
+                LiveArmMode.DISARMED
+            } else {
+                liveArmMode
+            },
+        )
+    }
 }

@@ -1,5 +1,8 @@
 package com.parmod.ema.model
 
+import com.parmod.ema.engine.AdaptiveExitEngine
+import kotlin.math.max
+
 /** Independent runtime/UI state for one index. */
 data class FullMarketState(
     val index: MarketIndex,
@@ -50,10 +53,12 @@ data class FullMarketState(
 
     /**
      * A zero/negative-quantity LIVE position is never a valid active local position.
-     * The only audited path that can produce one is broker reconciliation proving the
-     * position flat after a safety action. Drop the phantom position immediately, close
-     * its trade row with unknown P&L, and engage the daily uncertainty lock rather than
-     * manufacturing an exit price from LTP/bid data.
+     *
+     * UpstoxOrderClient exposes caller-visible SELL quantity only when its fill price is
+     * known. Therefore an unmarked zero-quantity position can be finalized with the P&L
+     * already accumulated in [PaperPosition.realizedPartialPnl]. If an earlier exit leg was
+     * explicitly marked uncertain, we close the local phantom but persist a null P&L and
+     * engage the uncertainty lock instead of manufacturing a historical price.
      */
     private fun normalizeBrokerFlatLivePositions(): FullMarketState {
         var normalized = this
@@ -62,6 +67,7 @@ data class FullMarketState(
             val position = state.position ?: return@forEach
             if (position.executionMode != ExecutionMode.LIVE || position.quantity > 0) return@forEach
 
+            val uncertain = LivePnlUncertaintyRegistry.isMarked(position)
             val now = System.currentTimeMillis()
             val log = normalized.tradeLog.toMutableList()
             val row = log.indexOfLast {
@@ -69,29 +75,69 @@ data class FullMarketState(
                     it.status == TradeStatus.OPEN &&
                     it.entryTimeMillis == position.openedAtMillis
             }
+
+            val finalizedPnl = if (uncertain) {
+                null
+            } else {
+                position.realizedPartialPnl - AdaptiveExitEngine.PAPER_ROUND_TRIP_COST_INR
+            }
+
             if (row >= 0) {
                 log[row] = log[row].copy(
                     status = TradeStatus.CLOSED,
                     exitPrice = null,
                     exitSpot = normalized.spotPrice.takeIf { it > 0.0 },
                     exitTimeMillis = now,
-                    pnl = null,
-                    exitReason = "BROKER SAFETY FLAT · P&L UNPRICED",
+                    pnl = finalizedPnl,
+                    exitReason = if (uncertain) {
+                        "BROKER SAFETY FLAT · P&L UNPRICED"
+                    } else {
+                        "BROKER SAFETY FLAT · PRICED RECONCILIATION"
+                    },
                 )
             }
+
+            val performance = if (finalizedPnl == null) {
+                state.performance
+            } else {
+                val old = state.performance
+                val realized = old.realizedPnl + finalizedPnl
+                val peak = max(old.peakEquity, realized)
+                val drawdown = (peak - realized).coerceAtLeast(0.0)
+                old.copy(
+                    trades = old.trades + 1,
+                    wins = old.wins + if (finalizedPnl > 0.0) 1 else 0,
+                    losses = old.losses + if (finalizedPnl < 0.0) 1 else 0,
+                    realizedPnl = realized,
+                    grossProfit = old.grossProfit + finalizedPnl.coerceAtLeast(0.0),
+                    grossLoss = old.grossLoss + (-finalizedPnl).coerceAtLeast(0.0),
+                    peakEquity = peak,
+                    maxDrawdown = max(old.maxDrawdown, drawdown),
+                )
+            }
+
             LivePnlUncertaintyRegistry.clear(position)
             normalized = normalized
                 .withEngine(
                     engineId,
                     state.copy(
                         position = null,
-                        message = "BROKER SAFETY FLAT · local position cleared · P&L unpriced",
+                        performance = performance,
+                        message = if (uncertain) {
+                            "BROKER SAFETY FLAT · local position cleared · P&L unpriced"
+                        } else {
+                            "BROKER SAFETY FLAT · priced closure finalized"
+                        },
                     ),
                 )
                 .copy(
-                    recoveredPnlUncertain = true,
+                    recoveredPnlUncertain = normalized.recoveredPnlUncertain || uncertain,
                     tradeLog = log,
-                    message = "LIVE broker-flat reconciliation · P&L uncertainty lock active",
+                    message = if (uncertain) {
+                        "LIVE broker-flat reconciliation · P&L uncertainty lock active"
+                    } else {
+                        "LIVE broker-flat reconciliation complete · LIVE disarmed"
+                    },
                 )
         }
         return normalized
@@ -146,10 +192,16 @@ data class FullDashboardState(
         markets.getValue(index).withRiskPolicy(riskConfig.dailyLossLimitInr)
 
     fun withMarket(index: MarketIndex, value: FullMarketState): FullDashboardState {
+        val brokerSafetyFlatTransition = value.engines.any {
+            it.position?.executionMode == ExecutionMode.LIVE && it.position.quantity <= 0
+        }
         val adjusted = value.withRiskPolicy(riskConfig.dailyLossLimitInr)
         return copy(
             markets = markets + (index to adjusted),
-            liveArmMode = if (executionMode == ExecutionMode.LIVE && adjusted.riskLocked) {
+            liveArmMode = if (
+                executionMode == ExecutionMode.LIVE &&
+                (adjusted.riskLocked || brokerSafetyFlatTransition)
+            ) {
                 LiveArmMode.DISARMED
             } else {
                 liveArmMode

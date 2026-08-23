@@ -18,7 +18,9 @@ import kotlin.math.min
  * - BUY fills are not returned to the runtime until an exchange-held SELL SL-M
  *   catastrophic stop has been accepted,
  * - VARDHANI protective stops are cancelled before a discretionary/adaptive SELL,
- * - partial exits re-arm protection for the remaining protected quantity,
+ * - partial exits re-arm protection using the broker's actual remaining long quantity,
+ * - if residual protection cannot be re-armed, a best-effort exact-quantity emergency
+ *   flatten is attempted and the protection fault remains latched,
  * - broker-side stop fills are reconciled before another SELL so VARDHANI does not
  *   blindly create a short position after its protection already fired.
  *
@@ -40,6 +42,7 @@ class UpstoxOrderClient(private val accessToken: String) {
         val preFillAveragePrice: Double = 0.0,
         val protectionBeforeQuantity: Int = 0,
         val protectionTriggerPrice: Double = 0.0,
+        val brokerLongBeforeQuantity: Int = 0,
         val protectAfterBuyFill: Boolean = false,
     ) {
         val orderId: String get() = orderIds.firstOrNull().orEmpty()
@@ -74,6 +77,9 @@ class UpstoxOrderClient(private val accessToken: String) {
         val pendingQuantity: Int,
         val averagePrice: Double,
         val states: List<Status>,
+        val safetyFlattenedQuantity: Int = 0,
+        val safetyFlattenAveragePrice: Double = 0.0,
+        val brokerFlatAfterSafetyAction: Boolean = false,
     ) {
         val fullyFilled: Boolean get() = filledQuantity >= requestedQuantity && requestedQuantity > 0
         val partiallyFilled: Boolean get() = filledQuantity in 1 until requestedQuantity
@@ -96,6 +102,7 @@ class UpstoxOrderClient(private val accessToken: String) {
         val preFillAveragePrice: Double,
         val protectionBeforeQuantity: Int,
         val protectionTriggerPrice: Double,
+        val brokerLongBeforeQuantity: Int,
     )
 
     fun placeMarketOrder(
@@ -114,7 +121,7 @@ class UpstoxOrderClient(private val accessToken: String) {
         val preparation = if (transactionType == TransactionType.SELL) {
             prepareSell(instrumentKey, quantity)
         } else {
-            SellPreparation(quantity, 0, 0.0, 0, 0.0)
+            SellPreparation(quantity, 0, 0.0, 0, 0.0, 0)
         }
 
         val raw = if (preparation.networkQuantity > 0) {
@@ -140,6 +147,7 @@ class UpstoxOrderClient(private val accessToken: String) {
             preFillAveragePrice = preparation.preFillAveragePrice,
             protectionBeforeQuantity = preparation.protectionBeforeQuantity,
             protectionTriggerPrice = preparation.protectionTriggerPrice,
+            brokerLongBeforeQuantity = preparation.brokerLongBeforeQuantity,
             protectAfterBuyFill = transactionType == TransactionType.BUY,
         )
     }
@@ -165,7 +173,7 @@ class UpstoxOrderClient(private val accessToken: String) {
     /**
      * Reconciles every order returned by Upstox auto-slicing. On timeout, all non-terminal
      * slices are cancelled and one final status snapshot is returned. BUY executions are
-     * then protected at the broker; SELL executions re-arm the remaining protective quantity.
+     * then protected at the broker; SELL executions re-arm the actual broker residual.
      */
     fun awaitExecution(
         placement: Placement,
@@ -174,7 +182,7 @@ class UpstoxOrderClient(private val accessToken: String) {
     ): Execution {
         require(expectedQuantity > 0)
         val networkExecution = awaitNetworkExecution(placement, timeoutMillis)
-        var combined = combinePreFill(placement, expectedQuantity, networkExecution)
+        val combined = combinePreFill(placement, expectedQuantity, networkExecution)
 
         if (placement.transactionType == TransactionType.BUY && placement.protectAfterBuyFill && combined.filledQuantity > 0) {
             val entryAverage = combined.averagePrice.takeIf { it > 0.0 }
@@ -191,8 +199,6 @@ class UpstoxOrderClient(private val accessToken: String) {
             )
             if (!protected) {
                 UpstoxComplianceRegistry.setProtectionFault("Could not arm exchange-held stop after LIVE BUY")
-                // Best-effort immediate flatten. If fully flattened, report zero live exposure
-                // so the caller will reject the entry and never create a local position.
                 val emergency = runCatching {
                     emergencyRawSell(placement.instrumentKey, combined.filledQuantity)
                 }.getOrNull()
@@ -203,6 +209,9 @@ class UpstoxOrderClient(private val accessToken: String) {
                         averagePrice = 0.0,
                         orderIds = combined.orderIds + emergency.orderIds,
                         states = combined.states + emergency.states,
+                        safetyFlattenedQuantity = emergency.filledQuantity,
+                        safetyFlattenAveragePrice = emergency.averagePrice,
+                        brokerFlatAfterSafetyAction = true,
                     )
                 }
             } else {
@@ -211,14 +220,22 @@ class UpstoxOrderClient(private val accessToken: String) {
         }
 
         if (placement.transactionType == TransactionType.SELL && placement.protectionBeforeQuantity > 0) {
-            val remaining = (placement.protectionBeforeQuantity - combined.filledQuantity).coerceAtLeast(0)
+            val fallbackRemaining =
+                (placement.brokerLongBeforeQuantity - networkExecution.filledQuantity).coerceAtLeast(0)
+            val remaining = currentBrokerLongQuantity(placement.instrumentKey) ?: fallbackRemaining
             if (remaining > 0) {
                 val trigger = placement.protectionTriggerPrice.takeIf { it > 0.0 }
                 if (trigger == null || !armProtectionWithRetry(placement.instrumentKey, remaining, trigger)) {
-                    UpstoxComplianceRegistry.setProtectionFault("Could not re-arm protective stop after partial LIVE exit")
-                } else {
-                    UpstoxComplianceRegistry.clearProtectionFault()
+                    UpstoxComplianceRegistry.setProtectionFault(
+                        "Could not re-arm protective stop after partial LIVE exit; emergency flatten required",
+                    )
+                    return emergencyFlattenResidual(
+                        placement = placement,
+                        combined = combined,
+                        trigger = trigger,
+                    )
                 }
+                UpstoxComplianceRegistry.clearProtectionFault()
             } else {
                 UpstoxComplianceRegistry.clearProtectionFault()
             }
@@ -260,14 +277,27 @@ class UpstoxOrderClient(private val accessToken: String) {
         }
 
         val brokerPosition = UpstoxRecoveryClient(accessToken).positionFor(instrumentKey)
-        val brokerLongQuantity = (brokerPosition?.quantity ?: 0).coerceAtLeast(0)
-        val missingFromBroker = (requestedQuantity - brokerLongQuantity).coerceIn(0, requestedQuantity)
-        val actualSellQuantity = min(requestedQuantity - missingFromBroker, brokerLongQuantity).coerceAtLeast(0)
+        val rawBrokerQuantity = brokerPosition?.quantity ?: 0
+        if (rawBrokerQuantity < 0) {
+            UpstoxComplianceRegistry.setProtectionFault("Unexpected broker short position detected during LIVE exit")
+            error("LIVE exit blocked because broker position is unexpectedly short")
+        }
+        val brokerLongQuantity = rawBrokerQuantity.coerceAtLeast(0)
 
-        val protectionBefore = latestProtection?.quantity ?: 0
-        if (actualSellQuantity < brokerLongQuantity && protectionBefore <= 0) {
-            UpstoxComplianceRegistry.setProtectionFault("Partial LIVE exit requested while broker protection is missing")
-            error("Partial LIVE exit blocked because no VARDHANI protective stop is active")
+        val protectedQuantity = latestProtection?.quantity ?: 0
+        val reconciledPositionQuantity = max(requestedQuantity, protectedQuantity)
+        val missingFromBroker =
+            (reconciledPositionQuantity - brokerLongQuantity).coerceIn(0, requestedQuantity)
+        val actualSellQuantity =
+            min((requestedQuantity - missingFromBroker).coerceAtLeast(0), brokerLongQuantity)
+        val residualIfFilled = (brokerLongQuantity - actualSellQuantity).coerceAtLeast(0)
+
+        val trigger = latestProtection?.triggerPrice ?: 0.0
+        if (residualIfFilled > 0 && trigger <= 0.0) {
+            UpstoxComplianceRegistry.setProtectionFault(
+                "Partial LIVE exit requested while broker protection is missing or unpriced",
+            )
+            error("Partial LIVE exit blocked because residual quantity cannot be protected")
         }
 
         val preFillAverage = latestProtection?.averageFillPrice?.takeIf { it > 0.0 } ?: 0.0
@@ -275,8 +305,9 @@ class UpstoxOrderClient(private val accessToken: String) {
             networkQuantity = actualSellQuantity,
             preFilledQuantity = missingFromBroker,
             preFillAveragePrice = preFillAverage,
-            protectionBeforeQuantity = max(protectionBefore, requestedQuantity),
-            protectionTriggerPrice = latestProtection?.triggerPrice ?: 0.0,
+            protectionBeforeQuantity = brokerLongQuantity,
+            protectionTriggerPrice = trigger,
+            brokerLongBeforeQuantity = brokerLongQuantity,
         )
     }
 
@@ -331,6 +362,79 @@ class UpstoxOrderClient(private val accessToken: String) {
             if (attempt < PROTECTION_RETRIES - 1) Thread.sleep(200L * (attempt + 1))
         }
         return false
+    }
+
+    private fun emergencyFlattenResidual(
+        placement: Placement,
+        combined: Execution,
+        trigger: Double?,
+    ): Execution {
+        var result = combined
+        repeat(EMERGENCY_FLATTEN_RETRIES) {
+            val remaining = currentBrokerLongQuantity(placement.instrumentKey) ?: return@repeat
+            if (remaining <= 0) {
+                return result.copy(brokerFlatAfterSafetyAction = true)
+            }
+            val emergency = runCatching {
+                emergencyRawSell(placement.instrumentKey, remaining)
+            }.getOrNull() ?: return@repeat
+            result = result.copy(
+                orderIds = result.orderIds + emergency.orderIds,
+                states = result.states + emergency.states,
+                safetyFlattenedQuantity = result.safetyFlattenedQuantity + emergency.filledQuantity,
+                safetyFlattenAveragePrice = weightedAverage(
+                    firstQty = result.safetyFlattenedQuantity,
+                    firstAvg = result.safetyFlattenAveragePrice,
+                    secondQty = emergency.filledQuantity,
+                    secondAvg = emergency.averagePrice,
+                ),
+            )
+            val after = currentBrokerLongQuantity(placement.instrumentKey)
+            if (after == 0) {
+                return result.copy(brokerFlatAfterSafetyAction = true)
+            }
+        }
+
+        val residual = currentBrokerLongQuantity(placement.instrumentKey)
+        if (residual != null && residual > 0 && trigger != null && trigger > 0.0) {
+            if (armProtectionWithRetry(placement.instrumentKey, residual, trigger)) {
+                UpstoxComplianceRegistry.setProtectionFault(
+                    "Protection re-arm failed during partial exit; emergency reduction executed and residual re-protected. LIVE entries remain locked",
+                )
+            } else {
+                UpstoxComplianceRegistry.setProtectionFault(
+                    "Protection re-arm and emergency flatten both incomplete; residual LIVE exposure remains",
+                )
+            }
+        } else if (residual == 0) {
+            return result.copy(brokerFlatAfterSafetyAction = true)
+        } else {
+            UpstoxComplianceRegistry.setProtectionFault(
+                "Protection re-arm failed and broker residual could not be verified",
+            )
+        }
+        return result
+    }
+
+    private fun currentBrokerLongQuantity(instrumentKey: String): Int? = runCatching {
+        val quantity = UpstoxRecoveryClient(accessToken).positionFor(instrumentKey)?.quantity ?: 0
+        if (quantity < 0) {
+            UpstoxComplianceRegistry.setProtectionFault("Unexpected broker short position detected during reconciliation")
+            error("Unexpected broker short position")
+        }
+        quantity
+    }.getOrNull()
+
+    private fun weightedAverage(
+        firstQty: Int,
+        firstAvg: Double,
+        secondQty: Int,
+        secondAvg: Double,
+    ): Double {
+        val q1 = if (firstQty > 0 && firstAvg > 0.0) firstQty else 0
+        val q2 = if (secondQty > 0 && secondAvg > 0.0) secondQty else 0
+        val total = q1 + q2
+        return if (total > 0) ((q1 * firstAvg) + (q2 * secondAvg)) / total else 0.0
     }
 
     private fun catastrophicStop(entryPrice: Double, entryTag: String): Double {
@@ -540,6 +644,7 @@ class UpstoxOrderClient(private val accessToken: String) {
         )
         private const val PROTECTION_TAG_PREFIX = "VRD-PSL-"
         private const val PROTECTION_RETRIES = 3
+        private const val EMERGENCY_FLATTEN_RETRIES = 2
         private const val DEFAULT_TICK_SIZE = 0.05
         private const val PLACE_ORDER_V3 = "https://api-hft.upstox.com/v3/order/place"
         private const val CANCEL_ORDER_V3 = "https://api-hft.upstox.com/v3/order/cancel"

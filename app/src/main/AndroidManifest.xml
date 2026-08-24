@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+    <application
+        android:name=".VardhaniApplication"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:usesCleartextTraffic="false"
+        android:icon="@drawable/vardhani_logo"
+        android:roundIcon="@drawable/vardhani_logo"
+        android:label="VARDHANI"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.EMA">
+        <service
+            android:name=".service.VardhaniMarketService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
+        <activity
+            android:name=".OAuthLauncherActivity"
+            android:exported="false" />
+        <activity
+            android:name=".LiveRecoveryActivity"
+            android:exported="false"
+            android:label="VARDHANI LIVE RECOVERY" />
+        <activity
+            android:name=".MetaBrainLabActivity"
+            android:exported="true"
+            android:label="VARDHANI AI LAB" />
+        <activity
+            android:name=".HistoricalDataActivity"
+            android:exported="true"
+            android:label="VARDHANI HISTORICAL DATA" />
+        <activity
+            android:name=".ResearchArchiveActivity"
+            android:exported="true"
+            android:label="VARDHANI RESEARCH BACKUP" />
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:label="VARDHANI BACKTEST / LEGACY TOOLS" />
+        <activity
+            android:name=".VardhaniFullActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:alwaysRetainTaskState="true"
+            android:label="VARDHANI" />
+        <activity
+            android:name=".VardhaniEntryActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:label="VARDHANI">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

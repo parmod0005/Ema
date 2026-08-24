@@ -1,0 +1,144 @@
+package com.parmod.ema
+
+import android.content.Intent
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.dp
+import com.parmod.ema.data.LocalCredentialVault
+import com.parmod.ema.model.UpstoxComplianceRegistry
+
+@Composable
+fun UpstoxCredentialsPanel(onAccessTokenSaved: (String) -> Unit) {
+    val context = LocalContext.current
+    val vault = remember(context) { LocalCredentialVault(context) }
+    val initial = remember(vault) { vault.read() }
+
+    var apiKey by remember { mutableStateOf(initial.upstoxApiKey) }
+    var apiSecret by remember { mutableStateOf(initial.upstoxApiSecret) }
+    var redirectUri by remember { mutableStateOf(initial.upstoxRedirectUri) }
+    var algoName by remember { mutableStateOf(initial.upstoxAlgoName) }
+    var expanded by remember { mutableStateOf(false) }
+    var reveal by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf("") }
+
+    fun saveCredentials() {
+        val old = vault.read()
+        vault.save(
+            old.copy(
+                upstoxApiKey = apiKey,
+                upstoxApiSecret = apiSecret,
+                upstoxRedirectUri = redirectUri,
+                upstoxAlgoName = algoName,
+            ),
+        )
+        UpstoxComplianceRegistry.configureAlgoName(algoName)
+        onAccessTokenSaved(old.upstoxAccessToken)
+        reveal = false
+        message = "Upstox credentials / Algo Name encrypted and saved"
+    }
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Column(Modifier.weight(1f)) {
+                    Text("UPSTOX APP CREDENTIALS", fontWeight = FontWeight.Bold)
+                    Text(
+                        if (apiKey.isNotBlank() && apiSecret.isNotBlank()) {
+                            "API credentials saved · AUTO LIVE Algo Name ${if (algoName.isBlank()) "NOT SET" else "SET"}"
+                        } else {
+                            "API key, secret, redirect URI, Algo Name + OAuth workflow"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                OutlinedButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "CLOSE" else "EDIT")
+                }
+            }
+
+            if (expanded) {
+                Text(
+                    "Values are encrypted with Android Keystore. Upstox password/TOTP are entered only on Upstox's hosted login page. AUTO LIVE also requires the exact Algo Name configured/approved for your Upstox Algo App; static-IP registration is checked again before an order is sent.",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+                CredentialField("Upstox API key", apiKey, reveal) { apiKey = it.trim() }
+                CredentialField("Upstox API secret", apiSecret, reveal) { apiSecret = it.trim() }
+                OutlinedTextField(
+                    value = redirectUri,
+                    onValueChange = { redirectUri = it.trim() },
+                    label = { Text("Upstox redirect URI") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = algoName,
+                    onValueChange = { algoName = it.trim() },
+                    label = { Text("Upstox Algo Name · required for AUTO LIVE") },
+                    supportingText = { Text("Use the exact configured Algo Name; do not invent one.") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = { reveal = !reveal },
+                        modifier = Modifier.weight(1f),
+                    ) { Text(if (reveal) "HIDE" else "REVEAL") }
+                    Button(
+                        onClick = {
+                            saveCredentials()
+                            expanded = false
+                        },
+                        enabled = apiKey.isNotBlank() || apiSecret.isNotBlank() || redirectUri.isNotBlank() || algoName.isNotBlank(),
+                        modifier = Modifier.weight(1f),
+                    ) { Text("SAVE") }
+                }
+                Button(
+                    onClick = {
+                        saveCredentials()
+                        context.startActivity(Intent(context, OAuthLauncherActivity::class.java))
+                    },
+                    enabled = apiKey.isNotBlank() && apiSecret.isNotBlank() && redirectUri.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("OPEN UPSTOX OAUTH LOGIN") }
+            }
+
+            if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+@Composable
+private fun CredentialField(
+    label: String,
+    value: String,
+    reveal: Boolean,
+    onValueChange: (String) -> Unit,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        visualTransformation = if (reveal) VisualTransformation.None else PasswordVisualTransformation(),
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+    )
+}

@@ -1,0 +1,53 @@
+name: Deploy VARDHANI Bridge
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate deployment secrets
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.VARDHANI_DEPLOY_HOOK_URL }}
+          BRIDGE_BASE_URL: ${{ secrets.VARDHANI_BRIDGE_BASE_URL }}
+          DEVICE_TOKEN: ${{ secrets.VARDHANI_DEVICE_TOKEN }}
+        run: |
+          test -n "$DEPLOY_HOOK_URL" || (echo 'Missing VARDHANI_DEPLOY_HOOK_URL' && exit 1)
+          test -n "$BRIDGE_BASE_URL" || (echo 'Missing VARDHANI_BRIDGE_BASE_URL' && exit 1)
+          test -n "$DEVICE_TOKEN" || (echo 'Missing VARDHANI_DEVICE_TOKEN' && exit 1)
+          case "$BRIDGE_BASE_URL" in https://*) ;; *) echo 'Bridge URL must use HTTPS'; exit 1;; esac
+
+      - name: Trigger deployment
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.VARDHANI_DEPLOY_HOOK_URL }}
+        run: curl --fail --silent --show-error --max-time 30 -X POST "$DEPLOY_HOOK_URL"
+
+      - name: Wait for bridge health
+        env:
+          BRIDGE_BASE_URL: ${{ secrets.VARDHANI_BRIDGE_BASE_URL }}
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --max-time 10 "$BRIDGE_BASE_URL/v1/health" > health.json; then
+              python - <<'PY'
+import json
+health = json.load(open('health.json', encoding='utf-8'))
+assert health.get('paperOnly') is True, health
+assert health.get('ok') is True, health
+print('Bridge health verified:', health)
+PY
+              exit 0
+            fi
+            echo "Waiting for deployment ($attempt/30)…"
+            sleep 10
+          done
+          echo 'Bridge did not become healthy in time'
+          exit 1
+
+      - name: Run production smoke test
+        env:
+          VARDHANI_BRIDGE_URL: ${{ secrets.VARDHANI_BRIDGE_BASE_URL }}
+          VARDHANI_DEVICE_TOKEN: ${{ secrets.VARDHANI_DEVICE_TOKEN }}
+        run: python bridge/scripts/smoke_test.py

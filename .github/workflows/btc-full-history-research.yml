@@ -1,0 +1,48 @@
+name: BTC Full History AI Research
+
+on:
+  push:
+    branches: [btc-full-research-20260824]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests scikit-learn pyarrow tabulate
+      - name: Cache Binance archives
+        uses: actions/cache@v4
+        with:
+          path: btc_full_research/cache
+          key: btcusdt-um-1m-full-20260824-v1
+      - name: Run research
+        run: python btc_full_research/run_full_research.py
+      - name: Package
+        if: always()
+        run: |
+          cd btc_full_research
+          zip -r BTC_FULL_HISTORY_AI_RESULTS.zip results || true
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BTC_FULL_HISTORY_AI_RESULTS
+          path: |
+            btc_full_research/BTC_FULL_HISTORY_AI_RESULTS.zip
+            btc_full_research/results/REPORT.md
+            btc_full_research/results/STRICT_SURVIVORS.csv
+            btc_full_research/results/ranking.csv
+            btc_full_research/results/dataset_summary.json
+          retention-days: 14

@@ -11,6 +11,6 @@ permissions:
 
 jobs:
   probe:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
-      - run: echo "Public GitHub runner OK"
+      - run: echo "Public GitHub slim runner OK"

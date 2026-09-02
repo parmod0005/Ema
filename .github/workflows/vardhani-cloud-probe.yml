@@ -1,0 +1,16 @@
+name: VARDHANI Public Runner Probe
+
+on:
+  push:
+    branches: [vardhani-cloud-probe]
+    paths:
+      - '.github/workflows/vardhani-cloud-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Public GitHub runner OK"

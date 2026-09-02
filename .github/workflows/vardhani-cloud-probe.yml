@@ -1,0 +1,12 @@
+name: Vardhani Cloud Probe
+on:
+  push:
+    branches:
+      - vardhani-cloud-build-v1.6.1
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe
+        run: echo "Vardhani cloud runner is available"

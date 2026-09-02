@@ -11,6 +11,6 @@ permissions:
 
 jobs:
   probe:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - run: echo "Public GitHub runner OK"

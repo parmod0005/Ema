@@ -7,6 +7,9 @@ import verify_corpus_recovery as gate
 import verify_corpus_recovery_v2 as gate_v2
 
 
+HASH64 = "0" * 64
+
+
 class RecoveryContractTests(unittest.TestCase):
     def candle(self, minute: int, *, close: float = 100.0, high: float = 101.0, low: float = 99.0, date: str = "2024-12-30"):
         # 09:15 IST = 03:45 UTC; only relative one-minute spacing matters here.
@@ -22,6 +25,41 @@ class RecoveryContractTests(unittest.TestCase):
             volume=10.0,
             oi=100.0,
         )
+
+    def valid_r3_report(self) -> dict:
+        return {
+            "format": "VARDHANI_SPECIALIST_R3_SPLIT_REPORT_V2",
+            "configured_train_cutoff": gate.R3_TRAIN_CUTOFF,
+            "configured_validation_start": gate.R3_VALIDATION_START,
+            "configured_validation_end": gate.R3_VALIDATION_END,
+            "train_min_exchange_date": "2024-09-20",
+            "train_max_exchange_date": "2024-12-31",
+            "validation_min_exchange_date": "2025-01-02",
+            "validation_max_exchange_date": "2025-04-17",
+            "contains_2025_training_rows": False,
+            "contains_2026_training_rows": False,
+            "contains_2026_validation_rows": False,
+            "contains_pre_2025_validation_rows": False,
+            "sealed_2026": True,
+            "execution_authority": False,
+            "source_canonical_row_stream_sha256": HASH64,
+            "source_split_counts": {"train": 1, "validation": 1, "test": 1},
+            "projected_split_counts": {"r3_train": 1, "r3_validation": 1},
+            "counters": {
+                "source_rows": 3,
+                "train_rows": 1,
+                "validation_rows": 1,
+                "train_2025_rows": 0,
+                "train_2026_or_later_rows": 0,
+                "validation_pre_2025_rows": 0,
+                "validation_2026_or_later_rows": 0,
+                "sealed_2026_rows_rejected": 0,
+            },
+            "outputs": {
+                "options_train_through_2024.ndjson": {"sha256": HASH64, "canonical_row_stream_sha256": HASH64},
+                "options_validation_2025.ndjson": {"sha256": HASH64, "canonical_row_stream_sha256": HASH64},
+            },
+        }
 
     def test_29_expiry_split_is_original_20_4_5(self):
         expiries = [f"2025-01-{i:02d}" for i in range(1, 30)]
@@ -61,41 +99,27 @@ class RecoveryContractTests(unittest.TestCase):
         self.assertEqual(q.disposition, "REJECT_INVALID")
 
     def test_r3_chronology_accepts_trading_day_bounds(self):
-        report = {
-            "format": "VARDHANI_SPECIALIST_R3_SPLIT_REPORT_V1",
-            "configured_train_cutoff": gate.R3_TRAIN_CUTOFF,
-            "configured_validation_start": gate.R3_VALIDATION_START,
-            "configured_validation_end": gate.R3_VALIDATION_END,
-            "train_min_exchange_date": "2024-09-20",
-            "train_max_exchange_date": "2024-12-31",
-            "validation_min_exchange_date": "2025-01-02",
-            "validation_max_exchange_date": "2025-04-17",
-            "contains_2025_training_rows": False,
-            "contains_2026_training_rows": False,
-            "contains_2026_validation_rows": False,
-            "sealed_2026": True,
-            "counters": {"train_rows": 1, "validation_rows": 1, "sealed_2026_rows_rejected": 0},
-        }
-        self.assertEqual(gate_v2.compare_r3_split_report_v2(report), [])
+        self.assertEqual(gate_v2.compare_r3_split_report_v2(self.valid_r3_report()), [])
 
-    def test_r3_chronology_rejects_2025_training(self):
-        report = {
-            "format": "VARDHANI_SPECIALIST_R3_SPLIT_REPORT_V1",
-            "configured_train_cutoff": gate.R3_TRAIN_CUTOFF,
-            "configured_validation_start": gate.R3_VALIDATION_START,
-            "configured_validation_end": gate.R3_VALIDATION_END,
-            "train_min_exchange_date": "2024-09-20",
-            "train_max_exchange_date": "2025-01-02",
-            "validation_min_exchange_date": "2025-01-02",
-            "validation_max_exchange_date": "2025-04-17",
-            "contains_2025_training_rows": True,
-            "contains_2026_training_rows": False,
-            "contains_2026_validation_rows": False,
-            "sealed_2026": True,
-            "counters": {"train_rows": 1, "validation_rows": 1, "sealed_2026_rows_rejected": 0},
-        }
+    def test_r3_chronology_rejects_measured_2025_training(self):
+        report = self.valid_r3_report()
+        report["train_max_exchange_date"] = "2025-01-02"
+        report["contains_2025_training_rows"] = True
+        report["counters"]["train_2025_rows"] = 1
         failures = gate_v2.compare_r3_split_report_v2(report)
         self.assertTrue(any("2025" in f or "exceeds" in f for f in failures))
+
+    def test_r3_chronology_rejects_missing_row_hash(self):
+        report = self.valid_r3_report()
+        report["source_canonical_row_stream_sha256"] = None
+        failures = gate_v2.compare_r3_split_report_v2(report)
+        self.assertTrue(any("row-stream" in f for f in failures))
+
+    def test_r3_chronology_rejects_count_reconciliation_error(self):
+        report = self.valid_r3_report()
+        report["projected_split_counts"]["r3_train"] = 2
+        failures = gate_v2.compare_r3_split_report_v2(report)
+        self.assertTrue(any("reconcile" in f for f in failures))
 
 
 if __name__ == "__main__":

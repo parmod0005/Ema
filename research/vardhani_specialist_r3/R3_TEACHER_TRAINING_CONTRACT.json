@@ -1,0 +1,163 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_TEACHER_TRAINING_CONTRACT_V1",
+  "status": "PRECOMMITTED_LOCKED_WAITING_FOR_RECOVERY_AND_ARCHITECTURE_BYTES",
+  "purpose": "Train the high-capacity off-device VARDHANI specialist teacher only after exact corpus recovery and architecture identity are proven. This contract has no promotion or execution authority.",
+  "teacher_identity": {
+    "name": "VARDHANI_SPECIALIST_R3_TEACHER_568M_FAMILY",
+    "role": "off-device teacher only",
+    "capacity_target": "approximately 568M parameters as defined by the sealed V0.2 architecture; exact parameter count must come from the immutable architecture manifest",
+    "architecture_manifest_required": true,
+    "architecture_manifest_format": "VARDHANI_SPECIALIST_R3_ARCHITECTURE_MANIFEST_V1",
+    "architecture_manifest_sha256_predeclared": false,
+    "rule": "No architecture hash or exact parameter count may be invented. Optimizer start is forbidden until the actual architecture manifest and referenced source files are present and hash-verified."
+  },
+  "required_unlock": {
+    "token_filename": "R3_TEACHER_UNLOCK_TOKEN.json",
+    "token_format": "VARDHANI_SPECIALIST_R3_TEACHER_UNLOCK_TOKEN_V1",
+    "required_status": "TEACHER_HISTORICAL_TRAINING_UNLOCKED_ONLY",
+    "prospective_authority": false,
+    "promotion_authority": false,
+    "execution_authority": false
+  },
+  "chronology": {
+    "development_train_end": "2024-12-31",
+    "validation_start": "2025-01-01",
+    "validation_end": "2025-12-31",
+    "sealed_2026": true,
+    "rule": "All optimizer gradients, normalization fits, class/target statistics, prototype selection and episodic-memory fitting must use development data dated no later than 2024-12-31. 2025 may be read only by evaluation/calibration procedures explicitly marked validation-only and may never update teacher weights. 2026 is not readable by the historical teacher pipeline."
+  },
+  "full_market_experience": {
+    "required": true,
+    "markets": ["NIFTY", "SENSEX"],
+    "base_clock": "observed one-minute exchange timestamps",
+    "training_period": "2022-01-01 through 2024-12-31, observed rows only",
+    "validation_period": "2025-01-01 through 2025-12-31, observed rows only",
+    "minimum_streams": [
+      "NIFTY one-minute OHLC",
+      "SENSEX one-minute OHLC",
+      "India VIX causally available state when genuine archived data exists",
+      "forming and completed 3m state reconstructed causally",
+      "forming and completed 5m state reconstructed causally",
+      "forming and completed 15m context reconstructed causally",
+      "session/time/gap/overnight/weekend state",
+      "cross-index synchronized state only at timestamps causally available for both indices"
+    ],
+    "future_mutation_gate_required": true,
+    "no_positional_future_shift": true,
+    "no_synthetic_candles": true
+  },
+  "modality_contract": {
+    "nifty_underlying": {
+      "historical": "GENUINE",
+      "allowed": true,
+      "index_volume": "NOT_USED_AS_GENUINE_VOLUME",
+      "index_oi": "NOT_USED_AS_GENUINE_OI"
+    },
+    "sensex_underlying": {
+      "historical": "GENUINE",
+      "allowed": true,
+      "index_volume": "NOT_USED_AS_GENUINE_VOLUME",
+      "index_oi": "NOT_USED_AS_GENUINE_OI"
+    },
+    "india_vix": {
+      "allowed": true,
+      "rule": "Use exact or causally as-of genuine archived VIX state only. If unavailable at a timestamp, set the VIX modality-present mask false; never backfill from future values."
+    },
+    "nifty_options": {
+      "allowed": true,
+      "source": "reconstructed aiml-historical-option-row-v1 plus genuine raw option OHLC/volume/OI where required",
+      "rule": "Attach only at exact timestamps where genuine option state is available. Earlier market history without genuine options remains valid full-market experience with option_present=false.",
+      "historical_bid_ask": false,
+      "historical_depth": false,
+      "historical_greeks": false
+    },
+    "sensex_options": {
+      "allowed": false,
+      "status": "SOURCE_UNAVAILABLE_NOT_FABRICATED"
+    },
+    "historical_d30": {
+      "allowed": false,
+      "status": "NOT_PRESENT_NOT_RECONSTRUCTED"
+    },
+    "pcr": {
+      "allowed_only_if_derived_from_genuine_archived_option_oi": true,
+      "rule": "Any derived PCR must identify its actual archived contract universe. A partial/local CE/PE OI ratio may not be labelled as full-market PCR. Missing coverage is masked, not synthesized."
+    },
+    "liquidity": {
+      "allowed_proxies": ["genuine option traded volume", "genuine option OI", "causal activity/turnover proxies derived from genuine bars"],
+      "forbidden_claims": ["historical spread when absent", "historical order-book depth when absent", "historical microprice when absent"]
+    }
+  },
+  "multi_timeframe_authority": {
+    "lower_timeframes": ["1m", "3m", "5m"],
+    "context_timeframe": "15m",
+    "15m_direct_action_veto": false,
+    "rule": "15m may enrich context/state interpretation but may not become a mechanical veto that overrides lower-timeframe judgement. Any action head path from a separately isolated 15m context branch must satisfy the precommitted architecture contract and non-veto audit."
+  },
+  "teacher_learning_targets": [
+    "latent market-state representation",
+    "current regime distribution",
+    "regime age and transition state",
+    "next-regime distribution",
+    "direction distribution",
+    "future return distributions for 1m/3m/5m/10m/15m where exact targets are valid",
+    "MFE and MAE distributions",
+    "target-before-stop probability under separately versioned economic definitions",
+    "continuation probability",
+    "reversal probability",
+    "breakout/breakdown acceptance probability",
+    "failed-break probability",
+    "range/chop/no-trade probability",
+    "volatility state and transition",
+    "NIFTY-SENSEX causal relationship state",
+    "NIFTY CE/PE relative-behavior state where genuine options exist",
+    "uncertainty and disagreement representation",
+    "historical analogue embedding suitable for episodic retrieval"
+  ],
+  "loss_and_optimizer_governance": {
+    "exact_loss_weights_required_from_architecture_manifest": true,
+    "exact_optimizer_config_required_from_architecture_manifest": true,
+    "deterministic_seed_set_required": true,
+    "train_only_normalization": true,
+    "train_only_target_statistics": true,
+    "validation_gradients_forbidden": true,
+    "validation_optimizer_steps": 0,
+    "2026_optimizer_steps": 0,
+    "no_threshold_retuning_from_2026": true
+  },
+  "checkpoint_contract": {
+    "best_checkpoint_selection_data": "2025 validation only, under a predeclared selection metric contained in the architecture/training manifest",
+    "checkpoint_sha256_required": true,
+    "architecture_sha256_required": true,
+    "data_projection_sha256_required": true,
+    "normalization_sha256_required": true,
+    "training_history_hash_required": true,
+    "teacher_status_after_historical_training": "CHALLENGER_SHADOW_ONLY",
+    "promotion_allowed": false,
+    "real_orders": "DISABLED"
+  },
+  "episodic_memory": {
+    "teacher_memory_build": "development/train-only states and labels may be used to construct historical experience memory",
+    "validation_outcomes_in_memory": false,
+    "2026_outcomes_in_memory": false,
+    "live_retrieval_rule": "At inference, query keys may contain only information available at the current timestamp. Retrieved outcome metadata must not be exposed as an input channel in a way that leaks future information unavailable live."
+  },
+  "frozen_r2_anchors": {
+    "NIFTY_STAGE1": "47312e180dc900f5d05711aa862b7ef82ece6d0ae32a36c607f8efae305bb8e5",
+    "NIFTY_STAGE2": "55791e80e6c10c9c5476c719b97b053b960145bb10894ef6208658eb4121bf1d",
+    "NIFTY_STAGE3": "6378c36f558ff6a3b292b8d7f74418f7eb1ce38142c235f4cd96d8d8cc49363d",
+    "SENSEX_STAGE1": "71b34d978f0efaef7e3faaf0d2509c893deb44b291f8b5125b6150da3034ba63",
+    "SENSEX_STAGE2": "a8c97ba5a8df86d246def3d0f1a741aa0adc8afab7be4507a2fdd546142ecd0c"
+  },
+  "hard_prohibitions": [
+    "Do not modify, retrain or overwrite frozen R2.",
+    "Do not train the R3 teacher without the exact recovery unlock token.",
+    "Do not invent the V0.2 architecture hash or exact parameter count.",
+    "Do not use 2025 rows for optimizer gradients or train-stat fitting.",
+    "Do not read 2026 historical rows in teacher training or validation.",
+    "Do not fabricate missing options, VIX, bid/ask, depth, Greeks, D30, index volume or index OI.",
+    "Do not call a partial option OI ratio full-market PCR.",
+    "Do not promote from historical results alone.",
+    "Do not enable real broker orders."
+  ]
+}

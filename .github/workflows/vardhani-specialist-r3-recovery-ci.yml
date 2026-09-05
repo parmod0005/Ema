@@ -1,0 +1,33 @@
+name: VARDHANI Specialist R3 Recovery CI
+
+on:
+  push:
+    branches:
+      - research/vardhani-specialist-r3-corpus-recovery
+    paths:
+      - 'research/vardhani_specialist_r3/**'
+      - '.github/workflows/vardhani-specialist-r3-recovery-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile recovery tools
+        run: |
+          python -m py_compile \
+            research/vardhani_specialist_r3/rebuild_aiml_option_corpus.py \
+            research/vardhani_specialist_r3/build_r3_option_split.py \
+            research/vardhani_specialist_r3/verify_corpus_recovery.py \
+            research/vardhani_specialist_r3/verify_corpus_recovery_v2.py
+      - name: Run recovery contract tests
+        env:
+          PYTHONPATH: research/vardhani_specialist_r3
+        run: python -m unittest discover -s research/vardhani_specialist_r3 -p 'test_*.py' -v

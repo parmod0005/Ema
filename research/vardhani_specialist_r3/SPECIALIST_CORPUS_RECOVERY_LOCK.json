@@ -1,0 +1,74 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_CORPUS_RECOVERY_LOCK_V1",
+  "status": "LOCKED_WAITING_FOR_EXECUTION",
+  "purpose": "Recover the exact historical source/corpus provenance before any R3 high-specialisation teacher training. This lock does not authorize model training or promotion.",
+  "raw_source": {
+    "filename": "aiml-upstox-history-1785255358705.zip",
+    "size_bytes_library": 58999099,
+    "sha256_expected": "bd7df469f6e7d95bee62a7c51d794a9119478cbc3c95b1e68debcafb4adc5b20",
+    "provenance_record": "ALPHA_A_2026_SEALED_PROVENANCE.json"
+  },
+  "original_corpus_importer": {
+    "repository": "parmod0005/AIML",
+    "integration_commit": "d7fc67e2b53bdca7a5b1237d7e685ad2d3ba37a1",
+    "path": "src/main/kotlin/com/parmod/aiml/ml/AndroidHistoricalCorpusImporter.kt",
+    "blob_sha": "d64f3a7af8b6b63bf7ca4b1de5e82f1fbf305b04",
+    "row_schema": "aiml-historical-option-row-v1",
+    "report_format": "AIML_HISTORICAL_IMPORT_REPORT_V1"
+  },
+  "expected_original_import_report": {
+    "status": "READY_FOR_RESEARCH",
+    "market": "nifty-50",
+    "horizons_minutes": [1, 3, 5, 15],
+    "max_moneyness_steps": 5.0,
+    "minimum_contract_coverage": 0.9,
+    "manifest_unique_entries": 6067,
+    "manifest_duplicate_records": 16,
+    "manifest_malformed_records": 0,
+    "manifest_verified": 5859,
+    "underlying_files": 55,
+    "underlying_rows": 422542,
+    "underlying_sessions": 1131,
+    "rows_written_train": 2156451,
+    "rows_written_validation": 475501,
+    "rows_written_test": 466114,
+    "execution_authority": false,
+    "limitations": [
+      "one-minute bars only",
+      "no historical bid/ask spread",
+      "no five-level depth"
+    ]
+  },
+  "original_expiry_split_for_parity_only": {
+    "train": [
+      "2024-10-03", "2024-10-10", "2024-10-17", "2024-10-24", "2024-10-31",
+      "2024-11-07", "2024-11-14", "2024-11-21", "2024-11-28", "2024-12-05",
+      "2024-12-12", "2024-12-19", "2024-12-26", "2025-01-02", "2025-01-09",
+      "2025-01-16", "2025-01-23", "2025-01-30", "2025-02-06", "2025-02-13"
+    ],
+    "validation": ["2025-02-20", "2025-02-27", "2025-03-06", "2025-03-13"],
+    "test": ["2025-03-20", "2025-03-27", "2025-04-03", "2025-04-09", "2025-04-17"]
+  },
+  "r3_challenger_chronology": {
+    "development_train_end": "2024-12-31T23:59:59+05:30",
+    "validation_start": "2025-01-01T00:00:00+05:30",
+    "validation_end": "2025-12-31T23:59:59+05:30",
+    "sealed_2026": true,
+    "rule": "The original AIML train/validation/test split is reconstructed only as a provenance parity gate. R3 teacher optimisation may consume only rows dated through 2024-12-31. Any 2025 rows are validation-only and 2026 remains sealed until the precommitted R3 gate permits opening it."
+  },
+  "frozen_r2_anchors": {
+    "NIFTY_STAGE1": "47312e180dc900f5d05711aa862b7ef82ece6d0ae32a36c607f8efae305bb8e5",
+    "NIFTY_STAGE2": "55791e80e6c10c9c5476c719b97b053b960145bb10894ef6208658eb4121bf1d",
+    "NIFTY_STAGE3": "6378c36f558ff6a3b292b8d7f74418f7eb1ce38142c235f4cd96d8d8cc49363d",
+    "SENSEX_STAGE1": "71b34d978f0efaef7e3faaf0d2509c893deb44b291f8b5125b6150da3034ba63",
+    "SENSEX_STAGE2": "a8c97ba5a8df86d246def3d0f1a741aa0adc8afab7be4507a2fdd546142ecd0c"
+  },
+  "hard_prohibitions": [
+    "Do not modify or retrain frozen R2.",
+    "Do not use historical or prospective 2026 rows for R3 optimisation.",
+    "Do not fabricate bid/ask, depth, Greeks, index volume/OI, SENSEX options or D30.",
+    "Do not treat the original AIML split as the R3 optimisation split; it is parity evidence only.",
+    "Do not unlock the teacher optimizer unless raw ZIP SHA, importer identity, report counts and chronology gate all pass.",
+    "Real broker orders remain disabled."
+  ]
+}

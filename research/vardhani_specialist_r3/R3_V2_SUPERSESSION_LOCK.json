@@ -1,0 +1,40 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_V2_SUPERSESSION_LOCK_V1",
+  "status": "PRECOMMITTED_AUTHORITATIVE_BEFORE_RUNTIME_ACCEPTANCE",
+  "purpose": "Make the statically corrected V2 full-market builder/preflight authoritative before any full-market corpus output or teacher checkpoint is accepted.",
+  "authoritative_components": {
+    "option_corpus_recovery": "run_exact_recovery_gate.py",
+    "option_recovery_verifier": "verify_corpus_recovery_v2.py",
+    "full_market_builder": "build_full_market_corpus_v2.py",
+    "full_market_manifest_format": "VARDHANI_SPECIALIST_R3_FULL_MARKET_CORPUS_MANIFEST_V2",
+    "teacher_preflight": "verify_teacher_preflight_v2.py",
+    "architecture_manifest_schema": "R3_ARCHITECTURE_MANIFEST_SCHEMA.json",
+    "teacher_training_contract": "R3_TEACHER_TRAINING_CONTRACT.json"
+  },
+  "superseded_before_runtime_acceptance": {
+    "build_full_market_corpus.py": "V1 implementation retained for audit history only; its aggregate pseudo-path manifest is not accepted by the teacher gate.",
+    "VARDHANI_SPECIALIST_R3_FULL_MARKET_CORPUS_MANIFEST_V1": "not authoritative; no V1 full-market output may unlock model construction or optimizer start",
+    "verify_teacher_preflight.py_full_market_verifier": "its token and architecture checks remain reused by V2, but its V1 full-market verifier is superseded"
+  },
+  "v2_corrections": [
+    "Normalize all raw market timestamps to Asia/Kolkata before exchange-day/session-minute derivation.",
+    "Require NIFTY Stage-A observed-row parity of exactly 422138 rows.",
+    "Require SENSEX Stage-A observed-row parity of exactly 422144 rows.",
+    "Represent NIFTY, SENSEX and exact-common cross streams as six physical SHA-verified NPZ artifacts.",
+    "Reconcile train/validation aggregate ledgers from physical file rows, byte sizes, file SHA-256 and canonical content SHA-256.",
+    "Require measured chronology leakage counters to be exactly zero.",
+    "Require NIFTY and SENSEX future-mutation pre-cut feature deltas to be exactly zero.",
+    "Keep NIFTY option corpus as a separate genuine overlay; SENSEX options remain unavailable/not fabricated."
+  ],
+  "chronology": {
+    "train_end": "2024-12-31",
+    "validation": "2025 only",
+    "sealed_2026": true
+  },
+  "frozen_r2_untouched": true,
+  "historical_d30_forbidden": true,
+  "fabricated_modalities_forbidden": true,
+  "promotion_authority": false,
+  "execution_authority": false,
+  "real_orders": "DISABLED"
+}

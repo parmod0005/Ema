@@ -1,0 +1,58 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_PROVENANCE_CORRECTION_V1",
+  "status": "CORRECTION_LOCKED_BEFORE_TEACHER_MODEL_CONSTRUCTION",
+  "reason": "Recovered September 3, 2026 provenance proves the V0.2 MTFN package was the initial small research bundle, not the later high-capacity R3 teacher architecture.",
+  "v0_2_reference": {
+    "package_name": "Vardhani-AI-Brain-MTFN-v0.2-research.zip",
+    "preserved_sha256": "961066969cce7a84f533a83316087ff7636d635dcfa4e1133b1d9d463b592211",
+    "library_package_located": true,
+    "library_size_bytes": 259773,
+    "library_created_at_utc": "2026-09-03T10:58:01.182126Z",
+    "fresh_byte_hash_recompute": "PENDING_EXECUTION_RUNTIME",
+    "conversation_provenance": {
+      "reported_parameter_count": 7080,
+      "reported_package_scale": "approximately 154 KB research brain payload",
+      "reported_15m_action_policy": "15m excluded from action head",
+      "reported_baseline_scope": "50k-example baseline",
+      "reported_nifty_macro_f1": 0.307,
+      "reported_sensex_macro_f1": 0.301,
+      "reported_result": "UNDERPERFORMED_BASELINE_RESEARCH_ONLY"
+    },
+    "role_in_r3": "HISTORICAL_MTFN_REFERENCE_AND_REGRESSION_PROVENANCE_ONLY",
+    "teacher_architecture_source": false
+  },
+  "later_mtfn_reference": {
+    "package_name": "Vardhani-AI-Brain-MTFN-v1.2.1-FullHistory.zip",
+    "preserved_sha256": "c9aeaed16b0d1e6cffed60ddd56bd90b82dd52bfe850e8f4dd1d4c3a626ea628",
+    "reported_parameter_count_each_brain": 77088,
+    "role_in_r3": "LATER_HISTORICAL_REFERENCE_ONLY",
+    "accepted_as_v0_2_byte_or_architecture_identity": false
+  },
+  "r3_teacher_correction": {
+    "teacher_family": "VARDHANI_SPECIALIST_R3_HIGH_CAPACITY_TEACHER",
+    "capacity_goal": "approximately 568M parameters off-device; exact count must be generated from the new sealed R3 source implementation before optimizer initialization",
+    "inherits_v0_2_exact_architecture": false,
+    "may_reuse_proven_causal_principles": [
+      "multi-timeframe numerical temporal learning",
+      "15m non-veto/context separation",
+      "strict chronology",
+      "paper/shadow-only promotion boundary"
+    ],
+    "must_not_claim": "V0.2 defined or contained the high-capacity teacher architecture"
+  },
+  "chronology": {
+    "teacher_train_end": "2024-12-31",
+    "validation_2025_read_only": true,
+    "sealed_2026": true
+  },
+  "hard_rules": {
+    "frozen_r2_untouched": true,
+    "historical_d30_forbidden": true,
+    "fabricated_modalities_forbidden": true,
+    "sensex_historical_options_fabricated": false,
+    "real_orders_disabled": true,
+    "historical_results_cannot_promote": true
+  },
+  "supersedes_false_assumption": "Any earlier R3 contract text stating that the approximately 568M teacher was defined by the sealed V0.2 architecture.",
+  "execution_authority": false
+}

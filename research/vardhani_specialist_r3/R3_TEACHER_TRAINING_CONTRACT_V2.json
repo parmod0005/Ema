@@ -1,0 +1,138 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_TEACHER_TRAINING_CONTRACT_V2",
+  "status": "PRECOMMITTED_LOCKED_WAITING_FOR_CORPUS_RUNTIME_AND_NEW_R3_ARCHITECTURE_MANIFEST",
+  "supersedes": "VARDHANI_SPECIALIST_R3_TEACHER_TRAINING_CONTRACT_V1",
+  "correction": "V0.2 is retained as a 7,080-parameter historical MTFN reference only. The high-capacity R3 teacher is a new specialist architecture and must be independently source-hashed, parameter-counted and sealed before training.",
+  "teacher_identity": {
+    "name": "VARDHANI_SPECIALIST_R3_HIGH_CAPACITY_TEACHER",
+    "role": "off-device teacher only",
+    "capacity_target": "approximately 568M parameters; exact source-derived count is authoritative",
+    "architecture_manifest_required": true,
+    "architecture_manifest_format": "VARDHANI_SPECIALIST_R3_ARCHITECTURE_MANIFEST_V2",
+    "v0_2_exact_architecture_inherited": false,
+    "v0_2_reference_sha256": "961066969cce7a84f533a83316087ff7636d635dcfa4e1133b1d9d463b592211"
+  },
+  "required_unlock": {
+    "token_filename": "R3_TEACHER_UNLOCK_TOKEN.json",
+    "token_format": "VARDHANI_SPECIALIST_R3_TEACHER_UNLOCK_TOKEN_V1",
+    "required_status": "TEACHER_HISTORICAL_TRAINING_UNLOCKED_ONLY",
+    "prospective_authority": false,
+    "promotion_authority": false,
+    "execution_authority": false
+  },
+  "chronology": {
+    "development_train_start": "2022-01-01",
+    "development_train_end": "2024-12-31",
+    "validation_start": "2025-01-01",
+    "validation_end": "2025-12-31",
+    "sealed_2026": true,
+    "train_only_normalization": true,
+    "train_only_target_statistics": true,
+    "train_only_prototype_and_memory_fit": true,
+    "validation_optimizer_steps": 0,
+    "2026_optimizer_steps": 0
+  },
+  "input_contract": {
+    "lower_input_width": 200,
+    "lower_components": [
+      "NIFTY_XLO_74",
+      "SENSEX_XLO_74",
+      "NIFTY_OPTION_STATE_49",
+      "NIFTY_PRESENT_MASK",
+      "SENSEX_PRESENT_MASK",
+      "NIFTY_OPTION_PRESENT_MASK"
+    ],
+    "context15_input_width": 48,
+    "context15_components": [
+      "NIFTY_X15_23",
+      "SENSEX_X15_23",
+      "NIFTY_PRESENT_MASK",
+      "SENSEX_PRESENT_MASK"
+    ],
+    "missing_modality_rule": "zero payload plus explicit false mask; never fabricate values",
+    "15m_policy": "CONTEXT_NON_VETO_ADVISORY_NO_DIRECT_ACTION_PATH"
+  },
+  "full_market_experience": {
+    "required": true,
+    "markets": ["NIFTY", "SENSEX"],
+    "clock": "observed one-minute exchange timestamps",
+    "forming_timeframes": ["3m", "5m", "15m"],
+    "completed_timeframes": ["1m", "3m", "5m", "15m"],
+    "vix": "genuine exact/as-of only",
+    "cross_index": "exact common timestamps only",
+    "future_mutation_gate_required": true,
+    "no_synthetic_candles": true,
+    "no_positional_future_shift": true
+  },
+  "modality_contract": {
+    "nifty_underlying": "GENUINE",
+    "sensex_underlying": "GENUINE",
+    "india_vix": "GENUINE_WHEN_AVAILABLE_CAUSAL_ASOF_ONLY",
+    "nifty_options": "GENUINE_OVERLAY_WHERE_ARCHIVED_OHLC_VOLUME_OI_EXISTS",
+    "sensex_options": "SOURCE_UNAVAILABLE_NOT_FABRICATED",
+    "historical_index_volume": "NOT_USED_AS_GENUINE_VOLUME",
+    "historical_index_oi": "NOT_USED_AS_GENUINE_OI",
+    "historical_bid_ask": false,
+    "historical_depth": false,
+    "historical_greeks": false,
+    "historical_d30": false,
+    "pcr": "only derived from explicitly identified genuine archived OI universe; partial ratio never labelled full-market PCR"
+  },
+  "teacher_learning_targets": [
+    "latent market state",
+    "regime distribution",
+    "regime age",
+    "next-regime distribution",
+    "direction distribution",
+    "future returns at exact 1m/3m/5m/10m/15m horizons where valid",
+    "MFE distribution",
+    "MAE distribution",
+    "target-before-stop probability under separately versioned economics",
+    "continuation probability",
+    "reversal probability",
+    "breakout/breakdown acceptance probability",
+    "failed-break probability",
+    "range/chop/no-trade probability",
+    "volatility state and transition",
+    "NIFTY-SENSEX relationship state",
+    "NIFTY CE/PE relative behaviour where genuine option state exists",
+    "uncertainty/disagreement",
+    "episodic analogue embedding",
+    "15m-vs-lower-timeframe relationship advisory state without direct action authority"
+  ],
+  "checkpoint_governance": {
+    "selection_data": "2025 validation only",
+    "selection_metric_must_be_predeclared": true,
+    "checkpoint_sha256_required": true,
+    "architecture_source_bundle_sha256_required": true,
+    "normalization_sha256_required": true,
+    "training_history_hash_required": true,
+    "post_training_status": "CHALLENGER_SHADOW_ONLY",
+    "historical_promotion_allowed": false,
+    "real_orders": "DISABLED"
+  },
+  "distillation_after_teacher": {
+    "student_candidates": ["~50MB", "~100MB", "~200MB", "~300MB", "<=500MB"],
+    "selection_basis": "unseen-domain behavioural parity plus realistic economic parity after costs, latency/slippage assumptions and uncertainty calibration",
+    "literal_general_GPT_copy_claim": false,
+    "android_primary_intelligence": "numerical temporal specialist",
+    "general_purpose_llm_required": false
+  },
+  "frozen_r2_anchors": {
+    "NIFTY_STAGE1": "47312e180dc900f5d05711aa862b7ef82ece6d0ae32a36c607f8efae305bb8e5",
+    "NIFTY_STAGE2": "55791e80e6c10c9c5476c719b97b053b960145bb10894ef6208658eb4121bf1d",
+    "NIFTY_STAGE3": "6378c36f558ff6a3b292b8d7f74418f7eb1ce38142c235f4cd96d8d8cc49363d",
+    "SENSEX_STAGE1": "71b34d978f0efaef7e3faaf0d2509c893deb44b291f8b5125b6150da3034ba63",
+    "SENSEX_STAGE2": "a8c97ba5a8df86d246def3d0f1a741aa0adc8afab7be4507a2fdd546142ecd0c"
+  },
+  "hard_prohibitions": [
+    "Do not modify, retrain or overwrite frozen R2.",
+    "Do not start teacher optimization without exact corpus unlock and V2 architecture manifest.",
+    "Do not represent V0.2 as the source architecture of the high-capacity teacher.",
+    "Do not use 2025 for gradients or train-stat fitting.",
+    "Do not read 2026 in historical teacher training or validation.",
+    "Do not fabricate options, VIX, bid/ask, depth, Greeks, D30, index volume or index OI.",
+    "Do not promote from historical evidence alone.",
+    "Do not enable real broker orders."
+  ]
+}

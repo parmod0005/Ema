@@ -1,0 +1,72 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_STATIC_IMPORTER_PARITY_AUDIT_V1",
+  "status": "STATIC_CONTRACT_PARITY_PASS_RUNTIME_PARITY_STILL_REQUIRED",
+  "original_importer": {
+    "repository": "parmod0005/AIML",
+    "commit": "d7fc67e2b53bdca7a5b1237d7e685ad2d3ba37a1",
+    "path": "src/main/kotlin/com/parmod/aiml/ml/AndroidHistoricalCorpusImporter.kt",
+    "blob_sha": "d64f3a7af8b6b63bf7ca4b1de5e82f1fbf305b04"
+  },
+  "python_rebuilder": "rebuild_aiml_option_corpus.py",
+  "matched_contracts": {
+    "row_schema": "aiml-historical-option-row-v1",
+    "execution_authority_false": true,
+    "timezone_aware_timestamp_to_epoch_second": true,
+    "session_date_from_source_offset": true,
+    "duplicate_timestamp_count_and_last_value_retained": true,
+    "ohlcv_oi_finite_and_nonnegative_validation": true,
+    "ohlc_high_low_geometry_validation": true,
+    "manifest_duplicate_last_record_retained": true,
+    "manifest_size_mismatch_rejected": true,
+    "manifest_sha256_mismatch_rejected": true,
+    "manifest_entry_missing_not_silently_relabelled_verified": true,
+    "nifty_exact_minute_spot_alignment": true,
+    "minimum_contract_coverage": 0.9,
+    "strike_step_median_positive_gap": true,
+    "strike_step_fallback": 50.0,
+    "max_absolute_moneyness_steps": 5.0,
+    "minimum_option_price": 0.05,
+    "positive_option_volume_required": true,
+    "positive_option_oi_required": true,
+    "horizons_minutes": [1, 3, 5, 15],
+    "exact_future_minute_required_for_every_horizon_step": true,
+    "future_path_cannot_cross_exchange_date": true,
+    "mfe_from_future_highs": true,
+    "mae_from_future_lows": true,
+    "future_return_from_horizon_close": true,
+    "quality_reject_duplicate_or_invalid": true,
+    "quality_reject_stale_flat_ratio_0_98_with_volume_ratio_below_0_05": true,
+    "quality_watch_sparse_floor_ratio_0_80_or_volume_or_oi_ratio_below_0_05": true,
+    "watch_sparse_rows_retained": true,
+    "expiry_split_rule": "70% train floor, 15% validation floor, remainder test with minimum-one safeguards",
+    "known_29_expiry_split": "20 train / 4 validation / 5 test"
+  },
+  "runtime_parity_targets": {
+    "manifest_unique_entries": 6067,
+    "manifest_duplicate_records": 16,
+    "manifest_malformed_records": 0,
+    "manifest_verified": 5859,
+    "underlying_files": 55,
+    "underlying_rows": 422542,
+    "underlying_sessions": 1131,
+    "train_rows": 2156451,
+    "validation_rows": 475501,
+    "test_rows": 466114
+  },
+  "non_semantic_differences": [
+    "Report generated_at formatting/runtime timezone may differ.",
+    "JSONObject numeric/string serialization bytes may differ from Python json serialization.",
+    "These differences have no training authority; runtime parity is judged by source SHA, importer contract, report counts, measured chronology and canonical row-stream hashes."
+  ],
+  "r3_additional_guards": [
+    "Original AIML split is parity evidence only.",
+    "R3 training consumes only exchange_date <= 2024-12-31.",
+    "2025 is validation-only.",
+    "2026 is sealed.",
+    "Measured leakage counters must all be zero.",
+    "Source and projected canonical row streams are SHA-256 anchored.",
+    "Frozen R2 is not modified.",
+    "Real broker orders remain disabled."
+  ],
+  "runtime_teacher_unlock": false
+}

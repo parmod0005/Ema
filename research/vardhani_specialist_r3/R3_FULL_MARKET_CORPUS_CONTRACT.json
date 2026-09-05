@@ -1,0 +1,126 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_FULL_MARKET_CORPUS_CONTRACT_V1",
+  "status": "PRECOMMITTED_BUILD_REQUIRED",
+  "purpose": "Define the causal full-market experience stream that must accompany the recovered NIFTY option overlay before the R3 high-capacity teacher can train.",
+  "raw_source": {
+    "filename": "aiml-upstox-history-1785255358705.zip",
+    "sha256": "bd7df469f6e7d95bee62a7c51d794a9119478cbc3c95b1e68debcafb4adc5b20",
+    "observed_only": true,
+    "synthetic_candles": false
+  },
+  "chronology": {
+    "train": "2022-01-01 through 2024-12-31 inclusive",
+    "validation": "2025-01-01 through 2025-12-31 inclusive",
+    "sealed": "2026-01-01 and later",
+    "train_stat_fitting_after_2024_forbidden": true,
+    "validation_optimizer_steps": 0,
+    "sealed_rows_readable_by_builder_for_rejection_audit_only": true,
+    "sealed_rows_emit_to_teacher_files": false
+  },
+  "streams": {
+    "NIFTY": {
+      "required": true,
+      "source": "underlying/nifty-50/minutes-1/*.json",
+      "price_fields": ["open", "high", "low", "close"],
+      "historical_index_volume_is_genuine": false,
+      "historical_index_oi_is_genuine": false
+    },
+    "SENSEX": {
+      "required": true,
+      "source": "underlying/sensex/minutes-1/*.json",
+      "price_fields": ["open", "high", "low", "close"],
+      "historical_index_volume_is_genuine": false,
+      "historical_index_oi_is_genuine": false
+    },
+    "INDIA_VIX": {
+      "required_when_genuine_available": true,
+      "source": "underlying/india-vix/minutes-1/*.json",
+      "alignment": "exact timestamp preferred; otherwise causal as-of only from a timestamp <= current market timestamp",
+      "future_fill": false,
+      "missing_mask_required": true
+    }
+  },
+  "causal_state": {
+    "base_clock": "one-minute timestamp after the corresponding observed 1m bar is complete",
+    "forming_3m": true,
+    "completed_3m": true,
+    "forming_5m": true,
+    "completed_5m": true,
+    "forming_15m": true,
+    "completed_15m": true,
+    "partial_bucket_coverage_and_missingness": true,
+    "session_progress": true,
+    "gap_and_overnight_state": true,
+    "weekend_calendar_gap_state": true,
+    "cross_index_state": "only where both index states are causally available at or before the same decision timestamp",
+    "future_mutation_pre_cut_max_abs_required": 0.0
+  },
+  "feature_semantics": {
+    "rule": "Feature implementation may extend the existing R2 causal families, but each feature must be computable from present/past information only and must be enumerated in the actual architecture/data manifest before training.",
+    "minimum_families": [
+      "returns and candle geometry",
+      "ATR-normalized body/range/wicks",
+      "EMA separation and slopes",
+      "RSI/MACD/ADX/DI/BB causal technical state",
+      "location/breakout/breakdown state",
+      "realized volatility and efficiency",
+      "session/open/high/low relation",
+      "gaps/overnight/weekend transitions",
+      "VIX level/change/regime when genuine",
+      "forming/completed 3m state",
+      "forming/completed 5m state",
+      "forming/completed 15m context",
+      "NIFTY-SENSEX synchronized relative/lead-lag state"
+    ],
+    "15m_policy": "context/non-veto; exact action authority is governed by the architecture manifest",
+    "forbidden": [
+      "future-completed forming candle values",
+      "future VIX values",
+      "historical index volume/OI treated as genuine when source contains zeros/non-market values",
+      "fabricated D30/depth/spread/Greeks"
+    ]
+  },
+  "option_overlay": {
+    "separate_recovered_corpus_required": true,
+    "token_required_for_option_overlay": "R3_TEACHER_UNLOCK_TOKEN.json",
+    "NIFTY_only": true,
+    "SENSEX_options": "SOURCE_UNAVAILABLE_NOT_FABRICATED",
+    "overlay_alignment": "exact timestamp and genuine contract state only",
+    "missing_option_state": "option_present=false; do not synthesize or discard the underlying market state",
+    "genuine_fields": ["OHLC", "traded volume", "OI", "contract strike", "CE/PE", "expiry", "lot size"],
+    "not_genuine_historical_fields": ["bid/ask spread", "order-book depth", "Greeks", "microprice"]
+  },
+  "required_output_manifest": {
+    "format": "VARDHANI_SPECIALIST_R3_FULL_MARKET_CORPUS_MANIFEST_V1",
+    "required_fields": [
+      "raw_source_sha256",
+      "train_file_sha256",
+      "validation_file_sha256",
+      "train_canonical_row_stream_sha256",
+      "validation_canonical_row_stream_sha256",
+      "train_rows",
+      "validation_rows",
+      "train_min_timestamp",
+      "train_max_timestamp",
+      "validation_min_timestamp",
+      "validation_max_timestamp",
+      "measured_train_2025_rows",
+      "measured_train_2026_rows",
+      "measured_validation_pre_2025_rows",
+      "measured_validation_2026_rows",
+      "sealed_2026_rows_rejected",
+      "feature_schema_sha256",
+      "modality_coverage",
+      "future_mutation_audit",
+      "execution_authority"
+    ],
+    "all_measured_leakage_counts_required_zero": true,
+    "execution_authority": false
+  },
+  "frozen_r2_reference_only": {
+    "NIFTY_STAGE1": "47312e180dc900f5d05711aa862b7ef82ece6d0ae32a36c607f8efae305bb8e5",
+    "SENSEX_STAGE1": "71b34d978f0efaef7e3faaf0d2509c893deb44b291f8b5125b6150da3034ba63",
+    "rule": "R2 artifacts may be used as immutable parity/reference evidence only. This R3 corpus build must not overwrite, retune or mutate them."
+  },
+  "real_orders": "DISABLED"
+}

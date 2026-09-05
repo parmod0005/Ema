@@ -23,15 +23,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Compile recovery tools
+      - name: Install deterministic recovery dependencies
+        run: python -m pip install -r research/vardhani_specialist_r3/requirements-r3-recovery.txt
+      - name: Compile recovery and V2 teacher-gate tools
         run: |
           python -m py_compile \
             research/vardhani_specialist_r3/rebuild_aiml_option_corpus.py \
             research/vardhani_specialist_r3/build_r3_option_split.py \
             research/vardhani_specialist_r3/verify_corpus_recovery.py \
             research/vardhani_specialist_r3/verify_corpus_recovery_v2.py \
-            research/vardhani_specialist_r3/run_exact_recovery_gate.py
-      - name: Run recovery contract tests
+            research/vardhani_specialist_r3/run_exact_recovery_gate.py \
+            research/vardhani_specialist_r3/build_full_market_corpus.py \
+            research/vardhani_specialist_r3/build_full_market_corpus_v2.py \
+            research/vardhani_specialist_r3/verify_teacher_preflight.py \
+            research/vardhani_specialist_r3/verify_teacher_preflight_v2.py \
+            research/vardhani_specialist_r3/verify_teacher_preflight_v2_strict.py
+      - name: Run all recovery contract tests
         env:
           PYTHONPATH: research/vardhani_specialist_r3
         run: python -m unittest discover -s research/vardhani_specialist_r3 -p 'test_*.py' -v

@@ -15,7 +15,10 @@ permissions:
 jobs:
   recovery-contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      - name: Runner reached executable steps
+        run: echo "VARDHANI R3 recovery CI runner active"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -26,7 +29,8 @@ jobs:
             research/vardhani_specialist_r3/rebuild_aiml_option_corpus.py \
             research/vardhani_specialist_r3/build_r3_option_split.py \
             research/vardhani_specialist_r3/verify_corpus_recovery.py \
-            research/vardhani_specialist_r3/verify_corpus_recovery_v2.py
+            research/vardhani_specialist_r3/verify_corpus_recovery_v2.py \
+            research/vardhani_specialist_r3/run_exact_recovery_gate.py
       - name: Run recovery contract tests
         env:
           PYTHONPATH: research/vardhani_specialist_r3

@@ -1,0 +1,50 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_ARCHITECTURE_RECOVERY_STATUS_V1",
+  "status": "CHECKSUM_PROVEN_SOURCE_NOT_YET_RECOVERED_TRAINING_LOCKED",
+  "target_identity": {
+    "package_name": "Vardhani-AI-Brain-MTFN-v0.2-research.zip",
+    "expected_sha256": "961066969cce7a84f533a83316087ff7636d635dcfa4e1133b1d9d463b592211",
+    "package_bytes_recovered": false,
+    "exact_architecture_source_recovered": false,
+    "exact_parameter_count_recovered": false,
+    "architecture_manifest_eligible": false
+  },
+  "evidence": {
+    "library_checksum_file_present": true,
+    "exact_zip_found_in_library": false,
+    "repository_path_named_mtfn_found": false,
+    "later_mtfn_package_checksum_observed": {
+      "name": "Vardhani-AI-Brain-MTFN-v1.2.1-FullHistory.zip",
+      "sha256": "c9aeaed16b0d1e6cffed60ddd56bd90b82dd52bfe850e8f4dd1d4c3a626ea628",
+      "accepted_as_v0_2_architecture_substitute": false,
+      "reason": "A shared MTFN package name does not prove byte-level or architecture-level identity. A lineage/source manifest is required before reuse."
+    },
+    "searched_repository_branches": [
+      "develop/ema-android-foundation",
+      "vardhani-cloud-build-v1.6.1",
+      "main"
+    ],
+    "develop_branch_has_historical_brain_training_sources": true,
+    "those_sources_proven_to_be_v0_2": false
+  },
+  "hard_rules": {
+    "do_not_invent_architecture": true,
+    "do_not_substitute_v1_2_1_without_lineage_proof": true,
+    "do_not_start_teacher_optimizer_without_exact_architecture_manifest": true,
+    "do_not_modify_frozen_r2": true,
+    "train_through_2024_only": true,
+    "validation_2025_read_only": true,
+    "sealed_2026": true,
+    "historical_d30_forbidden": true,
+    "fabricated_modalities_forbidden": true,
+    "real_orders_disabled": true
+  },
+  "next_allowed_recovery_actions": [
+    "Search historical build/package provenance for the exact v0.2 source-file ledger or archive bytes.",
+    "Accept a later MTFN source only if immutable lineage evidence proves the v0.2 architecture was unchanged.",
+    "If exact source is recovered, hash every source file, compute exact parameter count, and create R3_ARCHITECTURE_MANIFEST_V1 before any model construction."
+  ],
+  "teacher_optimizer_start_allowed": false,
+  "model_construction_allowed": false,
+  "execution_authority": false
+}

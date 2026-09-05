@@ -1,0 +1,30 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_MODALITY_MASK_SCHEMA_V1",
+  "status": "PRECOMMITTED",
+  "lower_input_width": 200,
+  "lower_layout": [
+    {"name":"NIFTY_XLO","start":0,"width":74},
+    {"name":"SENSEX_XLO","start":74,"width":74},
+    {"name":"NIFTY_OPTION_STATE","start":148,"width":49},
+    {"name":"NIFTY_PRESENT","start":197,"width":1},
+    {"name":"SENSEX_PRESENT","start":198,"width":1},
+    {"name":"NIFTY_OPTION_PRESENT","start":199,"width":1}
+  ],
+  "context15_input_width": 48,
+  "context15_layout": [
+    {"name":"NIFTY_X15","start":0,"width":23},
+    {"name":"SENSEX_X15","start":23,"width":23},
+    {"name":"NIFTY_PRESENT","start":46,"width":1},
+    {"name":"SENSEX_PRESENT","start":47,"width":1}
+  ],
+  "rules": {
+    "missing_numerical_payload": "all zeros for the missing modality",
+    "missing_presence_mask": 0,
+    "present_presence_mask": 1,
+    "mask_fitted_from_future": false,
+    "fabricated_values_allowed": false,
+    "sensex_historical_option_channel_present": false,
+    "historical_d30_channel_present": false,
+    "15m_direct_action_path": false
+  }
+}

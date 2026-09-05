@@ -37,7 +37,8 @@ jobs:
             research/vardhani_specialist_r3/build_full_market_corpus_v2.py \
             research/vardhani_specialist_r3/verify_teacher_preflight.py \
             research/vardhani_specialist_r3/verify_teacher_preflight_v2.py \
-            research/vardhani_specialist_r3/verify_teacher_preflight_v2_strict.py
+            research/vardhani_specialist_r3/verify_teacher_preflight_v2_strict.py \
+            research/vardhani_specialist_r3/recover_v02_architecture_package.py
       - name: Run all recovery contract tests
         env:
           PYTHONPATH: research/vardhani_specialist_r3

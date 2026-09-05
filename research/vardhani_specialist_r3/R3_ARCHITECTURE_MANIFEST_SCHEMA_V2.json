@@ -1,0 +1,92 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_ARCHITECTURE_MANIFEST_SCHEMA_V2",
+  "status": "SCHEMA_LOCKED_NEW_R3_HIGH_CAPACITY_DESIGN",
+  "supersedes": "VARDHANI_SPECIALIST_R3_ARCHITECTURE_MANIFEST_SCHEMA_V1",
+  "provenance_rule": "The R3 high-capacity teacher is a new explicitly sealed specialist architecture. V0.2 is a 7,080-parameter historical MTFN reference and must not be represented as the source of the high-capacity architecture.",
+  "required_manifest_format": "VARDHANI_SPECIALIST_R3_ARCHITECTURE_MANIFEST_V2",
+  "required_status": "SEALED_IMPLEMENTATION_READY_FOR_GATED_TRAINING",
+  "required_fields": {
+    "identity": [
+      "teacher_name",
+      "architecture_version",
+      "exact_parameter_count",
+      "parameter_count_method",
+      "source_bundle_sha256",
+      "source_files"
+    ],
+    "source_files_each": ["path", "bytes", "sha256"],
+    "lineage": [
+      "design_origin",
+      "v0_2_reference_only",
+      "v0_2_sha256",
+      "inherits_v0_2_exact_architecture"
+    ],
+    "input_contract": [
+      "lower_input_width",
+      "context15_input_width",
+      "full_market_feature_schema_sha256",
+      "option_feature_schema_sha256",
+      "modality_mask_schema_sha256",
+      "state_cache_contract",
+      "15m_policy"
+    ],
+    "model_contract": [
+      "temporal_encoder",
+      "multi_market_fusion",
+      "specialist_experts",
+      "meta_judgement",
+      "context15_advisory_branch",
+      "uncertainty_head",
+      "episodic_embedding_head",
+      "output_heads"
+    ],
+    "training_contract": [
+      "loss_heads",
+      "loss_weights",
+      "optimizer",
+      "scheduler",
+      "deterministic_seeds",
+      "precision_policy",
+      "gradient_clipping",
+      "checkpoint_selection_metric"
+    ],
+    "safety_contract": [
+      "frozen_r2_untouched",
+      "validation_gradients_forbidden",
+      "sealed_2026",
+      "historical_d30_forbidden",
+      "fabricated_modalities_forbidden",
+      "sensex_historical_options_fabricated",
+      "15m_direct_action_veto",
+      "real_orders_disabled"
+    ]
+  },
+  "semantic_requirements": {
+    "lineage.design_origin": "NEW_R3_HIGH_CAPACITY_SPECIALIST_DESIGN",
+    "lineage.v0_2_reference_only": true,
+    "lineage.v0_2_sha256": "961066969cce7a84f533a83316087ff7636d635dcfa4e1133b1d9d463b592211",
+    "lineage.inherits_v0_2_exact_architecture": false,
+    "input_contract.lower_input_width": 200,
+    "input_contract.context15_input_width": 48,
+    "15m_policy": "CONTEXT_NON_VETO_ADVISORY_NO_DIRECT_ACTION_PATH",
+    "frozen_r2_untouched": true,
+    "validation_gradients_forbidden": true,
+    "sealed_2026": true,
+    "historical_d30_forbidden": true,
+    "fabricated_modalities_forbidden": true,
+    "sensex_historical_options_fabricated": false,
+    "15m_direct_action_veto": false,
+    "real_orders_disabled": true,
+    "exact_parameter_count_must_be_runtime_derived_from_source": true,
+    "loss_weights_must_be_explicit": true,
+    "optimizer_must_be_explicit": true,
+    "deterministic_seeds_must_be_nonempty": true,
+    "checkpoint_selection_metric_must_be_predeclared": true
+  },
+  "input_width_definition": {
+    "lower_200": "NIFTY XLO74 + SENSEX XLO74 + NIFTY option-state49 + three modality-presence masks (NIFTY,SENSEX,NIFTY_OPTIONS)",
+    "context15_48": "NIFTY X15_23 + SENSEX X15_23 + two market-presence masks",
+    "missing_modalities": "zero numerical payload plus explicit false presence mask; never synthesized as genuine observations"
+  },
+  "rule": "No teacher optimizer may start from this schema alone. The actual R3 source implementation must be present, hash-ledgered and instantiated to derive its exact parameter count; a V2 architecture manifest must then pass the strict teacher preflight."
+}

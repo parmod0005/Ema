@@ -1,12 +1,20 @@
 {
-  "format": "VARDHANI_SPECIALIST_R3_CORPUS_RECOVERY_LOCK_V1",
-  "status": "LOCKED_WAITING_FOR_EXECUTION",
+  "format": "VARDHANI_SPECIALIST_R3_CORPUS_RECOVERY_LOCK_V2",
+  "status": "SOURCE_IDENTITY_PREVERIFIED_WAITING_FOR_RECONSTRUCTION_EXECUTION",
   "purpose": "Recover the exact historical source/corpus provenance before any R3 high-specialisation teacher training. This lock does not authorize model training or promotion.",
   "raw_source": {
     "filename": "aiml-upstox-history-1785255358705.zip",
     "size_bytes_library": 58999099,
     "sha256_expected": "bd7df469f6e7d95bee62a7c51d794a9119478cbc3c95b1e68debcafb4adc5b20",
     "provenance_record": "ALPHA_A_2026_SEALED_PROVENANCE.json"
+  },
+  "source_identity_evidence": {
+    "sealed_provenance_record": "ALPHA_A_2026_SEALED_PROVENANCE.json",
+    "sealed_acceptance_audit": "ALPHA_A_2026_SEALED_ACCEPTANCE_AUDIT.json",
+    "recorded_actual_sha256": "bd7df469f6e7d95bee62a7c51d794a9119478cbc3c95b1e68debcafb4adc5b20",
+    "recorded_expected_sha256": "bd7df469f6e7d95bee62a7c51d794a9119478cbc3c95b1e68debcafb4adc5b20",
+    "recorded_pass": true,
+    "note": "Sealed historical evidence proves the raw archive identity. The one-shot recovery runner still rechecks filename, byte size and SHA-256 before reconstruction and remains fail-closed if current bytes differ."
   },
   "original_corpus_importer": {
     "repository": "parmod0005/AIML",
@@ -56,6 +64,13 @@
     "sealed_2026": true,
     "rule": "The original AIML train/validation/test split is reconstructed only as a provenance parity gate. R3 teacher optimisation may consume only rows dated through 2024-12-31. Any 2025 rows are validation-only and 2026 remains sealed until the precommitted R3 gate permits opening it."
   },
+  "recovery_execution_contract": {
+    "orchestrator": "run_exact_recovery_gate.py",
+    "split_report_format": "VARDHANI_SPECIALIST_R3_SPLIT_REPORT_V2",
+    "measured_leakage_required": true,
+    "canonical_row_stream_hashes_required": true,
+    "teacher_unlock_token_only_after_all_gates": true
+  },
   "frozen_r2_anchors": {
     "NIFTY_STAGE1": "47312e180dc900f5d05711aa862b7ef82ece6d0ae32a36c607f8efae305bb8e5",
     "NIFTY_STAGE2": "55791e80e6c10c9c5476c719b97b053b960145bb10894ef6208658eb4121bf1d",
@@ -68,7 +83,7 @@
     "Do not use historical or prospective 2026 rows for R3 optimisation.",
     "Do not fabricate bid/ask, depth, Greeks, index volume/OI, SENSEX options or D30.",
     "Do not treat the original AIML split as the R3 optimisation split; it is parity evidence only.",
-    "Do not unlock the teacher optimizer unless raw ZIP SHA, importer identity, report counts and chronology gate all pass.",
+    "Do not unlock the teacher optimizer unless current raw ZIP identity, importer identity, original report parity and measured R3 chronology gates all pass.",
     "Real broker orders remain disabled."
   ]
 }

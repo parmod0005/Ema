@@ -1,0 +1,105 @@
+{
+  "format": "VARDHANI_SPECIALIST_R3_TRAINING_HYPERPARAMS_V1",
+  "status": "PRECOMMITTED_BEFORE_TEACHER_RESULTS",
+  "teacher": "VARDHANI_SPECIALIST_R3_HIGH_CAPACITY_TEACHER",
+  "chronology": {
+    "train": "2022-01-01..2024-12-31 only",
+    "validation": "2025-01-01..2025-12-31 read-only",
+    "sealed_2026": true,
+    "validation_optimizer_steps": 0,
+    "normalization_fit": "train only",
+    "target_statistics_fit": "train only",
+    "episodic_memory_fit": "train only"
+  },
+  "sequence_replay": {
+    "strict_time_order": true,
+    "shuffle_independent_sessions": false,
+    "causal_prefix_rows": 2612,
+    "target_rows_per_window": 256,
+    "synthetic_padding": false,
+    "cross_session_context": "observed chronology is preserved; overnight/weekend state is explicit",
+    "activation_checkpointing": true,
+    "micro_batch_sequences": 1,
+    "gradient_accumulation_steps": 8
+  },
+  "horizons_minutes": [1,3,5,10,15],
+  "horizon_weights": [0.70,0.90,1.10,0.90,0.70],
+  "return_quantiles": [0.10,0.25,0.50,0.75,0.90],
+  "path_quantiles": [0.10,0.50,0.90],
+  "loss_heads": {
+    "direction_cross_entropy": 1.00,
+    "return_pinball": 0.55,
+    "mfe_pinball": 0.35,
+    "mae_pinball": 0.35,
+    "target_before_stop_bce": 0.45,
+    "regime_cross_entropy": 0.30,
+    "next_regime_cross_entropy": 0.25,
+    "behavior_multilabel_bce": 0.35,
+    "volatility_state_cross_entropy": 0.20,
+    "volatility_transition_smooth_l1": 0.15,
+    "option_behavior_smooth_l1_masked": 0.25,
+    "uncertainty_calibration_nll": 0.25,
+    "episodic_contrastive": 0.20,
+    "context15_relation_cross_entropy_advisory": 0.12,
+    "context15_regime_cross_entropy_advisory": 0.08,
+    "context15_conflict_cross_entropy_advisory": 0.10,
+    "context15_uncertainty_smooth_l1_advisory": 0.05
+  },
+  "loss_masking": {
+    "every_future_target": "exact timestamp and same-session horizon must exist",
+    "option_heads": "only rows with NIFTY_OPTION_PRESENT=1 and required genuine option future target",
+    "single_market_rows": "missing peer market is zero payload with false mask",
+    "sensex_option_head": "absent; no fabricated target",
+    "invalid_or_missing_targets": "excluded from that head only; current state remains valid experience"
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "learning_rate": 0.0001,
+    "betas": [0.9,0.95],
+    "eps": 1e-8,
+    "weight_decay": 0.05,
+    "decay_exclusions": ["bias", "LayerNorm.weight", "LayerNorm.bias"]
+  },
+  "scheduler": {
+    "name": "cosine_decay_with_linear_warmup",
+    "warmup_fraction": 0.05,
+    "minimum_learning_rate_ratio": 0.10,
+    "schedule_steps_source": "number of train-only optimizer steps computed before training starts"
+  },
+  "precision_policy": {
+    "weights_and_matmul": "bfloat16 when supported; float32 fallback",
+    "normalization_and_loss_accumulation": "float32",
+    "mixed_precision_scaler": "only when runtime requires it",
+    "tf32": false
+  },
+  "gradient_clipping": {
+    "type": "global_norm",
+    "maximum_norm": 1.0
+  },
+  "deterministic_seeds": [26090501,26090517,26090533],
+  "seed_policy": "three independent train-only runs; architecture/objective unchanged; 2025 is evaluated read-only for each frozen run",
+  "checkpoint_selection_metric": {
+    "name": "VALIDATION_COMPOSITE_V1",
+    "formula": "0.30*direction_macro_f1 + 0.20*direction_balanced_accuracy + 0.15*return_quantile_skill + 0.10*mfe_mae_skill + 0.10*target_before_stop_brier_skill + 0.10*regime_transition_skill + 0.05*uncertainty_calibration_skill",
+    "economic_pnl_used_for_checkpoint_selection": false,
+    "reason": "avoid directly optimizing checkpoint choice to 2025 trading PnL; economic evaluation remains a separate qualification gate"
+  },
+  "early_stopping": {
+    "allowed": true,
+    "metric": "VALIDATION_COMPOSITE_V1",
+    "patience_evaluations": 8,
+    "minimum_delta": 0.0005,
+    "maximum_epochs": 24,
+    "restore_best_checkpoint": true
+  },
+  "hard_rules": {
+    "loss_weights_change_after_2025_seen": false,
+    "threshold_retuning_from_2025_pnl": false,
+    "2026_readable": false,
+    "frozen_r2_trainable": false,
+    "15m_direct_action_path": false,
+    "historical_d30": false,
+    "fabricated_modalities": false,
+    "real_orders": false
+  }
+}
